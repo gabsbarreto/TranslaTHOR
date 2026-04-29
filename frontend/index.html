@@ -10,22 +10,13 @@
     <main class="app-shell">
       <section class="panel upload-panel">
         <h1>PDF Translation Workbench</h1>
-        <p class="sub">Local pipeline: DeepSeek-OCR-2 + Qwen translation</p>
+        <p class="sub">Upload a PDF, choose the regions to OCR, then translate.</p>
 
         <div id="dropzone" class="dropzone">
-          <input id="fileInput" type="file" accept="application/pdf" multiple hidden />
-          <p>Drag and drop PDFs here</p>
+          <input id="fileInput" type="file" accept="application/pdf" hidden />
+          <p>Drag and drop a PDF here</p>
           <button id="pickBtn" type="button">Select Files</button>
         </div>
-
-        <div class="staged-head">
-          <h2>Staged Documents</h2>
-          <div class="queue-actions">
-            <button id="parseTranslateBtn" type="button">Parse and Translate</button>
-            <button id="clearStagedBtn" class="secondary-button" type="button">Clear Staged</button>
-          </div>
-        </div>
-        <div id="stagedQueue"></div>
 
         <div class="settings-grid">
           <label>Chunk Tokens <input id="chunkSize" type="number" min="128" max="8000" value="1800" /></label>
@@ -37,6 +28,41 @@
             </select>
           </label>
           <label>LLM Top P <input id="topP" type="number" min="0" max="1" step="0.05" value="0.9" /></label>
+        </div>
+      </section>
+
+      <section class="panel region-panel">
+        <div class="queue-head">
+          <h2>PDF Translation Pipeline</h2>
+        </div>
+        <ol id="workflowSteps" class="workflow-steps">
+          <li data-step="upload">Upload</li>
+          <li data-step="select">Select OCR regions</li>
+          <li data-step="ocr">OCR selected regions</li>
+          <li data-step="translate">Translate</li>
+          <li data-step="export">Rebuild / Export</li>
+        </ol>
+        <p id="regionStatus" class="sub">No region-editing job selected.</p>
+        <div class="region-toolbar">
+          <button id="prevPageBtn" class="secondary-button" type="button">Previous Page</button>
+          <button id="nextPageBtn" class="secondary-button" type="button">Next Page</button>
+          <button id="saveBoxesBtn" class="secondary-button" type="button">Save boxes</button>
+          <button id="reloadSavedBoxesBtn" class="secondary-button" type="button" hidden>Reload saved boxes</button>
+          <button id="useFullPageBtn" class="secondary-button" type="button">Use full page</button>
+          <button id="addBoxBtn" type="button">Add region</button>
+        </div>
+        <div class="workflow-actions">
+          <button id="runOcrSelectedBtn" type="button">Next: OCR selected regions</button>
+          <button id="startSelectedModeBtn" type="button" hidden>Translate now</button>
+        </div>
+        <div class="region-layout">
+          <div class="canvas-wrap">
+            <div id="regionCanvas"></div>
+          </div>
+          <aside class="region-sidebar">
+            <h3>OCR Regions</h3>
+            <div id="boxList" class="box-list"></div>
+          </aside>
         </div>
       </section>
 
@@ -53,6 +79,7 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260427-deepseek-only" defer></script>
+    <script src="https://unpkg.com/konva@9.3.15/konva.min.js"></script>
+    <script src="/app.js?v=20260429-saved-regions-continuous-ocr" defer></script>
   </body>
 </html>

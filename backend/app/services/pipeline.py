@@ -29,6 +29,8 @@ from app.services.job_store import JobStore
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_inspector import PdfInspector
 from app.services.profiler import PipelineProfiler
+from app.services.region_store import RegionStore
+from app.services.translation_debug import write_translation_comparison_report
 from app.services.translation_subprocess import run_translation_subprocess
 
 logger = logging.getLogger(__name__)
@@ -40,6 +42,7 @@ class TranslationPipeline:
         self.inspector = PdfInspector()
         self.deepseek_parser = DeepSeekOcrPipeline()
         self.md_builder = MarkdownBuilder()
+        self.region_store = RegionStore()
         self._lock = threading.RLock()
         self._cancelled_jobs: set[str] = set()
         self._active_processes: dict[str, list[subprocess.Popen]] = {}
@@ -67,6 +70,8 @@ class TranslationPipeline:
         artifacts_dir = self.job_store.get_job_dir(job_id) / "artifacts"
         render_strategy = str(settings.get("render_strategy", DEFAULT_RENDER_STRATEGY))
         reuse_ocr_cache = bool(settings.get("reuse_ocr_cache", False))
+        ocr_input_mode = str(settings.get("ocr_input_mode", "full_page"))
+        translation_input_mode = str(settings.get("translation_input_mode", "continuous_document"))
         translation_metadata = {
             "model": str(settings.get("model", "")),
             "temperature": float(settings.get("temperature", 0.2)),
@@ -83,10 +88,35 @@ class TranslationPipeline:
                 inspection = self.inspector.inspect(pdf_path)
             self._write_decision_debug(
                 job_id,
-                {page.page_number: "ocr: deepseek_ocr" for page in inspection.pages},
+                {
+                    page.page_number: (
+                        "ocr: selected_regions" if ocr_input_mode == "selected_regions" else "ocr: deepseek_ocr"
+                    )
+                    for page in inspection.pages
+                },
             )
 
-            if reuse_ocr_cache:
+            if ocr_input_mode == "selected_regions":
+                if not self._update_status(
+                    job_id,
+                    stage=JobStage.OCR_LAYOUT,
+                    progress=0.32,
+                    message="Building OCR document from selected regions",
+                ):
+                    return
+                with profiler.step("ocr_selected_region_load"):
+                    ocr_results = self.region_store.load_ocr_results(self.job_store.get_job_dir(job_id))
+                    if ocr_results is None or not ocr_results.results:
+                        raise RuntimeError(
+                            "Selected-region OCR results were not found. Run OCR on selected boxes before translation."
+                        )
+                    doc, marker_md = self.deepseek_parser.parse_selected_regions_document(
+                        inspection=inspection,
+                        ocr_results=ocr_results,
+                        profiler=profiler,
+                        translation_input_mode=translation_input_mode,
+                    )
+            elif reuse_ocr_cache:
                 if not self._update_status(
                     job_id,
                     stage=JobStage.OCR_LAYOUT,
@@ -222,6 +252,14 @@ class TranslationPipeline:
                 self._mark_cancelled(job_id)
                 return
 
+            translated_document = self.deepseek_parser.load_document_json(json_path)
+            comparison_json, comparison_md = write_translation_comparison_report(
+                source_path=source_md_path,
+                translated_path=md_path,
+                document=translated_document,
+                output_dir=artifacts_dir / "debug",
+            )
+
             profile_json = artifacts_dir / "timing_profile.json"
             profile_csv = artifacts_dir / "timing_profile.csv"
             profile_summary = artifacts_dir / "timing_summary.txt"
@@ -247,6 +285,8 @@ class TranslationPipeline:
                     "profile_json": str(profile_json) if profile_enabled else "",
                     "profile_csv": str(profile_csv) if profile_enabled else "",
                     "profile_summary": str(profile_summary) if profile_enabled else "",
+                    "translation_comparison_json": str(comparison_json),
+                    "translation_comparison_md": str(comparison_md),
                 },
             )
         except Exception as exc:

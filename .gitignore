@@ -3,5 +3,6 @@ __pycache__/
 .venv/
 .env.local
 workspace/jobs/
+workspace/ocr_region_debug/
 *.pyc
 .DS_Store

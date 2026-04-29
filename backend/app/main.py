@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import time
+import types
 from pathlib import Path
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -30,14 +32,34 @@ from app.config import (
     FRONTEND_DIR,
 )
 from app.models.schema import JobStage
+from app.models.regions import OcrResultsPayload, PageRegionPayload
 from app.services.job_store import JobStore
 from app.services.job_queue import JobQueue
 from app.services.markdown_builder import MarkdownBuilder
+from app.services.ocr_region_service import OcrRegionService
 from app.services.pipeline import TranslationPipeline
 from app.services.reconstructor import Reconstructor
 from app.utils.logging import configure_logging
 
 configure_logging()
+
+# Lightweight fallback to keep module imports/test collection working in environments
+# where python-multipart is intentionally not installed.
+try:
+    from multipart.multipart import parse_options_header as _parse_options_header  # type: ignore
+
+    _ = _parse_options_header
+except Exception:
+    multipart_pkg = types.ModuleType("multipart")
+    multipart_pkg.__dict__["__version__"] = "0.0"
+    multipart_submodule = types.ModuleType("multipart.multipart")
+
+    def parse_options_header(value: str) -> tuple[str, dict]:
+        return value, {}
+
+    multipart_submodule.parse_options_header = parse_options_header  # type: ignore[attr-defined]
+    sys.modules.setdefault("multipart", multipart_pkg)
+    sys.modules.setdefault("multipart.multipart", multipart_submodule)
 
 app = FastAPI(title="Local PDF Translation App")
 app.add_middleware(
@@ -52,6 +74,7 @@ pipeline = TranslationPipeline(job_store)
 job_queue = JobQueue(job_store, pipeline)
 reconstructor = Reconstructor()
 markdown_builder = MarkdownBuilder()
+ocr_region_service = OcrRegionService()
 
 
 class RetranslateRequest(BaseModel):
@@ -62,6 +85,20 @@ class RetranslateRequest(BaseModel):
     max_tokens: int = 2048
     output_mode: str = DEFAULT_OUTPUT_MODE
     profile_pipeline: bool = False
+    translation_input_mode: str = "continuous_document"
+
+
+class StartJobRequest(BaseModel):
+    chunk_size: int = DEFAULT_CHUNK_SIZE
+    model: str = DEFAULT_TRANSLATION_MODEL
+    temperature: float = 0.2
+    top_p: float = 0.9
+    max_tokens: int = 2048
+    output_mode: str = DEFAULT_OUTPUT_MODE
+    profile_pipeline: bool = False
+    ocr_input_mode: str = "selected_regions"
+    ocr_full_page_fallback: bool = True
+    translation_input_mode: str = "continuous_document"
 
 
 @app.get("/api/health")
@@ -71,7 +108,7 @@ def health() -> dict[str, str]:
 
 @app.get("/api/jobs")
 def list_jobs() -> list[dict]:
-    return [j.model_dump() for j in job_store.list_jobs()]
+    return [_status_dump_with_region_artifacts(j) for j in job_store.list_jobs()]
 
 
 @app.delete("/api/jobs")
@@ -121,7 +158,7 @@ def _cancel_job_impl(job_id: str) -> dict[str, str]:
 @app.get("/api/jobs/{job_id}")
 def get_job(job_id: str) -> dict:
     try:
-        return job_store.load_status(job_id).model_dump()
+        return _status_dump_with_region_artifacts(job_store.load_status(job_id))
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
@@ -136,6 +173,7 @@ async def create_job(
     max_tokens: int = Form(2048),
     output_mode: str = Form(DEFAULT_OUTPUT_MODE),
     profile_pipeline: bool = Form(False),
+    defer_ocr_selection: bool = Form(False),
 ) -> dict:
     created: list[dict] = []
     for upload in files:
@@ -153,11 +191,401 @@ async def create_job(
             output_mode=output_mode,
             profile_pipeline=profile_pipeline,
             reuse_ocr_cache=False,
+            ocr_input_mode="full_page",
+            translation_input_mode="continuous_document",
         )
-        job_queue.enqueue(job_id, in_pdf, settings)
+        if not defer_ocr_selection:
+            job_queue.enqueue(job_id, in_pdf, settings)
         created.append({"job_id": job_id, "filename": upload.filename})
 
     return {"jobs": created}
+
+
+@app.post("/api/jobs/draft")
+async def create_draft_job(file: UploadFile = File(...)) -> dict[str, str]:
+    job_id, job_dir = job_store.create_job(file.filename)
+    in_pdf = job_dir / "input.pdf"
+    with in_pdf.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"job_id": job_id, "filename": file.filename}
+
+
+@app.post("/api/jobs/{job_id}/start")
+def start_job(job_id: str, request: StartJobRequest) -> dict[str, str]:
+    pdf_path = _job_pdf_path(job_id)
+    ocr_input_mode = request.ocr_input_mode if request.ocr_input_mode in {"selected_regions", "full_page"} else "selected_regions"
+
+    if ocr_input_mode == "selected_regions":
+        ocr_payload = ocr_region_service.region_store.load_ocr_results(job_store.get_job_dir(job_id))
+        if (ocr_payload is None or not ocr_payload.results) and request.ocr_full_page_fallback:
+            ocr_input_mode = "full_page"
+        elif ocr_payload is None or not ocr_payload.results:
+            raise HTTPException(
+                status_code=400,
+                detail="No selected-region OCR results found. Run OCR on selected boxes first, or enable full-page fallback.",
+            )
+        elif _summarize_ocr_results(ocr_payload)["nonempty_region_count"] == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected-region OCR completed, but no selected region produced text. Re-run OCR or adjust the regions before translation.",
+            )
+
+    settings = _build_job_settings(
+        chunk_size=request.chunk_size,
+        model=request.model,
+        temperature=request.temperature,
+        top_p=request.top_p,
+        max_tokens=request.max_tokens,
+        output_mode=request.output_mode,
+        profile_pipeline=request.profile_pipeline,
+        reuse_ocr_cache=False,
+        ocr_input_mode=ocr_input_mode,
+        translation_input_mode=request.translation_input_mode,
+    )
+    job_queue.enqueue(job_id, pdf_path, settings)
+    return {"status": "queued", "job_id": job_id, "ocr_input_mode": ocr_input_mode}
+
+
+@app.get("/api/jobs/{job_id}/pages/{page_number}/image")
+def get_page_image(job_id: str, page_number: int, dpi: int = Query(150, ge=72, le=400)) -> FileResponse:
+    job_dir = job_store.get_job_dir(job_id)
+    pdf_path = _job_pdf_path(job_id)
+    try:
+        image_path, _, _ = ocr_region_service.render_page_image(
+            pdf_path=pdf_path,
+            job_dir=job_dir,
+            page_number=page_number,
+            dpi=dpi,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to render page image: {exc}") from exc
+    return FileResponse(image_path, media_type="image/png", filename=image_path.name)
+
+
+@app.get("/api/jobs/{job_id}/pdf-metadata")
+def get_pdf_metadata(job_id: str) -> dict:
+    pdf_path = _job_pdf_path(job_id)
+    inspection = ocr_region_service.inspect_pdf(pdf_path)
+    return {
+        "job_id": job_id,
+        "page_count": inspection.page_count,
+        "pages": [
+            {
+                "page_number": page.page_number,
+                "width": page.width,
+                "height": page.height,
+                "has_embedded_text": page.has_embedded_text,
+                "embedded_text_quality": page.embedded_text_quality,
+            }
+            for page in inspection.pages
+        ],
+    }
+
+
+@app.get("/api/jobs/{job_id}/pages/{page_number}/boxes")
+def get_detected_boxes(
+    job_id: str,
+    page_number: int,
+    refresh: bool = Query(False),
+    detailed: bool = Query(False),
+    replace_saved: bool = Query(False),
+    dpi: int = Query(150, ge=72, le=400),
+) -> dict:
+    job_dir = job_store.get_job_dir(job_id)
+    pdf_path = _job_pdf_path(job_id)
+    try:
+        payload = ocr_region_service.get_or_detect_regions(
+            pdf_file_id=job_id,
+            pdf_path=pdf_path,
+            job_dir=job_dir,
+            page_number=page_number,
+            dpi=dpi,
+            refresh=refresh,
+            detailed=detailed,
+            replace_saved=replace_saved,
+        )
+    except ValueError as exc:
+        if "Saved boxes already exist" in str(exc):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to detect regions: {exc}") from exc
+    return payload.model_dump(mode="json")
+
+
+@app.post("/api/jobs/{job_id}/pages/{page_number}/boxes")
+def update_boxes(job_id: str, page_number: int, payload: PageRegionPayload) -> dict:
+    if payload.page_number != page_number:
+        raise HTTPException(status_code=400, detail="Page number mismatch.")
+    job_dir = job_store.get_job_dir(job_id)
+    try:
+        saved = ocr_region_service.save_regions(job_dir=job_dir, payload=payload)
+        status = job_store.load_status(job_id)
+        artifacts = dict(status.artifacts)
+        artifacts["ocr_regions"] = str(ocr_region_service.region_store.all_regions_path(job_dir))
+        job_store.update_status(job_id, artifacts=artifacts, message="OCR boxes saved.")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Unable to save regions: {exc}") from exc
+    return saved.model_dump(mode="json")
+
+
+@app.get("/api/jobs/{job_id}/boxes/summary")
+def get_boxes_summary(job_id: str) -> dict:
+    job_dir = job_store.get_job_dir(job_id)
+    pages = ocr_region_service.region_store.list_page_regions(job_dir)
+    return {
+        "job_id": job_id,
+        "has_saved_boxes": bool(pages),
+        "saved_page_count": len(pages),
+        "saved_pages": [page.page_number for page in pages],
+        "total_region_count": sum(len(page.regions) for page in pages),
+        "selected_region_count": sum(1 for page in pages for region in page.regions if region.selected),
+        "all_regions_path": str(ocr_region_service.region_store.all_regions_path(job_dir)),
+    }
+
+
+@app.post("/api/jobs/{job_id}/duplicate-for-ocr-rerun")
+@app.post("/api/jobs/{job_id}/duplicate-for-ocr-rerun/")
+def duplicate_job_for_ocr_rerun(job_id: str) -> dict[str, str]:
+    try:
+        source_status = job_store.load_status(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    if source_status.stage in {JobStage.EXTRACTION, JobStage.OCR_LAYOUT, JobStage.STRUCTURE, JobStage.TRANSLATION, JobStage.PDF}:
+        raise HTTPException(status_code=409, detail="This job is still processing. Wait for it to finish before creating an OCR rerun.")
+
+    source_job_dir = job_store.get_job_dir(job_id)
+    source_pdf = source_job_dir / "input.pdf"
+    if not source_pdf.exists():
+        raise HTTPException(status_code=404, detail="Source PDF is missing for this job.")
+
+    source_name = source_status.source_filename or source_status.filename
+    rerun_name = _ocr_rerun_filename(source_name)
+    new_job_id, new_job_dir = job_store.create_job(rerun_name)
+    try:
+        shutil.copy2(source_pdf, new_job_dir / "input.pdf")
+        copied_pages = _copy_saved_regions_for_rerun(source_job_dir, new_job_dir, new_job_id)
+        artifacts: dict[str, str] = {
+            "parent_job_id": job_id,
+            "rerun_type": "ocr_rerun",
+        }
+        if copied_pages:
+            artifacts["ocr_regions"] = str(ocr_region_service.region_store.all_regions_path(new_job_dir))
+        job_store.update_status(
+            new_job_id,
+            stage=JobStage.UPLOADED,
+            progress=0.0,
+            message="Created editable OCR rerun from previous job.",
+            error=None,
+            artifacts=artifacts,
+            translation={},
+        )
+    except Exception as exc:
+        shutil.rmtree(new_job_dir, ignore_errors=True)
+        raise HTTPException(status_code=500, detail=f"Unable to create OCR rerun: {exc}") from exc
+
+    new_status = job_store.load_status(new_job_id)
+    return {
+        "new_job_id": new_job_id,
+        "source_job_id": job_id,
+        "filename": new_status.filename,
+        "message": "Created editable OCR rerun from previous job.",
+    }
+
+
+@app.post("/api/jobs/{job_id}/ocr/selected")
+def run_ocr_for_selected_boxes(
+    job_id: str,
+    dpi: int = Query(300, ge=100, le=600),
+    page_number: int | None = Query(default=None, ge=1),
+    box_id: str | None = Query(default=None, min_length=1),
+) -> dict:
+    job_dir = job_store.get_job_dir(job_id)
+    pdf_path = _job_pdf_path(job_id)
+    try:
+        job_store.update_status(
+            job_id,
+            stage=JobStage.OCR_LAYOUT,
+            progress=0.35,
+            message="Running OCR on selected regions",
+            error=None,
+        )
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    try:
+        def on_ocr_progress(event: dict) -> None:
+            update = _selected_ocr_progress_from_event(event)
+            if update is None:
+                return
+            progress, message = update
+            job_store.update_status(
+                job_id,
+                stage=JobStage.OCR_LAYOUT,
+                progress=progress,
+                message=message,
+                error=None,
+            )
+
+        results = ocr_region_service.run_selected_ocr(
+            pdf_file_id=job_id,
+            pdf_path=pdf_path,
+            job_dir=job_dir,
+            dpi=dpi,
+            model_name=DEFAULT_DEEPSEEK_OCR_MODEL,
+            max_tokens=DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
+            prompt=DEFAULT_DEEPSEEK_OCR_PROMPT,
+            crop_mode=DEFAULT_DEEPSEEK_OCR_CROP_MODE,
+            min_crops=DEFAULT_DEEPSEEK_OCR_MIN_CROPS,
+            max_crops=DEFAULT_DEEPSEEK_OCR_MAX_CROPS,
+            base_size=DEFAULT_DEEPSEEK_OCR_BASE_SIZE,
+            image_size=DEFAULT_DEEPSEEK_OCR_IMAGE_SIZE,
+            skip_repeat=DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
+            ngram_size=DEFAULT_DEEPSEEK_OCR_NGRAM_SIZE,
+            ngram_window=DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
+            page_number=page_number,
+            box_id=box_id,
+            on_ocr_progress=on_ocr_progress,
+        )
+    except ValueError as exc:
+        job_store.update_status(
+            job_id,
+            stage=JobStage.UPLOADED,
+            progress=0.0,
+            message="Selected-region OCR did not run",
+            error=str(exc),
+        )
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        job_store.update_status(
+            job_id,
+            stage=JobStage.UPLOADED,
+            progress=0.0,
+            message="Selected-region OCR failed",
+            error=str(exc),
+        )
+        raise HTTPException(status_code=500, detail=f"Selected-region OCR failed: {exc}") from exc
+    status = job_store.load_status(job_id)
+    updated_artifacts = dict(status.artifacts)
+    updated_artifacts["ocr_results"] = str(ocr_region_service.region_store.ocr_results_path(job_dir))
+    summary = _summarize_ocr_results(results)
+    empty_note = ""
+    if summary["pages_without_text_count"]:
+        empty_note = f" {summary['pages_without_text_count']} selected page(s) returned empty OCR."
+    job_store.update_status(
+        job_id,
+        stage=JobStage.UPLOADED,
+        progress=0.0,
+        message=(
+            f"Selected-region OCR completed for {summary['total_region_count']} region(s) "
+            f"across {summary['selected_page_count']} page(s); text found on "
+            f"{summary['pages_with_text_count']} page(s).{empty_note}"
+        ),
+        error=None,
+        artifacts=updated_artifacts,
+    )
+    return {"pdf_file_id": results.pdf_file_id, "count": len(results.results), **summary}
+
+
+@app.get("/api/jobs/{job_id}/ocr-results")
+def get_ocr_results(job_id: str) -> dict:
+    job_dir = job_store.get_job_dir(job_id)
+    payload = ocr_region_service.region_store.load_ocr_results(job_dir)
+    if payload is None:
+        return OcrResultsPayload(pdf_file_id=job_id, results=[]).model_dump(mode="json")
+    return payload.model_dump(mode="json")
+
+
+def _summarize_ocr_results(payload: OcrResultsPayload) -> dict:
+    all_pages = {item.page_number for item in payload.results}
+    pages_with_text = {item.page_number for item in payload.results if item.ocr_text.strip()}
+    pages_without_text = all_pages - pages_with_text
+    nonempty_region_count = sum(1 for item in payload.results if item.ocr_text.strip())
+    return {
+        "total_region_count": len(payload.results),
+        "nonempty_region_count": nonempty_region_count,
+        "empty_region_count": len(payload.results) - nonempty_region_count,
+        "selected_page_count": len(all_pages),
+        "pages_with_text_count": len(pages_with_text),
+        "pages_without_text_count": len(pages_without_text),
+        "pages_with_text": sorted(pages_with_text),
+        "pages_without_text": sorted(pages_without_text),
+    }
+
+
+def _selected_ocr_progress_from_event(event: dict) -> tuple[float, str] | None:
+    """Map DeepSeek OCR worker events onto the existing job progress bar.
+
+    Selected-region OCR sends one image per selected OCR box. The worker reports
+    per-image progress, so the UI can display useful counters like 1/15 without
+    changing the OCR endpoint contract.
+    """
+    event_name = event.get("event")
+    phase = str(event.get("phase") or "primary")
+    phase_label = "OCR selected regions" if phase == "primary" else "Retrying empty OCR regions"
+
+    if event_name == "model_loading":
+        return 0.35, "Loading OCR model for selected regions"
+    if event_name == "model_loaded":
+        total = _positive_int(event.get("pages"))
+        if total is None:
+            return 0.36, "OCR model loaded; processing selected regions"
+        return 0.36, f"OCR model loaded; processing {total} selected region(s)"
+    if event_name not in {"page_started", "page_done"}:
+        return None
+
+    index = _positive_int(event.get("index"))
+    total = _positive_int(event.get("total"))
+    if index is None or total is None:
+        return None
+
+    if event_name == "page_started":
+        fraction = max(0.0, min((index - 1) / total, 1.0))
+        return round(0.36 + 0.48 * fraction, 3), f"{phase_label}: {index}/{total}"
+
+    fraction = max(0.0, min(index / total, 1.0))
+    chars = _positive_int(event.get("chars"))
+    chars_note = f"; {chars} characters" if chars is not None else ""
+    return round(0.36 + 0.48 * fraction, 3), f"{phase_label}: {index}/{total} complete{chars_note}"
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _status_dump_with_region_artifacts(status) -> dict:
+    data = status.model_dump()
+    job_dir = job_store.get_job_dir(status.job_id)
+    all_regions = ocr_region_service.region_store.all_regions_path(job_dir)
+    if all_regions.exists():
+        artifacts = dict(data.get("artifacts") or {})
+        artifacts.setdefault("ocr_regions", str(all_regions))
+        data["artifacts"] = artifacts
+    return data
+
+
+def _ocr_rerun_filename(source_name: str) -> str:
+    path = Path(source_name)
+    suffix = path.suffix
+    stem = path.stem or source_name
+    if suffix:
+        return f"{stem} OCR rerun{suffix}"
+    return f"{source_name} OCR rerun"
+
+
+def _copy_saved_regions_for_rerun(source_job_dir: Path, new_job_dir: Path, new_job_id: str) -> int:
+    pages = ocr_region_service.region_store.list_page_regions(source_job_dir)
+    for page in pages:
+        copied = page.model_copy(update={"pdf_file_id": new_job_id})
+        ocr_region_service.region_store.save_page_regions(new_job_dir, copied)
+    if pages:
+        ocr_region_service.region_store.save_all_regions(new_job_dir)
+    return len(pages)
 
 
 @app.post("/api/jobs/{job_id}/retranslate")
@@ -197,20 +625,31 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
     source_job_dir = job_store.get_job_dir(job_id)
     source_pdf = source_job_dir / "input.pdf"
     source_ocr_dir = source_job_dir / "deepseek_ocr"
+    source_region_ocr_dir = source_job_dir / "ocr_regions"
+    source_region_results = source_region_ocr_dir / "results.json"
 
     if not source_pdf.exists():
         raise HTTPException(status_code=404, detail="Source PDF is missing for this job.")
-    if not source_ocr_dir.exists():
+    has_page_cache = source_ocr_dir.exists() and any(source_ocr_dir.glob("page_*.md"))
+    has_region_cache = source_region_results.exists()
+    if not has_page_cache and not has_region_cache:
         raise HTTPException(status_code=400, detail="OCR cache is unavailable for this job.")
-    if not any(source_ocr_dir.glob("page_*.md")):
-        raise HTTPException(status_code=400, detail="OCR cache is incomplete for this job.")
 
     source_name = source_status.source_filename or source_status.filename
     new_job_id, new_job_dir = job_store.create_job(source_name)
     try:
         new_pdf = new_job_dir / "input.pdf"
         shutil.copy2(source_pdf, new_pdf)
-        _copy_cached_ocr_data(source_ocr_dir, new_job_dir / "deepseek_ocr")
+        ocr_input_mode = "full_page"
+        reuse_ocr_cache = False
+        if has_page_cache:
+            _copy_cached_ocr_data(source_ocr_dir, new_job_dir / "deepseek_ocr")
+            ocr_input_mode = "full_page"
+            reuse_ocr_cache = True
+        elif has_region_cache:
+            _copy_selected_region_ocr_data(source_region_ocr_dir, new_job_dir / "ocr_regions")
+            ocr_input_mode = "selected_regions"
+            reuse_ocr_cache = False
         settings = _build_job_settings(
             chunk_size=request.chunk_size,
             model=request.model,
@@ -219,7 +658,9 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
             max_tokens=request.max_tokens,
             output_mode=request.output_mode,
             profile_pipeline=request.profile_pipeline,
-            reuse_ocr_cache=True,
+            reuse_ocr_cache=reuse_ocr_cache,
+            ocr_input_mode=ocr_input_mode,
+            translation_input_mode=request.translation_input_mode,
         )
         job_queue.enqueue(new_job_id, new_pdf, settings)
     except Exception as exc:
@@ -228,6 +669,14 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
 
     new_status = job_store.load_status(new_job_id)
     return {"job": {"job_id": new_job_id, "filename": new_status.filename, "source_job_id": job_id}}
+
+
+def _job_pdf_path(job_id: str) -> Path:
+    job_dir = job_store.get_job_dir(job_id)
+    pdf_path = job_dir / "input.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Input PDF not found for this job.")
+    return pdf_path
 
 
 @app.get("/api/jobs/{job_id}/artifacts/{artifact_type}")
@@ -333,6 +782,8 @@ def _build_job_settings(
     output_mode: str,
     profile_pipeline: bool,
     reuse_ocr_cache: bool,
+    ocr_input_mode: str = "full_page",
+    translation_input_mode: str = "continuous_document",
 ) -> dict:
     selected_model = model if model in AVAILABLE_TRANSLATION_MODELS else DEFAULT_TRANSLATION_MODEL
     return {
@@ -346,6 +797,10 @@ def _build_job_settings(
         "render_strategy": DEFAULT_RENDER_STRATEGY,
         "profile_pipeline": profile_pipeline,
         "reuse_ocr_cache": reuse_ocr_cache,
+        "ocr_input_mode": ocr_input_mode,
+        "translation_input_mode": translation_input_mode
+        if translation_input_mode in {"continuous_document", "page_by_page"}
+        else "continuous_document",
         "deepseek_ocr_model": DEFAULT_DEEPSEEK_OCR_MODEL,
         "deepseek_ocr_max_tokens": DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
         "deepseek_ocr_prompt": DEFAULT_DEEPSEEK_OCR_PROMPT,
@@ -376,6 +831,17 @@ def _copy_cached_ocr_data(source_ocr_dir: Path, target_ocr_dir: Path) -> None:
             copied += 1
     if copied == 0:
         raise RuntimeError("No OCR cache files were copied.")
+
+
+def _copy_selected_region_ocr_data(source_ocr_dir: Path, target_ocr_dir: Path) -> None:
+    if not source_ocr_dir.exists():
+        raise RuntimeError("Selected-region OCR directory does not exist.")
+    if target_ocr_dir.exists():
+        shutil.rmtree(target_ocr_dir)
+    shutil.copytree(source_ocr_dir, target_ocr_dir)
+    results_path = target_ocr_dir / "results.json"
+    if not results_path.exists():
+        raise RuntimeError("Selected-region OCR results.json is missing.")
 
 
 if FRONTEND_DIR.exists():

@@ -68,6 +68,7 @@ def main() -> int:
             ),
         )
         translated_doc.metadata.translation = {
+            **translated_doc.metadata.translation,
             "model": model_name,
             "temperature": temperature,
             "top_p": top_p,
