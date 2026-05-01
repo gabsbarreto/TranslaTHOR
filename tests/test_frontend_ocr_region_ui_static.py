@@ -46,3 +46,30 @@ def test_ocr_counter_is_rendered_inside_progress_bar() -> None:
     assert "function progressBarLabel" in APP_JS
     assert 'return `OCR ${counter[0].replace(/\\s+/g, "")}`;' in APP_JS
     assert "<small>${escapeHtml(progressText)}</small>" in APP_JS
+
+
+def test_canvas_drag_drawing_creates_manual_drawn_regions() -> None:
+    assert 'id="drawRegionModeBtn"' in INDEX_HTML
+    assert "function toggleDrawRegionMode" in APP_JS
+    assert "function installCanvasDrawingHandlers" in APP_JS
+    assert 'stage.on("pointerdown"' in APP_JS
+    assert 'stage.on("pointermove"' in APP_JS
+    assert 'stage.on("pointerup pointercancel"' in APP_JS
+    assert "if (!canvasState.drawMode && event.target !== stage) return;" in APP_JS
+    assert 'source: "manual_drawn"' in APP_JS
+    assert "selected: true" in APP_JS
+    assert 'coordinate_space: "normalized"' in APP_JS
+    assert "item.rect.draggable(!canvasState.drawMode)" in APP_JS
+
+
+def test_canvas_drag_drawing_ignores_tiny_regions_and_normalizes_direction() -> None:
+    assert "MIN_DRAW_REGION_PIXELS" in APP_JS
+    assert "MIN_DRAW_REGION_RATIO" in APP_JS
+    assert "rect.width < minWidth || rect.height < minHeight" in APP_JS
+    assert "Math.min(a.x, b.x)" in APP_JS
+    assert "Math.abs(b.x - a.x)" in APP_JS
+
+
+def test_add_region_button_still_uses_default_manual_box() -> None:
+    assert 'addBoxBtn?.addEventListener("click", addManualBox);' in APP_JS
+    assert "function buildManualBox" in APP_JS

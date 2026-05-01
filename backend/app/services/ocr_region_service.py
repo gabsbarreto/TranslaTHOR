@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import shutil
+import subprocess
 from pathlib import Path
 from typing import Callable
 
@@ -178,6 +179,9 @@ class OcrRegionService:
         page_number: int | None = None,
         box_id: str | None = None,
         on_ocr_progress: Callable[[dict], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        on_process_started: Callable[[subprocess.Popen], None] | None = None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None = None,
     ) -> OcrResultsPayload:
         all_pages = self.region_store.list_page_regions(job_dir)
         if not all_pages:
@@ -205,7 +209,7 @@ class OcrRegionService:
         md_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
 
-        image_paths: list[Path] = []
+        ocr_inputs: list[tuple[Path, str]] = []
         output_names: list[str] = []
         mapping: dict[str, tuple[PageRegionPayload, Region]] = {}
         ocr_image_metadata: dict[str, dict[str, str | int | float | bool | None]] = {}
@@ -256,14 +260,13 @@ class OcrRegionService:
                     "padded_crop_nonwhite_ratio": debug_payload["padded_crop_nonwhite_ratio"],
                 }
 
-            image_paths.append(masked_path)
+            ocr_inputs.append((masked_path, output_name))
             output_names.append(output_name)
             mapping[output_name] = (page_payload, region)
 
-        markdown_results = self.deepseek.run_ocr_on_images(
-            image_paths=image_paths,
+        markdown_results = self._run_ocr_inputs_in_single_model_session(
+            ocr_inputs=ocr_inputs,
             output_dir=md_dir,
-            output_names=output_names,
             model_name=model_name,
             max_tokens=max_tokens,
             prompt=prompt,
@@ -276,12 +279,14 @@ class OcrRegionService:
             ngram_size=ngram_size,
             ngram_window=ngram_window,
             on_ocr_progress=self._phase_progress_callback(on_ocr_progress, "primary"),
+            cancel_requested=cancel_requested,
+            on_process_started=on_process_started,
+            on_process_finished=on_process_finished,
         )
 
         empty_output_names = [name for name in output_names if not markdown_results.get(name, "").strip()]
         if empty_output_names:
-            retry_paths: list[Path] = []
-            retry_names: list[str] = []
+            retry_inputs: list[tuple[Path, str]] = []
             retry_to_original: dict[str, str] = {}
             for output_name in empty_output_names:
                 _page_payload, region = mapping[output_name]
@@ -301,14 +306,12 @@ class OcrRegionService:
                             "ocr_retry_coordinate_snap": SELECTED_OCR_RETRY_COORD_SNAP,
                         }
                     )
-                retry_paths.append(retry_path)
-                retry_names.append(retry_name)
+                retry_inputs.append((retry_path, retry_name))
                 retry_to_original[retry_name] = output_name
 
-            retry_results = self.deepseek.run_ocr_on_images(
-                image_paths=retry_paths,
+            retry_results = self._run_ocr_inputs_in_single_model_session(
+                ocr_inputs=retry_inputs,
                 output_dir=md_dir,
-                output_names=retry_names,
                 model_name=model_name,
                 max_tokens=max_tokens,
                 prompt=prompt,
@@ -321,6 +324,9 @@ class OcrRegionService:
                 ngram_size=ngram_size,
                 ngram_window=ngram_window,
                 on_ocr_progress=self._phase_progress_callback(on_ocr_progress, "retry"),
+                cancel_requested=cancel_requested,
+                on_process_started=on_process_started,
+                on_process_finished=on_process_finished,
             )
             for retry_name, retry_text in retry_results.items():
                 original_name = retry_to_original[retry_name]
@@ -359,6 +365,55 @@ class OcrRegionService:
         )
         self.region_store.save_ocr_results(job_dir, payload)
         return payload
+
+    def _run_ocr_inputs_in_single_model_session(
+        self,
+        *,
+        ocr_inputs: list[tuple[Path, str]],
+        output_dir: Path,
+        model_name: str,
+        max_tokens: int,
+        prompt: str,
+        crop_mode: bool,
+        min_crops: int,
+        max_crops: int,
+        base_size: int,
+        image_size: int,
+        skip_repeat: bool,
+        ngram_size: int,
+        ngram_window: int,
+        on_ocr_progress: Callable[[dict], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        on_process_started: Callable[[subprocess.Popen], None] | None = None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None = None,
+    ) -> dict[str, str]:
+        if not ocr_inputs:
+            return {}
+        if cancel_requested is not None and cancel_requested():
+            raise RuntimeError("Cancelled by user")
+
+        image_paths = [image_path for image_path, _output_name in ocr_inputs]
+        output_names = [output_name for _image_path, output_name in ocr_inputs]
+        return self.deepseek.run_ocr_on_images(
+            image_paths=image_paths,
+            output_dir=output_dir,
+            output_names=output_names,
+            model_name=model_name,
+            max_tokens=max_tokens,
+            prompt=prompt,
+            crop_mode=crop_mode,
+            min_crops=min_crops,
+            max_crops=max_crops,
+            base_size=base_size,
+            image_size=image_size,
+            skip_repeat=skip_repeat,
+            ngram_size=ngram_size,
+            ngram_window=ngram_window,
+            on_ocr_progress=on_ocr_progress,
+            cancel_requested=cancel_requested,
+            on_process_started=on_process_started,
+            on_process_finished=on_process_finished,
+        )
 
     def _phase_progress_callback(
         self,

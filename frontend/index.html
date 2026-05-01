@@ -24,7 +24,7 @@
           <label>LLM Max Tokens <input id="maxTokens" type="number" min="256" max="8192" value="2048" /></label>
           <label>Translation LLM
             <select id="model">
-              <option value="mlx-community/Qwen3.5-9B-8bit" selected>Qwen3.5 9B 8-bit</option>
+              <option value="mlx-community/Qwen3.5-4B-OptiQ-4bit" selected>Qwen3.5 4B OptiQ-4bit</option>
             </select>
           </label>
           <label>LLM Top P <input id="topP" type="number" min="0" max="1" step="0.05" value="0.9" /></label>
@@ -50,6 +50,7 @@
           <button id="reloadSavedBoxesBtn" class="secondary-button" type="button" hidden>Reload saved boxes</button>
           <button id="useFullPageBtn" class="secondary-button" type="button">Use full page</button>
           <button id="addBoxBtn" type="button">Add region</button>
+          <button id="drawRegionModeBtn" class="secondary-button" type="button">Draw region: Off</button>
         </div>
         <div class="workflow-actions">
           <button id="runOcrSelectedBtn" type="button">Next: OCR selected regions</button>

@@ -1,5 +1,7 @@
 const BOX_TYPES = ["page", "text", "table", "figure", "caption", "header", "footer", "reference", "other"];
 const WORKFLOW_STEPS = ["upload", "select", "ocr", "translate", "export"];
+const MIN_DRAW_REGION_PIXELS = 20;
+const MIN_DRAW_REGION_RATIO = 0.015;
 
 const state = {
   jobs: [],
@@ -54,6 +56,7 @@ const deselectAllBoxesBtn = document.getElementById("deselectAllBoxesBtn");
 const deleteSelectedBoxesBtn = document.getElementById("deleteSelectedBoxesBtn");
 const clearPageRegionsBtn = document.getElementById("clearPageRegionsBtn");
 const addBoxBtn = document.getElementById("addBoxBtn");
+const drawRegionModeBtn = document.getElementById("drawRegionModeBtn");
 const runOcrSelectedBtn = document.getElementById("runOcrSelectedBtn");
 const boxListEl = document.getElementById("boxList");
 const regionCanvasEl = document.getElementById("regionCanvas");
@@ -66,6 +69,11 @@ const canvasState = {
   transformer: null,
   boxNodes: new Map(),
   activeBoxId: null,
+  isDrawingRegion: false,
+  drawStartPoint: null,
+  draftRegion: null,
+  suppressStageClick: false,
+  drawMode: false,
 };
 
 pickBtn?.addEventListener("click", () => fileInput.click());
@@ -94,6 +102,7 @@ deselectAllBoxesBtn?.addEventListener("click", () => setAllBoxesSelected(false))
 deleteSelectedBoxesBtn?.addEventListener("click", deleteSelectedBoxes);
 clearPageRegionsBtn?.addEventListener("click", clearCurrentPageRegions);
 addBoxBtn?.addEventListener("click", addManualBox);
+drawRegionModeBtn?.addEventListener("click", toggleDrawRegionMode);
 runOcrSelectedBtn?.addEventListener("click", runSelectedOcr);
 
 window.addEventListener("resize", () => {
@@ -306,7 +315,7 @@ function appendTranslationFormFields(form) {
   form.append("chunk_size", getInputValue("chunkSize", "1800"));
   form.append("temperature", getInputValue("temp", "0.2"));
   form.append("max_tokens", getInputValue("maxTokens", "2048"));
-  form.append("model", getInputValue("model", "mlx-community/Qwen3.5-9B-8bit"));
+  form.append("model", getInputValue("model", "mlx-community/Qwen3.5-4B-OptiQ-4bit"));
   form.append("top_p", getInputValue("topP", "0.9"));
   form.append("output_mode", "readable");
 }
@@ -314,7 +323,7 @@ function appendTranslationFormFields(form) {
 function buildTranslationPayload() {
   return {
     chunk_size: numberInput("chunkSize", 1800),
-    model: getInputValue("model", "mlx-community/Qwen3.5-9B-8bit"),
+    model: getInputValue("model", "mlx-community/Qwen3.5-4B-OptiQ-4bit"),
     temperature: numberInput("temp", 0.2),
     top_p: numberInput("topP", 0.9),
     max_tokens: numberInput("maxTokens", 2048),
@@ -823,6 +832,7 @@ async function renderCurrentPageCanvas() {
   const canvasHeight = Math.round(image.height * scale);
 
   if (canvasState.stage) canvasState.stage.destroy();
+  resetDraftRegion();
   canvasState.stage = new Konva.Stage({
     container: "regionCanvas",
     width: canvasWidth,
@@ -863,8 +873,14 @@ async function renderCurrentPageCanvas() {
   canvasState.stage.add(canvasState.imageLayer);
   canvasState.stage.add(canvasState.boxLayer);
   canvasState.stage.draw();
+  updateDrawRegionModeUi();
+  installCanvasDrawingHandlers();
 
   canvasState.stage.on("click", (event) => {
+    if (canvasState.suppressStageClick) {
+      canvasState.suppressStageClick = false;
+      return;
+    }
     if (event.target === canvasState.stage || event.target === background) {
       canvasState.activeBoxId = null;
       canvasState.transformer.nodes([]);
@@ -879,6 +895,201 @@ async function renderCurrentPageCanvas() {
   if (canvasState.activeBoxId && canvasState.boxNodes.has(canvasState.activeBoxId)) {
     focusBox(canvasState.activeBoxId);
   }
+}
+
+function installCanvasDrawingHandlers() {
+  const stage = canvasState.stage;
+  if (!stage) return;
+
+  stage.on("pointerdown", (event) => {
+    if (!canvasState.drawMode && event.target !== stage) return;
+    if (isDeleteControlTarget(event.target)) return;
+    if (!canvasState.drawMode && isTransformerTarget(event.target)) return;
+    if (event.evt && typeof event.evt.button === "number" && event.evt.button !== 0) return;
+    const point = stage.getPointerPosition();
+    if (!point) return;
+    event.cancelBubble = true;
+    beginDrawRegion(point);
+  });
+
+  stage.on("pointermove", () => {
+    if (!canvasState.isDrawingRegion) return;
+    const point = stage.getPointerPosition();
+    if (!point) return;
+    updateDraftRegion(point);
+  });
+
+  stage.on("pointerup pointercancel", () => {
+    if (!canvasState.isDrawingRegion) return;
+    const point = stage.getPointerPosition() || canvasState.drawStartPoint;
+    finishDrawRegion(point);
+  });
+}
+
+function toggleDrawRegionMode() {
+  canvasState.drawMode = !canvasState.drawMode;
+  resetDraftRegion();
+  updateDrawRegionModeUi();
+}
+
+function updateDrawRegionModeUi() {
+  if (drawRegionModeBtn) {
+    drawRegionModeBtn.textContent = canvasState.drawMode ? "Draw region: On" : "Draw region: Off";
+    drawRegionModeBtn.classList.toggle("active", canvasState.drawMode);
+    drawRegionModeBtn.setAttribute("aria-pressed", canvasState.drawMode ? "true" : "false");
+  }
+  for (const item of canvasState.boxNodes.values()) {
+    item.rect.draggable(!canvasState.drawMode);
+  }
+  if (canvasState.drawMode) {
+    canvasState.transformer?.nodes([]);
+  }
+  if (canvasState.stage) {
+    canvasState.stage.container().style.cursor = canvasState.drawMode ? "crosshair" : "default";
+  }
+}
+
+function isDeleteControlTarget(target) {
+  if (!target) return false;
+  let node = target;
+  while (node) {
+    if (node.name && node.name() === "delete-control") return true;
+    node = node.getParent ? node.getParent() : null;
+  }
+  return false;
+}
+
+function isTransformerTarget(target) {
+  if (!target || !canvasState.transformer) return false;
+  let node = target;
+  while (node) {
+    if (node === canvasState.transformer) return true;
+    node = node.getParent ? node.getParent() : null;
+  }
+  return false;
+}
+
+function beginDrawRegion(point) {
+  resetDraftRegion();
+  canvasState.isDrawingRegion = true;
+  canvasState.drawStartPoint = clampCanvasPoint(point);
+  canvasState.transformer?.nodes([]);
+  canvasState.activeBoxId = null;
+
+  canvasState.draftRegion = new Konva.Rect({
+    x: canvasState.drawStartPoint.x,
+    y: canvasState.drawStartPoint.y,
+    width: 0,
+    height: 0,
+    stroke: "#0e7a52",
+    strokeWidth: 2,
+    dash: [7, 5],
+    fill: "rgba(13, 110, 74, 0.16)",
+    listening: false,
+  });
+  canvasState.boxLayer.add(canvasState.draftRegion);
+  canvasState.draftRegion.moveToTop();
+  canvasState.boxLayer.batchDraw();
+}
+
+function updateDraftRegion(point) {
+  if (!canvasState.draftRegion || !canvasState.drawStartPoint) return;
+  const rect = canvasRectFromPoints(canvasState.drawStartPoint, clampCanvasPoint(point));
+  canvasState.draftRegion.position({ x: rect.x, y: rect.y });
+  canvasState.draftRegion.size({ width: rect.width, height: rect.height });
+  canvasState.boxLayer.batchDraw();
+}
+
+function finishDrawRegion(point) {
+  const page = currentPageState();
+  const stage = canvasState.stage;
+  const start = canvasState.drawStartPoint;
+  if (!page || !stage || !start) {
+    resetDraftRegion();
+    return;
+  }
+
+  const rect = canvasRectFromPoints(start, clampCanvasPoint(point || start));
+  const minWidth = Math.max(MIN_DRAW_REGION_PIXELS, stage.width() * MIN_DRAW_REGION_RATIO);
+  const minHeight = Math.max(MIN_DRAW_REGION_PIXELS, stage.height() * MIN_DRAW_REGION_RATIO);
+  resetDraftRegion();
+
+  if (rect.width < minWidth || rect.height < minHeight) {
+    clearCanvasFocus();
+    return;
+  }
+
+  const box = buildDrawnBoxFromCanvasRect(rect, stage.width(), stage.height());
+  page.regions.push(box);
+  normalizeReadingOrder(page.regions);
+  canvasState.activeBoxId = box.id;
+  canvasState.suppressStageClick = true;
+  markRegionEditsDirty();
+  renderCurrentPageCanvas().then(() => {
+    focusBox(box.id);
+    renderBoxList();
+  });
+}
+
+function resetDraftRegion() {
+  if (canvasState.draftRegion) {
+    canvasState.draftRegion.destroy();
+  }
+  canvasState.isDrawingRegion = false;
+  canvasState.drawStartPoint = null;
+  canvasState.draftRegion = null;
+}
+
+function clearCanvasFocus() {
+  canvasState.activeBoxId = null;
+  canvasState.transformer?.nodes([]);
+  for (const item of canvasState.boxNodes.values()) {
+    item.deleteGroup?.visible(false);
+  }
+  canvasState.boxLayer?.draw();
+  renderBoxList();
+}
+
+function clampCanvasPoint(point) {
+  const stage = canvasState.stage;
+  const width = stage ? stage.width() : 0;
+  const height = stage ? stage.height() : 0;
+  return {
+    x: clamp(point.x, 0, width),
+    y: clamp(point.y, 0, height),
+  };
+}
+
+function canvasRectFromPoints(a, b) {
+  const x = Math.min(a.x, b.x);
+  const y = Math.min(a.y, b.y);
+  return {
+    x,
+    y,
+    width: Math.abs(b.x - a.x),
+    height: Math.abs(b.y - a.y),
+  };
+}
+
+function buildDrawnBoxFromCanvasRect(rect, canvasWidth, canvasHeight) {
+  const minSize = 0.005;
+  const x0 = clamp(rect.x / canvasWidth, 0, 1 - minSize);
+  const y0 = clamp(rect.y / canvasHeight, 0, 1 - minSize);
+  const x1 = clamp((rect.x + rect.width) / canvasWidth, x0 + minSize, 1);
+  const y1 = clamp((rect.y + rect.height) / canvasHeight, y0 + minSize, 1);
+  return {
+    id: `manual-drawn-${state.region.currentPage}-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+    page_number: state.region.currentPage,
+    x0,
+    y0,
+    x1,
+    y1,
+    coordinate_space: "normalized",
+    type: "page",
+    selected: true,
+    reading_order: (currentPageState()?.regions.length || 0) + 1,
+    source: "manual_drawn",
+  };
 }
 
 function createBoxNode(box, canvasWidth, canvasHeight) {
@@ -916,6 +1127,7 @@ function createBoxNode(box, canvasWidth, canvasHeight) {
   const deleteGroup = new Konva.Group({
     x: x + width - 11,
     y: y + 11,
+    name: "delete-control",
     visible: false,
   });
   const deleteCircle = new Konva.Circle({
@@ -976,22 +1188,32 @@ function createBoxNode(box, canvasWidth, canvasHeight) {
   rect.on("click", focusFromPage);
   rect.on("tap", focusFromPage);
   rect.on("mouseenter", () => {
+    canvasState.stage.container().style.cursor = canvasState.drawMode ? "crosshair" : "move";
     deleteGroup.visible(true);
     canvasState.boxLayer.batchDraw();
   });
   rect.on("mouseleave", () => {
+    canvasState.stage.container().style.cursor = canvasState.drawMode ? "crosshair" : "default";
     deleteGroup.visible(canvasState.activeBoxId === box.id);
     canvasState.boxLayer.batchDraw();
   });
   deleteGroup.on("mouseenter", () => {
+    canvasState.stage.container().style.cursor = "pointer";
     deleteGroup.visible(true);
     canvasState.boxLayer.batchDraw();
+  });
+  deleteGroup.on("mouseleave", () => {
+    canvasState.stage.container().style.cursor = canvasState.drawMode ? "crosshair" : "default";
   });
   deleteGroup.on("click tap", (event) => {
     event.cancelBubble = true;
     deleteBoxesById([box.id]);
   });
   rect.on("dragstart", () => {
+    if (canvasState.drawMode) {
+      rect.stopDrag();
+      return;
+    }
     dragInProgress = true;
     focusBox(box.id);
   });
@@ -1550,9 +1772,16 @@ async function runSelectedOcr() {
       `OCR completed for ${data.total_region_count || data.count || 0} region(s). Text was found on ${pagesWithText}/${selectedPages} selected page(s).${emptySuffix}`
     );
   } catch (error) {
-    state.region.ocrStatus = "failed";
-    state.region.workflowStep = "ocr";
-    window.alert(error.message || "Selected OCR failed");
+    const message = error.message || "Selected OCR failed";
+    if (message.toLowerCase().includes("cancelled")) {
+      state.region.ocrStatus = "not_started";
+      state.region.statusMessage = "Selected-region OCR cancelled.";
+      await pollJobs();
+    } else {
+      state.region.ocrStatus = "failed";
+      state.region.workflowStep = "ocr";
+    }
+    window.alert(message);
   } finally {
     runOcrSelectedBtn.disabled = false;
     renderRegionStatus();
@@ -1579,9 +1808,16 @@ async function runSingleRegionOcr(box) {
     const chars = Array.isArray(data.pages_with_text) && data.pages_with_text.length ? "Text found." : "No text found.";
     window.alert(`OCR completed for region "${box.id}". ${chars}`);
   } catch (error) {
-    state.region.ocrStatus = "failed";
-    state.region.workflowStep = "ocr";
-    window.alert(error.message || "Single-region OCR failed");
+    const message = error.message || "Single-region OCR failed";
+    if (message.toLowerCase().includes("cancelled")) {
+      state.region.ocrStatus = "not_started";
+      state.region.statusMessage = "Selected-region OCR cancelled.";
+      await pollJobs();
+    } else {
+      state.region.ocrStatus = "failed";
+      state.region.workflowStep = "ocr";
+    }
+    window.alert(message);
   } finally {
     renderRegionStatus();
   }

@@ -60,3 +60,23 @@ def test_default_full_page_region_values_are_serializable() -> None:
 
     assert decoded.type == RegionType.PAGE
     assert decoded.source == RegionSource.DEFAULT_FULL_PAGE
+
+
+def test_manual_drawn_region_source_is_serializable() -> None:
+    decoded = Region.model_validate(
+        {
+            "id": "drawn-1",
+            "page_number": 1,
+            "x0": 0.2,
+            "y0": 0.2,
+            "x1": 0.6,
+            "y1": 0.6,
+            "coordinate_space": "normalized",
+            "type": "page",
+            "selected": True,
+            "reading_order": 2,
+            "source": "manual_drawn",
+        }
+    )
+
+    assert decoded.source == RegionSource.MANUAL_DRAWN

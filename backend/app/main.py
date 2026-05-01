@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import os
+import signal
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -75,6 +79,9 @@ job_queue = JobQueue(job_store, pipeline)
 reconstructor = Reconstructor()
 markdown_builder = MarkdownBuilder()
 ocr_region_service = OcrRegionService()
+_selected_ocr_lock = threading.RLock()
+_selected_ocr_cancelled_jobs: set[str] = set()
+_selected_ocr_processes: dict[str, list[subprocess.Popen]] = {}
 
 
 class RetranslateRequest(BaseModel):
@@ -135,7 +142,10 @@ def _clear_terminal_jobs_impl() -> dict[str, int]:
 
 @app.post("/api/jobs/stop-all")
 def stop_all_jobs() -> dict[str, int]:
-    return job_queue.stop_all()
+    result = job_queue.stop_all()
+    selected_result = _cancel_selected_ocr_jobs()
+    interrupted_result = _mark_interrupted_processing_jobs_cancelled()
+    return {**result, **selected_result, **interrupted_result}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -151,6 +161,8 @@ def cancel_job_compat(job_id: str) -> dict[str, str]:
 def _cancel_job_impl(job_id: str) -> dict[str, str]:
     result = job_queue.cancel_job(job_id)
     if result["status"] == "not_found":
+        if _cancel_selected_ocr_job(job_id):
+            return {"status": "selected_ocr_cancelled"}
         raise HTTPException(status_code=404, detail="Job is not queued or active.")
     return result
 
@@ -415,18 +427,23 @@ def run_ocr_for_selected_boxes(
         raise HTTPException(status_code=404, detail="Job not found")
 
     try:
+        _start_selected_ocr_tracking(job_id)
+
         def on_ocr_progress(event: dict) -> None:
             update = _selected_ocr_progress_from_event(event)
             if update is None:
                 return
             progress, message = update
-            job_store.update_status(
-                job_id,
-                stage=JobStage.OCR_LAYOUT,
-                progress=progress,
-                message=message,
-                error=None,
-            )
+            try:
+                job_store.update_status(
+                    job_id,
+                    stage=JobStage.OCR_LAYOUT,
+                    progress=progress,
+                    message=message,
+                    error=None,
+                )
+            except FileNotFoundError:
+                pass
 
         results = ocr_region_service.run_selected_ocr(
             pdf_file_id=job_id,
@@ -447,6 +464,9 @@ def run_ocr_for_selected_boxes(
             page_number=page_number,
             box_id=box_id,
             on_ocr_progress=on_ocr_progress,
+            cancel_requested=lambda: _is_selected_ocr_cancelled(job_id),
+            on_process_started=lambda process: _register_selected_ocr_process(job_id, process),
+            on_process_finished=lambda process: _unregister_selected_ocr_process(job_id, process),
         )
     except ValueError as exc:
         job_store.update_status(
@@ -458,6 +478,18 @@ def run_ocr_for_selected_boxes(
         )
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
+        if _is_selected_ocr_cancelled(job_id) or str(exc) == "Cancelled by user":
+            try:
+                job_store.update_status(
+                    job_id,
+                    stage=JobStage.CANCELLED,
+                    progress=1.0,
+                    message="Selected-region OCR cancelled by user.",
+                    error=None,
+                )
+            except FileNotFoundError:
+                pass
+            raise HTTPException(status_code=409, detail="Selected-region OCR cancelled by user.") from exc
         job_store.update_status(
             job_id,
             stage=JobStage.UPLOADED,
@@ -466,6 +498,8 @@ def run_ocr_for_selected_boxes(
             error=str(exc),
         )
         raise HTTPException(status_code=500, detail=f"Selected-region OCR failed: {exc}") from exc
+    finally:
+        _finish_selected_ocr_tracking(job_id)
     status = job_store.load_status(job_id)
     updated_artifacts = dict(status.artifacts)
     updated_artifacts["ocr_results"] = str(ocr_region_service.region_store.ocr_results_path(job_dir))
@@ -512,6 +546,119 @@ def _summarize_ocr_results(payload: OcrResultsPayload) -> dict:
         "pages_with_text": sorted(pages_with_text),
         "pages_without_text": sorted(pages_without_text),
     }
+
+
+def _start_selected_ocr_tracking(job_id: str) -> None:
+    with _selected_ocr_lock:
+        _selected_ocr_cancelled_jobs.discard(job_id)
+        _selected_ocr_processes[job_id] = []
+
+
+def _finish_selected_ocr_tracking(job_id: str) -> None:
+    with _selected_ocr_lock:
+        _selected_ocr_cancelled_jobs.discard(job_id)
+        _selected_ocr_processes.pop(job_id, None)
+
+
+def _is_selected_ocr_cancelled(job_id: str) -> bool:
+    with _selected_ocr_lock:
+        return job_id in _selected_ocr_cancelled_jobs
+
+
+def _register_selected_ocr_process(job_id: str, process: subprocess.Popen) -> None:
+    with _selected_ocr_lock:
+        _selected_ocr_processes.setdefault(job_id, []).append(process)
+        cancelled = job_id in _selected_ocr_cancelled_jobs
+    if cancelled:
+        _terminate_process_tree(process)
+
+
+def _unregister_selected_ocr_process(job_id: str, process: subprocess.Popen) -> None:
+    with _selected_ocr_lock:
+        processes = _selected_ocr_processes.get(job_id, [])
+        _selected_ocr_processes[job_id] = [item for item in processes if item.pid != process.pid]
+
+
+def _cancel_selected_ocr_job(job_id: str) -> bool:
+    with _selected_ocr_lock:
+        processes = list(_selected_ocr_processes.get(job_id, []))
+        is_active = job_id in _selected_ocr_processes
+        if is_active:
+            _selected_ocr_cancelled_jobs.add(job_id)
+
+    if not is_active:
+        return False
+
+    for process in processes:
+        _terminate_process_tree(process)
+
+    try:
+        job_store.update_status(
+            job_id,
+            stage=JobStage.CANCELLED,
+            progress=1.0,
+            message="Selected-region OCR cancelled by user.",
+            error=None,
+        )
+    except FileNotFoundError:
+        pass
+    return True
+
+
+def _cancel_selected_ocr_jobs() -> dict[str, int]:
+    with _selected_ocr_lock:
+        job_ids = list(_selected_ocr_processes)
+    cancelled = 0
+    for job_id in job_ids:
+        if _cancel_selected_ocr_job(job_id):
+            cancelled += 1
+    return {"selected_ocr_cancelled": cancelled}
+
+
+def _mark_interrupted_processing_jobs_cancelled() -> dict[str, int]:
+    processing_stages = {
+        JobStage.EXTRACTION,
+        JobStage.OCR_LAYOUT,
+        JobStage.STRUCTURE,
+        JobStage.TRANSLATION,
+        JobStage.PDF,
+    }
+    cancelled = 0
+    for status in job_store.list_jobs():
+        if status.stage not in processing_stages:
+            continue
+        try:
+            job_store.update_status(
+                status.job_id,
+                stage=JobStage.CANCELLED,
+                progress=1.0,
+                message="Cancelled by Stop All Processes.",
+                error=None,
+            )
+            cancelled += 1
+        except FileNotFoundError:
+            continue
+    return {"interrupted_cancelled": cancelled}
+
+
+def _terminate_process_tree(process: subprocess.Popen) -> None:
+    try:
+        if process.poll() is not None:
+            return
+        try:
+            pgid = os.getpgid(process.pid)
+        except Exception:
+            pgid = None
+        if pgid is not None:
+            os.killpg(pgid, signal.SIGTERM)
+        else:
+            process.terminate()
+    except Exception:
+        try:
+            if process.poll() is None:
+                process.kill()
+        except Exception:
+            pass
 
 
 def _selected_ocr_progress_from_event(event: dict) -> tuple[float, str] | None:

@@ -27,6 +27,7 @@ class RegionSource(str, Enum):
     PYMUPDF = "pymupdf"
     SURYA = "surya"
     MANUAL = "manual"
+    MANUAL_DRAWN = "manual_drawn"
 
 
 class Region(BaseModel):

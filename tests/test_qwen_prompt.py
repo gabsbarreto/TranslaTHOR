@@ -13,7 +13,7 @@ class DummyTokenizer:
 
 
 def test_qwen35_disables_thinking_via_chat_template_kwargs() -> None:
-    translator = MlxTranslator(TranslationSettings(model_name="mlx-community/Qwen3.5-9B-8bit"))
+    translator = MlxTranslator(TranslationSettings(model_name="mlx-community/Qwen3.5-4B-OptiQ-4bit"))
     tokenizer = DummyTokenizer()
     translator._tokenizer = tokenizer
 
@@ -25,7 +25,7 @@ def test_qwen35_disables_thinking_via_chat_template_kwargs() -> None:
 
 
 def test_qwen35_uses_translation_system_prompt() -> None:
-    translator = MlxTranslator(TranslationSettings(model_name="mlx-community/Qwen3.5-9B-8bit"))
+    translator = MlxTranslator(TranslationSettings(model_name="mlx-community/Qwen3.5-4B-OptiQ-4bit"))
     prompt = translator._system_prompt()
     assert "PDF reconstruction" in prompt
     assert "TEXT may contain plain text, Markdown, or HTML" in prompt

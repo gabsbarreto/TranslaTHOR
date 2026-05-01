@@ -51,7 +51,7 @@ class DeepSeekOcrPipeline:
         job_dir: Path,
         dpi: int,
         preprocess: dict[str, bool | float],
-        model_name: str = "mlx-community/DeepSeek-OCR-2-bf16",
+        model_name: str = "mlx-community/DeepSeek-OCR-2-8bit",
         max_tokens: int = 4096,
         prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
         crop_mode: bool = True,
@@ -417,7 +417,7 @@ class DeepSeekOcrPipeline:
         image_paths: list[Path],
         output_dir: Path,
         output_names: list[str],
-        model_name: str = "mlx-community/DeepSeek-OCR-2-bf16",
+        model_name: str = "mlx-community/DeepSeek-OCR-2-8bit",
         max_tokens: int = 4096,
         prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
         crop_mode: bool = True,
@@ -429,6 +429,9 @@ class DeepSeekOcrPipeline:
         ngram_size: int = 20,
         ngram_window: int = 90,
         on_ocr_progress: Callable[[dict], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        on_process_started: Callable[[subprocess.Popen], None] | None = None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None = None,
     ) -> dict[str, str]:
         output_dir.mkdir(parents=True, exist_ok=True)
         self._run_pdf_ocr(
@@ -447,6 +450,9 @@ class DeepSeekOcrPipeline:
             ngram_window=ngram_window,
             output_names=output_names,
             on_ocr_progress=on_ocr_progress,
+            cancel_requested=cancel_requested,
+            on_process_started=on_process_started,
+            on_process_finished=on_process_finished,
         )
         results: dict[str, str] = {}
         for name in output_names:
@@ -488,7 +494,7 @@ class DeepSeekOcrPipeline:
         thread.start()
         while thread.is_alive():
             thread.join(timeout=0.2)
-            if cancel_requested():
+            if cancel_requested is not None and cancel_requested():
                 process.terminate()
         thread.join()
         return result["stdout"], result["stderr"]

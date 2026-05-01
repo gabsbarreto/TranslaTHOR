@@ -79,6 +79,12 @@ button:disabled {
   border-color: #b9ad95;
 }
 
+.secondary-button.active {
+  background: #0e7a52;
+  border-color: #084d35;
+  color: #fff;
+}
+
 .settings-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
