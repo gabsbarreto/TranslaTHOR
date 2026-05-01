@@ -354,7 +354,7 @@ function syncWorkflowFromCurrentJob() {
   if (!state.region.jobId) return;
   const job = state.jobs.find((item) => item.job_id === state.region.jobId);
   if (!job) {
-    state.region = createEmptyRegionState();
+    resetRegionEditor();
     return;
   }
 
@@ -362,7 +362,9 @@ function syncWorkflowFromCurrentJob() {
     state.region.ocrStatus = "completed";
     state.region.translationStatus = "completed";
     state.region.workflowStep = "export";
-  } else if (job.stage === "failed" || job.stage === "cancelled") {
+  } else if (job.stage === "cancelled") {
+    resetRegionEditor();
+  } else if (job.stage === "failed") {
     if (state.region.ocrStatus === "running") state.region.ocrStatus = "failed";
     if (state.region.translationStatus === "running") {
       state.region.translationStatus = "failed";
@@ -396,6 +398,27 @@ async function clearResults() {
   }
 }
 
+function forcePageRefresh() {
+  const url = new URL(window.location.href);
+  url.searchParams.set("_refresh", Date.now().toString());
+  window.location.replace(url.toString());
+}
+
+function resetRegionEditor() {
+  state.region = createEmptyRegionState();
+  if (canvasState.stage) {
+    canvasState.stage.destroy();
+    canvasState.stage = null;
+  }
+  canvasState.boxNodes = new Map();
+  canvasState.activeBoxId = null;
+  canvasState.drawMode = false;
+  resetDraftRegion();
+  if (regionCanvasEl) regionCanvasEl.innerHTML = "";
+  if (boxListEl) boxListEl.innerHTML = "";
+  renderRegionStatus();
+}
+
 async function cleanTerminalJobs() {
   const confirmed = window.confirm("Remove cancelled and failed jobs from the list?");
   if (!confirmed) return;
@@ -405,7 +428,7 @@ async function cleanTerminalJobs() {
     const res = await fetch("/api/jobs/cleanup-terminal", { method: "DELETE" });
     const data = await parseJsonResponse(res);
     if (!res.ok) throw new Error(data.detail || "Cleanup failed");
-    await pollJobs();
+    forcePageRefresh();
   } catch (error) {
     window.alert(error.message || "Cleanup failed");
   } finally {
@@ -421,7 +444,7 @@ async function stopAllProcesses() {
   try {
     const res = await fetch("/api/jobs/stop-all", { method: "POST" });
     if (!res.ok) throw new Error("Stop-all failed");
-    await pollJobs();
+    forcePageRefresh();
   } catch (error) {
     window.alert(error.message || "Stop-all failed");
   } finally {
@@ -481,6 +504,8 @@ function renderQueue() {
       <div class="downloads">
         ${cancelQueuedButton(job)}
         ${reloadOcrButton(job)}
+        ${sourceMarkdownDownloadLink(job)}
+        ${sourcePdfDownloadLink(job, "readable", "OCR PDF")}
         ${pdfDownloadLink(job, "readable", "Readable PDF")}
         ${pdfDownloadLink(job, "faithful", "Faithful PDF")}
         ${downloadLink(job, "markdown", "Markdown")}
@@ -555,6 +580,18 @@ function pdfDownloadLink(job, mode, label) {
   return `<a href="/api/jobs/${job.job_id}/pdf/${mode}" target="_blank"><button>${label}</button></a>`;
 }
 
+function sourceMarkdownDownloadLink(job) {
+  const hasSource = Boolean(job.artifacts && (job.artifacts.source_markdown || job.artifacts.ocr_results));
+  if (!hasSource) return "";
+  return `<a href="/api/jobs/${job.job_id}/artifacts/source_markdown" target="_blank"><button>OCR Markdown</button></a>`;
+}
+
+function sourcePdfDownloadLink(job, mode, label) {
+  const hasSource = Boolean(job.artifacts && (job.artifacts.source_markdown || job.artifacts.ocr_results));
+  if (!hasSource) return "";
+  return `<a href="/api/jobs/${job.job_id}/ocr-pdf/${mode}" target="_blank"><button>${label}</button></a>`;
+}
+
 function translationInfoLine(job) {
   if (job.stage !== "complete" || !job.translation) return "";
   const model = String(job.translation.model || "").trim();
@@ -585,7 +622,7 @@ async function cancelQueuedJob(job) {
     const res = await fetch(`/api/jobs/${job.job_id}/cancel`, { method: "POST" });
     const data = await parseJsonResponse(res);
     if (!res.ok) throw new Error(data.detail || "Unable to cancel queued job");
-    await pollJobs();
+    forcePageRefresh();
   } catch (error) {
     window.alert(error.message || "Unable to cancel queued job");
   }
@@ -1762,6 +1799,7 @@ async function runSelectedOcr() {
     if (!res.ok) throw new Error(data.detail || "Selected OCR failed");
     state.region.ocrStatus = "completed";
     state.region.workflowStep = "translate";
+    await pollJobs();
     const pagesWithText = Number(data.pages_with_text_count || 0);
     const selectedPages = Number(data.selected_page_count || 0);
     const emptyPages = Array.isArray(data.pages_without_text) ? data.pages_without_text : [];
@@ -1805,6 +1843,7 @@ async function runSingleRegionOcr(box) {
     if (!res.ok) throw new Error(data.detail || "Single-region OCR failed");
     state.region.ocrStatus = "completed";
     state.region.workflowStep = "translate";
+    await pollJobs();
     const chars = Array.isArray(data.pages_with_text) && data.pages_with_text.length ? "Text found." : "No text found.";
     window.alert(`OCR completed for region "${box.id}". ${chars}`);
   } catch (error) {

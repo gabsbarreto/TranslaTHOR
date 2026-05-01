@@ -145,7 +145,8 @@ def stop_all_jobs() -> dict[str, int]:
     result = job_queue.stop_all()
     selected_result = _cancel_selected_ocr_jobs()
     interrupted_result = _mark_interrupted_processing_jobs_cancelled()
-    return {**result, **selected_result, **interrupted_result}
+    draft_result = _mark_uploaded_draft_jobs_cancelled()
+    return {**result, **selected_result, **interrupted_result, **draft_result}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -163,6 +164,8 @@ def _cancel_job_impl(job_id: str) -> dict[str, str]:
     if result["status"] == "not_found":
         if _cancel_selected_ocr_job(job_id):
             return {"status": "selected_ocr_cancelled"}
+        if _mark_uploaded_draft_job_cancelled(job_id):
+            return {"status": "draft_cancelled"}
         raise HTTPException(status_code=404, detail="Job is not queued or active.")
     return result
 
@@ -503,6 +506,8 @@ def run_ocr_for_selected_boxes(
     status = job_store.load_status(job_id)
     updated_artifacts = dict(status.artifacts)
     updated_artifacts["ocr_results"] = str(ocr_region_service.region_store.ocr_results_path(job_dir))
+    source_md_path = _write_selected_ocr_source_markdown(job_id, results)
+    updated_artifacts["source_markdown"] = str(source_md_path)
     summary = _summarize_ocr_results(results)
     empty_note = ""
     if summary["pages_without_text_count"]:
@@ -641,6 +646,33 @@ def _mark_interrupted_processing_jobs_cancelled() -> dict[str, int]:
     return {"interrupted_cancelled": cancelled}
 
 
+def _mark_uploaded_draft_job_cancelled(job_id: str) -> bool:
+    try:
+        status = job_store.load_status(job_id)
+    except FileNotFoundError:
+        return False
+    if status.stage != JobStage.UPLOADED:
+        return False
+    job_store.update_status(
+        job_id,
+        stage=JobStage.CANCELLED,
+        progress=1.0,
+        message="Cancelled before OCR started.",
+        error=None,
+    )
+    return True
+
+
+def _mark_uploaded_draft_jobs_cancelled() -> dict[str, int]:
+    cancelled = 0
+    for status in job_store.list_jobs():
+        if status.stage != JobStage.UPLOADED:
+            continue
+        if _mark_uploaded_draft_job_cancelled(status.job_id):
+            cancelled += 1
+    return {"draft_cancelled": cancelled}
+
+
 def _terminate_process_tree(process: subprocess.Popen) -> None:
     try:
         if process.poll() is not None:
@@ -709,9 +741,18 @@ def _status_dump_with_region_artifacts(status) -> dict:
     data = status.model_dump()
     job_dir = job_store.get_job_dir(status.job_id)
     all_regions = ocr_region_service.region_store.all_regions_path(job_dir)
+    ocr_results = ocr_region_service.region_store.ocr_results_path(job_dir)
+    source_markdown = job_dir / "artifacts" / "source.md"
     if all_regions.exists():
         artifacts = dict(data.get("artifacts") or {})
         artifacts.setdefault("ocr_regions", str(all_regions))
+        data["artifacts"] = artifacts
+    if ocr_results.exists() or source_markdown.exists():
+        artifacts = dict(data.get("artifacts") or {})
+        if ocr_results.exists():
+            artifacts.setdefault("ocr_results", str(ocr_results))
+        if source_markdown.exists():
+            artifacts.setdefault("source_markdown", str(source_markdown))
         data["artifacts"] = artifacts
     return data
 
@@ -837,6 +878,9 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
         path = _ensure_pdf_artifact(job_id, artifact_type)
         filename = path.name
         return FileResponse(path, media_type="application/pdf", filename=filename)
+    if artifact_type == "source_markdown":
+        path = _ensure_ocr_source_markdown(job_id)
+        return FileResponse(path, media_type="text/markdown", filename=path.name)
 
     path_str = status.artifacts.get(artifact_type)
     if not path_str:
@@ -849,6 +893,7 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
     media = {
         "pdf": "application/pdf",
         "markdown": "text/markdown",
+        "source_markdown": "text/markdown",
         "json": "application/json",
         "profile_json": "application/json",
         "profile_csv": "text/csv",
@@ -866,6 +911,15 @@ def get_pdf(job_id: str, mode: str) -> FileResponse:
         raise HTTPException(status_code=400, detail="Unsupported PDF mode")
     artifact_type = "pdf_faithful" if mode in {"faithful", "visual_sandwich_pdf"} else "pdf_readable"
     path = _ensure_pdf_artifact(job_id, artifact_type)
+    return FileResponse(path, media_type="application/pdf", filename=path.name)
+
+
+@app.get("/api/jobs/{job_id}/ocr-pdf/{mode}")
+def get_ocr_pdf(job_id: str, mode: str) -> FileResponse:
+    valid_modes = {"readable", "faithful"}
+    if mode not in valid_modes:
+        raise HTTPException(status_code=400, detail="Unsupported PDF mode")
+    path = _ensure_ocr_source_pdf_artifact(job_id, mode)
     return FileResponse(path, media_type="application/pdf", filename=path.name)
 
 
@@ -917,6 +971,83 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
         job_store.update_status(job_id, artifacts=updated_artifacts)
 
     return pdf_path
+
+
+def _ensure_ocr_source_markdown(job_id: str) -> Path:
+    try:
+        status = job_store.load_status(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+
+    job_dir = job_store.get_job_dir(job_id)
+    artifacts_dir = job_dir / "artifacts"
+    source_md_path = Path(status.artifacts.get("source_markdown", artifacts_dir / "source.md"))
+    if source_md_path.exists():
+        return source_md_path
+
+    full_page_dir = job_dir / "deepseek_ocr"
+    page_markdown = sorted(full_page_dir.glob("page_*.md")) if full_page_dir.exists() else []
+    if page_markdown:
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        text = "\n\n".join(path.read_text(encoding="utf-8", errors="ignore").strip() for path in page_markdown)
+        source_md_path.write_text(text.strip() + "\n", encoding="utf-8")
+        _record_source_markdown_artifact(job_id, source_md_path)
+        return source_md_path
+
+    payload = ocr_region_service.region_store.load_ocr_results(job_dir)
+    if payload is not None and payload.results:
+        source_md_path = _write_selected_ocr_source_markdown(job_id, payload)
+        _record_source_markdown_artifact(job_id, source_md_path)
+        return source_md_path
+
+    raise HTTPException(status_code=404, detail="Original OCR markdown is not available for this job.")
+
+
+def _ensure_ocr_source_pdf_artifact(job_id: str, mode: str) -> Path:
+    source_md_path = _ensure_ocr_source_markdown(job_id)
+    status = job_store.load_status(job_id)
+    artifacts_dir = job_store.get_job_dir(job_id) / "artifacts"
+    key = f"source_pdf_{mode}"
+    pdf_path = Path(status.artifacts.get(key, artifacts_dir / f"source_ocr_{mode}.pdf"))
+    if not pdf_path.exists():
+        markdown_text = source_md_path.read_text(encoding="utf-8", errors="ignore")
+        html = reconstructor.markdown_to_html(markdown_text, title=f"OCR source - {status.filename}", output_mode=mode)
+        reconstructor.html_to_pdf(html, pdf_path)
+        updated_artifacts = dict(status.artifacts)
+        updated_artifacts["source_markdown"] = str(source_md_path)
+        updated_artifacts[key] = str(pdf_path)
+        job_store.update_status(job_id, artifacts=updated_artifacts)
+    return pdf_path
+
+
+def _write_selected_ocr_source_markdown(job_id: str, payload: OcrResultsPayload) -> Path:
+    job_dir = job_store.get_job_dir(job_id)
+    out_path = job_dir / "artifacts" / "source.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    page_order: dict[int, list] = {}
+    for item in sorted(payload.results, key=lambda result: (result.page_number, result.reading_order, result.box_id)):
+        if not item.ocr_text.strip():
+            continue
+        page_order.setdefault(item.page_number, []).append(item)
+
+    lines: list[str] = []
+    for page_number in sorted(page_order):
+        lines.append(f"<!-- page: {page_number} -->")
+        for item in page_order[page_number]:
+            lines.append(item.ocr_text.strip())
+            lines.append("")
+    out_path.write_text("\n".join(lines).strip() + "\n", encoding="utf-8")
+    return out_path
+
+
+def _record_source_markdown_artifact(job_id: str, source_md_path: Path) -> None:
+    try:
+        status = job_store.load_status(job_id)
+    except FileNotFoundError:
+        return
+    artifacts = dict(status.artifacts)
+    artifacts["source_markdown"] = str(source_md_path)
+    job_store.update_status(job_id, artifacts=artifacts)
 
 
 def _build_job_settings(

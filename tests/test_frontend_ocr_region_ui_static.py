@@ -73,3 +73,26 @@ def test_canvas_drag_drawing_ignores_tiny_regions_and_normalizes_direction() -> 
 def test_add_region_button_still_uses_default_manual_box() -> None:
     assert 'addBoxBtn?.addEventListener("click", addManualBox);' in APP_JS
     assert "function buildManualBox" in APP_JS
+
+
+def test_cancelled_region_job_clears_visual_editor() -> None:
+    assert "function resetRegionEditor" in APP_JS
+    assert 'job.stage === "cancelled"' in APP_JS
+    assert "resetRegionEditor();" in APP_JS
+
+
+def test_original_ocr_download_buttons_are_available() -> None:
+    assert "function sourceMarkdownDownloadLink" in APP_JS
+    assert "function sourcePdfDownloadLink" in APP_JS
+    assert "/artifacts/source_markdown" in APP_JS
+    assert "/ocr-pdf/" in APP_JS
+    assert "OCR Markdown" in APP_JS
+    assert "OCR PDF" in APP_JS
+
+
+def test_cancel_stop_and_cleanup_force_page_refresh() -> None:
+    assert "function forcePageRefresh" in APP_JS
+    assert 'url.searchParams.set("_refresh", Date.now().toString());' in APP_JS
+    assert "window.location.replace(url.toString());" in APP_JS
+    assert APP_JS.count("forcePageRefresh();") >= 3
+    assert "20260501-force-cancel-refresh" in INDEX_HTML

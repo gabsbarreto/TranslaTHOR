@@ -279,6 +279,7 @@ class TranslationPipeline:
                 artifacts={
                     "json": str(json_path),
                     "markdown": str(md_path),
+                    "source_markdown": str(source_md_path),
                     "debug_markdown": str(md_path),
                     "pdf_readable": str(pdf_readable),
                     "pdf_faithful": str(pdf_faithful),
