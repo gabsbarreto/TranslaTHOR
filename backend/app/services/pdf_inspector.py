@@ -2,14 +2,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pdfplumber
-from pypdf import PdfReader
-
 from app.models.inspection import PageInspection, PdfInspection
+
+try:
+    from pypdf import PdfReader
+except Exception:  # pragma: no cover - exercised only in lightweight test envs
+    PdfReader = None
+
+try:
+    import pdfplumber
+except Exception:  # pragma: no cover - exercised only in lightweight test envs
+    pdfplumber = None
 
 
 class PdfInspector:
     def inspect(self, pdf_path: Path) -> PdfInspection:
+        if pdfplumber is None or PdfReader is None:
+            raise RuntimeError("pypdf and pdfplumber are required for PDF inspection. Install project dependencies first.")
         reader = PdfReader(str(pdf_path))
         metadata = reader.metadata or {}
         pages: list[PageInspection] = []

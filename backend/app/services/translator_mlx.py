@@ -221,14 +221,19 @@ class MlxTranslator:
                     chunk.source_language,
                 )
             else:
-                translated = self._translate_chunk(chunk.source_text, effective_context, chunk.source_language)
+                translated = self._translate_chunk_with_validation(
+                    chunk.source_text,
+                    effective_context,
+                    chunk.source_language,
+                    block_type,
+                )
             chunk.translated_text = translated
             translated_chunks.append(chunk)
             if on_chunk_translated is not None:
                 preview = translated.replace("\n", " ").strip()
                 on_chunk_translated(index, total_chunks, preview[:160])
 
-        for chunk in translated_chunks:
+        for chunk in self._coalesce_translated_chunks(translated_chunks):
             self._apply_translation_to_target(chunk, block_by_id, table_by_id)
 
         return document, translated_md
@@ -414,6 +419,43 @@ class MlxTranslator:
             if block is not None:
                 block.text = ""
                 block.metadata["merged_into_block_id"] = first.id
+
+    def _coalesce_translated_chunks(self, chunks: list[TranslationChunk]) -> list[TranslationChunk]:
+        out: list[TranslationChunk] = []
+        index = 0
+        while index < len(chunks):
+            chunk = chunks[index]
+            if not chunk.block_ids or self._is_table_target(chunk.block_ids[0]):
+                out.append(chunk)
+                index += 1
+                continue
+
+            block_ids = tuple(chunk.block_ids)
+            group = [chunk]
+            index += 1
+            while index < len(chunks) and tuple(chunks[index].block_ids) == block_ids:
+                group.append(chunks[index])
+                index += 1
+
+            if len(group) == 1:
+                out.append(chunk)
+                continue
+
+            out.append(
+                chunk.model_copy(
+                    update={
+                        "id": group[0].id,
+                        "source_text": "\n\n".join(item.source_text.strip() for item in group if item.source_text.strip()),
+                        "translated_text": "\n\n".join(
+                            item.translated_text.strip() for item in group if item.translated_text.strip()
+                        ),
+                    }
+                )
+            )
+        return out
+
+    def _is_table_target(self, target_id: str) -> bool:
+        return target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(self.TABLE_ROW_PREFIX)
 
     def _split_table_translation(self, translated_text: str, source_text: str, expected_cells: int) -> list[str]:
         parts = [part.strip() for part in translated_text.split(self.TABLE_DELIMITER)]
@@ -611,6 +653,72 @@ class MlxTranslator:
         except Exception as exc:
             logger.warning("Chunk translation failed; returning source text for this chunk: %s", exc)
             return text
+
+    def _translate_chunk_with_validation(
+        self,
+        text: str,
+        context: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+    ) -> str:
+        translated = self._translate_chunk(text, context, source_language)
+        if self._is_valid_chunk_translation_structure(text, translated, block_type):
+            return translated
+
+        retry_context = (
+            f"{context}\n"
+            "Preserve the source structure exactly: keep paragraph boundaries, list boundaries, headings, "
+            "Markdown markers, citations, numbers, and line breaks that separate logical blocks. "
+            "Do not summarize, omit, or collapse content."
+        ).strip()
+        retried = self._translate_chunk(text, retry_context, source_language)
+        if self._is_valid_chunk_translation_structure(text, retried, block_type):
+            return retried
+
+        logger.warning("Chunk translation failed structure validation after retry; returning source text.")
+        return text
+
+    def _is_valid_chunk_translation_structure(
+        self,
+        source: str,
+        translated: str,
+        block_type: BlockType | None,
+    ) -> bool:
+        source = source.strip()
+        translated = translated.strip()
+        if not source:
+            return not translated
+        if not translated:
+            return False
+
+        if len(source) >= 200 and len(translated) < max(40, int(len(source) * 0.20)):
+            return False
+
+        source_paragraphs = self._paragraph_count(source)
+        translated_paragraphs = self._paragraph_count(translated)
+        if source_paragraphs >= 3 and translated_paragraphs < max(2, source_paragraphs // 2):
+            return False
+
+        source_list_items = self._markdown_list_item_count(source)
+        if source_list_items and self._markdown_list_item_count(translated) < source_list_items:
+            return False
+
+        source_heading_count = self._markdown_heading_count(source)
+        if source_heading_count and self._markdown_heading_count(translated) < source_heading_count:
+            return False
+
+        if block_type == BlockType.HEADING and "\n\n" in translated:
+            return False
+        return True
+
+    def _paragraph_count(self, text: str) -> int:
+        return len([part for part in re.split(r"\n\s*\n", text.strip()) if part.strip()])
+
+    def _markdown_list_item_count(self, text: str) -> int:
+        return len(re.findall(r"(?m)^\s*[-*+]\s+\S", text))
+
+    def _markdown_heading_count(self, text: str) -> int:
+        return len(re.findall(r"(?m)^\s{0,3}#{1,6}\s+\S", text))
 
     def _translate_table_markup_chunk(self, text: str, context: str, source_language: str | None) -> str:
         text = self._normalize_table_markup_for_translation(text)

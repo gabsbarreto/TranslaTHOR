@@ -42,10 +42,14 @@ h1, h2, h3 { font-family: "IBM Plex Sans", "Avenir Next", sans-serif; margin: 0 
 .dropzone {
   border: 2px dashed var(--accent);
   border-radius: 10px;
-  padding: 20px;
+  padding: 24px;
   text-align: center;
   margin-bottom: 12px;
   background: #f8fff9;
+}
+
+.dropzone p {
+  margin: 0 0 10px;
 }
 
 .dropzone.dragover { background: #e8f7ed; }
@@ -73,6 +77,12 @@ button:disabled {
   background: #efe8db;
   color: var(--ink);
   border-color: #b9ad95;
+}
+
+.secondary-button.active {
+  background: #0e7a52;
+  border-color: #084d35;
+  color: #fff;
 }
 
 .settings-grid {
@@ -178,11 +188,12 @@ button:disabled {
 }
 
 .progress {
-  height: 9px;
+  height: 18px;
   border-radius: 20px;
   overflow: hidden;
   background: #efe8db;
   margin: 8px 0;
+  position: relative;
 }
 
 .progress > span {
@@ -190,6 +201,20 @@ button:disabled {
   height: 100%;
   background: linear-gradient(90deg, #136d4a, #26a76e);
   transition: width .25s ease;
+}
+
+.progress > small {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #173326;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .02em;
+  line-height: 1;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, .55);
 }
 
 .stage {
@@ -210,4 +235,179 @@ button:disabled {
   gap: 8px;
   margin-top: 8px;
   flex-wrap: wrap;
+}
+
+.workflow-steps {
+  counter-reset: workflow;
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 6px;
+  list-style: none;
+  margin: 8px 0 12px;
+  padding: 0;
+}
+
+.workflow-steps li {
+  align-items: center;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  gap: 6px;
+  min-height: 38px;
+  padding: 6px 8px;
+}
+
+.workflow-steps li::before {
+  align-items: center;
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  content: counter(workflow);
+  counter-increment: workflow;
+  display: inline-flex;
+  flex: 0 0 20px;
+  height: 20px;
+  justify-content: center;
+  width: 20px;
+}
+
+.workflow-steps li.active {
+  background: #eef9f2;
+  border-color: #0f6a47;
+  color: #0f5539;
+  font-weight: 700;
+}
+
+.workflow-steps li.done {
+  background: #f8fff9;
+  color: #0f5539;
+}
+
+.workflow-steps li.blocked {
+  opacity: .62;
+}
+
+.region-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.workflow-actions {
+  border-top: 1px solid var(--border);
+  display: grid;
+  gap: 8px;
+  grid-template-columns: 1fr;
+  margin: 4px 0 12px;
+  padding-top: 12px;
+}
+
+.workflow-actions button {
+  font-size: 15px;
+  font-weight: 700;
+  min-height: 44px;
+}
+
+.workflow-actions button:disabled {
+  background: #e8e0d1;
+  border-color: #cfc2aa;
+  color: #7a715f;
+}
+
+.region-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 320px;
+  gap: 12px;
+}
+
+.canvas-wrap {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #faf8f1;
+  padding: 8px;
+  min-height: 420px;
+  overflow: auto;
+}
+
+#regionCanvas {
+  min-height: 400px;
+}
+
+.region-sidebar {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px;
+  background: #fff;
+  max-height: 680px;
+  overflow: auto;
+}
+
+.region-sidebar h3 {
+  margin-top: 0;
+}
+
+.box-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.box-row {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  display: grid;
+  gap: 6px;
+}
+
+.box-row.selected {
+  border-color: #0f6a47;
+  background: #f3fff8;
+}
+
+.box-row-head {
+  display: flex;
+  justify-content: flex-start;
+  align-items: center;
+  gap: 6px;
+}
+
+.box-row label {
+  font-size: 12px;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.box-geometry {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.box-row input,
+.box-row select {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px;
+  font-size: 12px;
+}
+
+.tiny {
+  font-size: 12px;
+  padding: 4px 8px;
+}
+
+@media (max-width: 1000px) {
+  .region-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-steps {
+    grid-template-columns: 1fr;
+  }
 }

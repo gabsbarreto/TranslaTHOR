@@ -25,8 +25,10 @@ from app.models.schema import (
     SourceType,
     TableModel,
 )
+from app.models.regions import OcrRegionResult, OcrResultsPayload, RegionType
 from app.services.renderer import PageRenderer
 from app.services.profiler import PipelineProfiler
+from app.services.ocr_text_compiler import compile_ocr_results_to_document_text
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,7 @@ class DeepSeekOcrPipeline:
         job_dir: Path,
         dpi: int,
         preprocess: dict[str, bool | float],
-        model_name: str = "mlx-community/DeepSeek-OCR-2-bf16",
+        model_name: str = "mlx-community/DeepSeek-OCR-2-8bit",
         max_tokens: int = 4096,
         prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
         crop_mode: bool = True,
@@ -83,7 +85,7 @@ class DeepSeekOcrPipeline:
                         grayscale=bool(preprocess.get("grayscale", False)),
                         binarize=bool(preprocess.get("binarize", False)),
                         denoise=bool(preprocess.get("denoise", False)),
-                        contrast=float(preprocess.get("contrast", 1.0)),
+                        #contrast=float(preprocess.get("contrast", 1.0)),
                         profiler=profiler,
                         stage_prefix="page_rendering",
                     )
@@ -99,7 +101,7 @@ class DeepSeekOcrPipeline:
                         grayscale=bool(preprocess.get("grayscale", False)),
                         binarize=bool(preprocess.get("binarize", False)),
                         denoise=bool(preprocess.get("denoise", False)),
-                        contrast=float(preprocess.get("contrast", 1.0)),
+                        #contrast=float(preprocess.get("contrast", 1.0)),
                         profiler=profiler,
                         stage_prefix="page_rendering",
                     )
@@ -154,6 +156,168 @@ class DeepSeekOcrPipeline:
             ),
         )
 
+    def parse_selected_regions_document(
+        self,
+        inspection: PdfInspection,
+        ocr_results: OcrResultsPayload,
+        profiler: PipelineProfiler | None = None,
+        translation_input_mode: str = "continuous_document",
+    ) -> tuple[DocumentModel, str]:
+        if translation_input_mode == "continuous_document":
+            return self._parse_selected_regions_continuous_document(
+                inspection=inspection,
+                ocr_results=ocr_results,
+                profiler=profiler,
+            )
+        return self._parse_selected_regions_page_by_page(
+            inspection=inspection,
+            ocr_results=ocr_results,
+            profiler=profiler,
+        )
+
+    def _parse_selected_regions_continuous_document(
+        self,
+        inspection: PdfInspection,
+        ocr_results: OcrResultsPayload,
+        profiler: PipelineProfiler | None = None,
+    ) -> tuple[DocumentModel, str]:
+        compiled = compile_ocr_results_to_document_text(ocr_results)
+        first_page = compiled.spans[0].page_number if compiled.spans else 1
+        blocks = self._blocks_from_markdown(compiled.text, first_page, 0)
+        tables, figures = self._extract_structures_from_markdown(compiled.text, first_page)
+        span_payload = [
+            {
+                "page_number": span.page_number,
+                "box_id": span.box_id,
+                "reading_order": span.reading_order,
+                "source_start": span.start,
+                "source_end": span.end,
+            }
+            for span in compiled.spans
+        ]
+        for block in blocks:
+            block.metadata.update(
+                {
+                    "parser": "deepseek_ocr_2_regions",
+                    "translation_input_mode": "continuous_document",
+                }
+            )
+        if blocks:
+            # Keep source page/region offsets available for debugging and future
+            # layout-aware rebuilds while giving translation one continuous text.
+            blocks[0].metadata["ocr_region_spans"] = span_payload
+
+        with profiler.step("language_detection") if profiler is not None else _nullcontext():
+            language = self._detect_language(blocks)
+
+        doc = DocumentModel(
+            metadata=DocumentMetadata(
+                filename=inspection.filename,
+                title=inspection.title,
+                author=inspection.author,
+                page_count=inspection.page_count,
+                detected_language=language,
+                translation={"translation_input_mode": "continuous_document"},
+            ),
+            pages=[
+                PageMetadata(
+                    page_number=p.page_number,
+                    width=p.width,
+                    height=p.height,
+                    has_embedded_text=p.has_embedded_text,
+                    embedded_text_quality=p.embedded_text_quality,
+                    extraction_mode=SourceType.OCR,
+                )
+                for p in inspection.pages
+            ],
+            blocks=blocks,
+            tables=tables,
+            figures=figures,
+            warnings=[
+                "Parsed from selected OCR regions as one continuous document before translation chunking.",
+                "Original page/region offsets are preserved in block metadata for debugging.",
+            ],
+        )
+        # Return no marker markdown here so source.md and translated.md are both
+        # rendered from the same parsed block model. This keeps paragraph/list/
+        # heading boundaries aligned for PDF reconstruction.
+        return doc, ""
+
+    def _parse_selected_regions_page_by_page(
+        self,
+        inspection: PdfInspection,
+        ocr_results: OcrResultsPayload,
+        profiler: PipelineProfiler | None = None,
+    ) -> tuple[DocumentModel, str]:
+        region_items = sorted(
+            ocr_results.results,
+            key=lambda item: (item.page_number, item.reading_order, item.box_id),
+        )
+
+        blocks: list[Block] = []
+        pages_md: list[str] = []
+        page_order: dict[int, list[OcrRegionResult]] = {}
+        for item in region_items:
+            page_order.setdefault(item.page_number, []).append(item)
+
+        for page in inspection.pages:
+            page_items = page_order.get(page.page_number, [])
+            lines: list[str] = []
+            for item in page_items:
+                text = item.ocr_text.strip()
+                if not text:
+                    continue
+                block_type = self._region_type_to_block_type(item.box_type)
+                block = Block(
+                    id=f"deepseek-region-{item.page_number}-{item.box_id}",
+                    page_number=item.page_number,
+                    block_type=block_type,
+                    text=text,
+                    bbox=BoundingBox(x0=item.x0, y0=item.y0, x1=item.x1, y1=item.y1),
+                    confidence=item.ocr_confidence,
+                    reading_order_index=len(blocks),
+                    source_type=SourceType.OCR,
+                    metadata={
+                        "parser": "deepseek_ocr_2_regions",
+                        "region_id": item.box_id,
+                        "region_type": item.box_type.value,
+                    },
+                )
+                blocks.append(block)
+                lines.append(text)
+            pages_md.append(f"\n<!-- page: {page.page_number} -->\n\n" + "\n\n".join(lines).strip() + "\n")
+
+        with profiler.step("language_detection") if profiler is not None else _nullcontext():
+            language = self._detect_language(blocks)
+
+        doc = DocumentModel(
+            metadata=DocumentMetadata(
+                filename=inspection.filename,
+                title=inspection.title,
+                author=inspection.author,
+                page_count=inspection.page_count,
+                detected_language=language,
+            ),
+            pages=[
+                PageMetadata(
+                    page_number=p.page_number,
+                    width=p.width,
+                    height=p.height,
+                    has_embedded_text=p.has_embedded_text,
+                    embedded_text_quality=p.embedded_text_quality,
+                    extraction_mode=SourceType.OCR,
+                )
+                for p in inspection.pages
+            ],
+            blocks=blocks,
+            tables=[],
+            figures=[],
+            warnings=[
+                "Parsed from selected OCR regions. Reading order and box metadata were preserved from user-edited regions."
+            ],
+        )
+        return doc, "\n".join(pages_md)
+
     def _run_pdf_ocr(
         self,
         image_paths: list[Path],
@@ -169,9 +333,11 @@ class DeepSeekOcrPipeline:
         skip_repeat: bool,
         ngram_size: int,
         ngram_window: int,
+        output_names: list[str] | None = None,
         cancel_requested: Callable[[], bool] | None = None,
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
         on_process_finished: Callable[[subprocess.Popen], None] | None = None,
+        on_ocr_progress: Callable[[dict], None] | None = None,
     ) -> None:
         python_executable = os.getenv("DEEPSEEK_OCR_PYTHON", sys.executable)
         cmd = [
@@ -206,6 +372,8 @@ class DeepSeekOcrPipeline:
             "--ngram-window",
             str(ngram_window),
         ]
+        if output_names:
+            cmd.extend(["--names-json", json.dumps(output_names)])
         try:
             process = subprocess.Popen(
                 cmd,
@@ -216,14 +384,19 @@ class DeepSeekOcrPipeline:
             )
             if on_process_started is not None:
                 on_process_started(process)
-            stdout, stderr = self._communicate_with_cancel(process, cancel_requested)
+            stdout, stderr = self._communicate_with_cancel(
+                process,
+                cancel_requested,
+                on_stdout_line=self._ocr_worker_line_handler(on_ocr_progress) if on_ocr_progress is not None else None,
+            )
             if on_process_finished is not None:
                 on_process_finished(process)
             if process.returncode != 0:
                 raise subprocess.CalledProcessError(process.returncode, cmd, output=stdout, stderr=stderr)
-            for line in stdout.splitlines():
-                if '"event"' in line:
-                    logger.info("DeepSeek OCR worker: %s", line)
+            if on_ocr_progress is None:
+                for line in stdout.splitlines():
+                    if '"event"' in line:
+                        logger.info("DeepSeek OCR worker: %s", line)
         except FileNotFoundError as exc:
             raise RuntimeError(
                 "DeepSeek OCR requires a Python environment with mlx-vlm. "
@@ -238,30 +411,108 @@ class DeepSeekOcrPipeline:
                 f"conflicts, use a separate DeepSeek OCR env via DEEPSEEK_OCR_PYTHON. Details: {stderr[-1000:]}"
             ) from exc
 
+    def run_ocr_on_images(
+        self,
+        *,
+        image_paths: list[Path],
+        output_dir: Path,
+        output_names: list[str],
+        model_name: str = "mlx-community/DeepSeek-OCR-2-8bit",
+        max_tokens: int = 4096,
+        prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
+        crop_mode: bool = True,
+        min_crops: int = 2,
+        max_crops: int = 6,
+        base_size: int = 1024,
+        image_size: int = 768,
+        skip_repeat: bool = True,
+        ngram_size: int = 20,
+        ngram_window: int = 90,
+        on_ocr_progress: Callable[[dict], None] | None = None,
+        cancel_requested: Callable[[], bool] | None = None,
+        on_process_started: Callable[[subprocess.Popen], None] | None = None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None = None,
+    ) -> dict[str, str]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._run_pdf_ocr(
+            image_paths=image_paths,
+            output_dir=output_dir,
+            model_name=model_name,
+            max_tokens=max_tokens,
+            prompt=prompt,
+            crop_mode=crop_mode,
+            min_crops=min_crops,
+            max_crops=max_crops,
+            base_size=base_size,
+            image_size=image_size,
+            skip_repeat=skip_repeat,
+            ngram_size=ngram_size,
+            ngram_window=ngram_window,
+            output_names=output_names,
+            on_ocr_progress=on_ocr_progress,
+            cancel_requested=cancel_requested,
+            on_process_started=on_process_started,
+            on_process_finished=on_process_finished,
+        )
+        results: dict[str, str] = {}
+        for name in output_names:
+            md_path = output_dir / f"{name}.md"
+            if md_path.exists():
+                results[name] = md_path.read_text(encoding="utf-8", errors="ignore")
+        return results
+
     def _communicate_with_cancel(
         self,
         process: subprocess.Popen,
         cancel_requested: Callable[[], bool] | None = None,
+        on_stdout_line: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
-        if cancel_requested is None:
+        if cancel_requested is None and on_stdout_line is None:
             stdout, stderr = process.communicate()
             return stdout, stderr
 
         result: dict[str, str] = {"stdout": "", "stderr": ""}
 
         def target() -> None:
-            stdout, stderr = process.communicate()
-            result["stdout"] = stdout
+            if on_stdout_line is None:
+                stdout, stderr = process.communicate()
+                result["stdout"] = stdout
+                result["stderr"] = stderr
+                return
+
+            stdout_chunks: list[str] = []
+            assert process.stdout is not None
+            for line in process.stdout:
+                stdout_chunks.append(line)
+                on_stdout_line(line)
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            process.wait()
+            result["stdout"] = "".join(stdout_chunks)
             result["stderr"] = stderr
 
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
         while thread.is_alive():
             thread.join(timeout=0.2)
-            if cancel_requested():
+            if cancel_requested is not None and cancel_requested():
                 process.terminate()
         thread.join()
         return result["stdout"], result["stderr"]
+
+    def _ocr_worker_line_handler(self, on_ocr_progress: Callable[[dict], None] | None) -> Callable[[str], None]:
+        def handle(line: str) -> None:
+            if '"event"' not in line:
+                return
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                logger.debug("Unable to parse OCR worker progress event: %s", line.strip())
+                return
+            logger.info("DeepSeek OCR worker: %s", line.strip())
+            if on_ocr_progress is not None:
+                on_ocr_progress(event)
+
+        return handle
 
     def _clean_mlx_vlm_output(self, output: str) -> str:
         text = output.strip()
@@ -353,6 +604,20 @@ class DeepSeekOcrPipeline:
             source_type=SourceType.OCR,
             metadata={"parser": "deepseek_ocr_2"},
         )
+
+    def _region_type_to_block_type(self, region_type: RegionType) -> BlockType:
+        mapping = {
+            RegionType.PAGE: BlockType.PARAGRAPH,
+            RegionType.TEXT: BlockType.PARAGRAPH,
+            RegionType.TABLE: BlockType.TABLE,
+            RegionType.FIGURE: BlockType.FIGURE,
+            RegionType.CAPTION: BlockType.CAPTION,
+            RegionType.HEADER: BlockType.HEADER,
+            RegionType.FOOTER: BlockType.FOOTER,
+            RegionType.REFERENCE: BlockType.REFERENCE,
+            RegionType.OTHER: BlockType.UNKNOWN,
+        }
+        return mapping.get(region_type, BlockType.UNKNOWN)
 
     def _extract_structures_from_markdown(self, markdown: str, page_number: int) -> tuple[list[TableModel], list[FigureAsset]]:
         tables: list[TableModel] = []
