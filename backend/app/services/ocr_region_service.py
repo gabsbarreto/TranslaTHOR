@@ -8,6 +8,7 @@ from typing import Callable
 
 from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
+from app.config import DEFAULT_SELECTED_OCR_PRIMARY_JPEG_QUALITY, DEFAULT_SELECTED_OCR_PRIMARY_SCALE
 from app.models.inspection import PdfInspection
 from app.models.regions import (
     CoordinateSpace,
@@ -29,6 +30,8 @@ DEFAULT_BOX_INSET_RATIO = 0.03
 SELECTED_OCR_PADDING = 0.10
 SELECTED_OCR_RETRY_CONTRAST = 1.8
 SELECTED_OCR_RETRY_COORD_SNAP = 0.001
+SELECTED_OCR_PRIMARY_SCALE = DEFAULT_SELECTED_OCR_PRIMARY_SCALE
+SELECTED_OCR_PRIMARY_JPEG_QUALITY = DEFAULT_SELECTED_OCR_PRIMARY_JPEG_QUALITY
 
 
 class OcrRegionService:
@@ -201,10 +204,12 @@ class OcrRegionService:
             raise ValueError("No selected regions were found.")
 
         masked_dir = self.region_store.ocr_region_dir(job_dir) / "masked_pages"
+        optimized_dir = self.region_store.ocr_region_dir(job_dir) / "optimized_crops"
         retry_dir = self.region_store.ocr_region_dir(job_dir) / "retry_crops"
         md_dir = self.region_store.ocr_region_dir(job_dir) / "markdown"
         debug_dir = self.region_store.ocr_region_dir(job_dir) / "debug"
         masked_dir.mkdir(parents=True, exist_ok=True)
+        optimized_dir.mkdir(parents=True, exist_ok=True)
         retry_dir.mkdir(parents=True, exist_ok=True)
         md_dir.mkdir(parents=True, exist_ok=True)
         debug_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +235,7 @@ class OcrRegionService:
             safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", region.id)
             output_name = f"p{page_number:04d}_{safe_id}"
             masked_path = masked_dir / f"{output_name}.png"
+            optimized_path = optimized_dir / f"{output_name}.jpg"
 
             self._save_masked_page_region(
                 image_path=image_path,
@@ -237,7 +243,17 @@ class OcrRegionService:
                 output_path=masked_path,
                 padding=SELECTED_OCR_PADDING,
             )
+            self._save_optimized_raw_crop_region(
+                image_path=image_path,
+                region=region,
+                output_path=optimized_path,
+                scale=SELECTED_OCR_PRIMARY_SCALE,
+                quality=SELECTED_OCR_PRIMARY_JPEG_QUALITY,
+            )
             with Image.open(masked_path) as masked_image:
+                with Image.open(optimized_path) as optimized_image:
+                    optimized_width = optimized_image.width
+                    optimized_height = optimized_image.height
                 debug_payload = self._write_region_debug_images(
                     image_path=image_path,
                     region=region,
@@ -246,11 +262,17 @@ class OcrRegionService:
                     padding=SELECTED_OCR_PADDING,
                 )
                 ocr_image_metadata[output_name] = {
-                    "ocr_image_mode": "masked_page_padded",
-                    "ocr_image_path": str(masked_path),
-                    "ocr_image_width": masked_image.width,
-                    "ocr_image_height": masked_image.height,
-                    "ocr_padding": SELECTED_OCR_PADDING,
+                    "ocr_image_mode": "raw_crop_jpeg_s075_q75",
+                    "ocr_image_path": str(optimized_path),
+                    "ocr_image_width": optimized_width,
+                    "ocr_image_height": optimized_height,
+                    "ocr_raw_crop_scale": SELECTED_OCR_PRIMARY_SCALE,
+                    "ocr_jpeg_quality": SELECTED_OCR_PRIMARY_JPEG_QUALITY,
+                    "ocr_padding": 0.0,
+                    "masked_page_path": str(masked_path),
+                    "masked_page_width": masked_image.width,
+                    "masked_page_height": masked_image.height,
+                    "masked_page_padding": SELECTED_OCR_PADDING,
                     "debug_json_path": str(debug_payload["debug_json_path"]),
                     "raw_crop_width": debug_payload["raw_crop_width"],
                     "raw_crop_height": debug_payload["raw_crop_height"],
@@ -260,7 +282,7 @@ class OcrRegionService:
                     "padded_crop_nonwhite_ratio": debug_payload["padded_crop_nonwhite_ratio"],
                 }
 
-            ocr_inputs.append((masked_path, output_name))
+            ocr_inputs.append((optimized_path, output_name))
             output_names.append(output_name)
             mapping[output_name] = (page_payload, region)
 
@@ -452,6 +474,32 @@ class OcrRegionService:
             masked.paste(source.crop((left, top, right, bottom)), (left, top))
             masked.save(output_path)
 
+    def _save_optimized_raw_crop_region(
+        self,
+        *,
+        image_path: Path,
+        region: Region,
+        output_path: Path,
+        scale: float,
+        quality: int,
+    ) -> None:
+        with Image.open(image_path) as image:
+            source = image.convert("RGB")
+            bbox = normalized_to_image_bbox(
+                x0=region.x0,
+                y0=region.y0,
+                x1=region.x1,
+                y1=region.y1,
+                image_width=source.width,
+                image_height=source.height,
+            )
+            crop = source.crop(bbox)
+            if scale != 1.0:
+                width = max(1, int(crop.width * scale))
+                height = max(1, int(crop.height * scale))
+                crop = crop.resize((width, height), Image.Resampling.LANCZOS)
+            crop.save(output_path, format="JPEG", quality=quality, optimize=True)
+
     def _write_region_debug_images(
         self,
         *,
@@ -584,7 +632,7 @@ class OcrRegionService:
         """Snap retry crops to 0.1 percentage-point UI increments.
 
         Konva/browser editing stores normalized floats with more precision than
-        the user-visible percentages. For DeepSeek OCR2, page-10 testing showed
+        the user-visible percentages. For the Qwen OCR backend, page-10 testing showed
         that a one-pixel boundary difference can flip a cropped region from
         readable to empty. Snapping only the empty-result retry crop recreates
         the user's visible coordinates while leaving the primary OCR image

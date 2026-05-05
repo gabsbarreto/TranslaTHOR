@@ -8,7 +8,7 @@ from app.models.regions import CoordinateSpace, PageRegionPayload, Region, Regio
 from app.services.ocr_region_service import OcrRegionService
 
 
-def test_run_selected_ocr_masks_unselected_page_content(tmp_path: Path) -> None:
+def test_run_selected_ocr_uses_optimized_raw_crop_input(tmp_path: Path) -> None:
     job_dir = tmp_path / "job"
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -79,26 +79,31 @@ def test_run_selected_ocr_masks_unselected_page_content(tmp_path: Path) -> None:
         ngram_window=50,
     )
 
-    assert [image.size for image in captured_images] == [(100, 100)]
-    assert captured_images[0].getpixel((5, 5)) == (255, 255, 255)
-    assert captured_images[0].getpixel((20, 30)) == (0, 0, 0)
+    assert [image.size for image in captured_images] == [(37, 37)]
+    assert captured_images[0].getpixel((0, 0)) == (0, 0, 0)
     assert len(results.results) == 1
     result = results.results[0]
     assert result.box_id == "box-1"
     assert result.ocr_text == "example text"
     assert result.coordinate_space == CoordinateSpace.NORMALIZED
-    assert result.metadata["ocr_image_mode"] == "masked_page_padded"
-    assert str(result.metadata["ocr_image_path"]).endswith("ocr_regions/masked_pages/p0001_box-1.png")
-    assert result.metadata["ocr_image_width"] == 100
-    assert result.metadata["ocr_image_height"] == 100
-    assert result.metadata["ocr_padding"] == 0.1
+    assert result.metadata["ocr_image_mode"] == "raw_crop_jpeg_s075_q75"
+    assert str(result.metadata["ocr_image_path"]).endswith("ocr_regions/optimized_crops/p0001_box-1.jpg")
+    assert result.metadata["ocr_image_width"] == 37
+    assert result.metadata["ocr_image_height"] == 37
+    assert result.metadata["ocr_raw_crop_scale"] == 0.75
+    assert result.metadata["ocr_jpeg_quality"] == 75
+    assert result.metadata["ocr_padding"] == 0.0
+    assert str(result.metadata["masked_page_path"]).endswith("ocr_regions/masked_pages/p0001_box-1.png")
+    assert result.metadata["masked_page_width"] == 100
+    assert result.metadata["masked_page_height"] == 100
+    assert result.metadata["masked_page_padding"] == 0.1
     assert result.metadata["raw_crop_width"] == 50
     assert result.metadata["raw_crop_height"] == 50
     assert result.metadata["padded_crop_width"] == 60
     assert result.metadata["padded_crop_height"] == 60
 
 
-def test_selected_ocr_masked_page_keeps_rendered_size(tmp_path: Path) -> None:
+def test_selected_ocr_optimized_raw_crop_scales_rendered_crop(tmp_path: Path) -> None:
     job_dir = tmp_path / "job"
     job_dir.mkdir(parents=True, exist_ok=True)
 
@@ -168,11 +173,13 @@ def test_selected_ocr_masked_page_keeps_rendered_size(tmp_path: Path) -> None:
         ngram_window=50,
     )
 
-    assert [image.size for image in captured_images] == [(2000, 2666)]
-    assert captured_images[0].getpixel((20, 20)) == (255, 255, 255)
-    assert captured_images[0].getpixel((1000, 1333)) == (0, 0, 0)
-    assert results.results[0].metadata["ocr_image_width"] == 2000
-    assert results.results[0].metadata["ocr_image_height"] == 2666
+    assert [image.size for image in captured_images] == [(750, 1000)]
+    assert results.results[0].metadata["ocr_image_width"] == 750
+    assert results.results[0].metadata["ocr_image_height"] == 1000
+    assert results.results[0].metadata["raw_crop_width"] == 1000
+    assert results.results[0].metadata["raw_crop_height"] == 1334
+    assert results.results[0].metadata["masked_page_width"] == 2000
+    assert results.results[0].metadata["masked_page_height"] == 2666
 
 
 def test_selected_ocr_retries_empty_primary_with_contrast_crop(tmp_path: Path) -> None:

@@ -16,4 +16,4 @@ else
   printf 'DEEPSEEK_OCR_PYTHON=.venv-deepseek-ocr/bin/python\n' > .env.local
 fi
 
-echo "DeepSeek OCR environment ready: .venv-deepseek-ocr/bin/python"
+echo "Qwen OCR environment ready: .venv-deepseek-ocr/bin/python"

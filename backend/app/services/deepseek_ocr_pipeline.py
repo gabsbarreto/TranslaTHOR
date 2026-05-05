@@ -36,7 +36,7 @@ logger = logging.getLogger(__name__)
 class DeepSeekOcrPipeline:
     """Optional MLX-VLM OCR backend for scanned or visually complex PDFs.
 
-    DeepSeek-OCR-2 returns markdown from page images. It does not currently provide the same
+    Qwen 3.5 2B returns markdown from page images. It does not currently provide the same
     rich block-coordinate structure as Marker JSON in this app, so we preserve page mapping and
     semantic markdown blocks while leaving bbox empty for generated text blocks.
     """
@@ -51,9 +51,9 @@ class DeepSeekOcrPipeline:
         job_dir: Path,
         dpi: int,
         preprocess: dict[str, bool | float],
-        model_name: str = "mlx-community/DeepSeek-OCR-2-bf16",
+        model_name: str = "mlx-community/Qwen3.5-4B-4bit",
         max_tokens: int = 4096,
-        prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
+        prompt: str = "convert this text to markdown",
         crop_mode: bool = True,
         min_crops: int = 2,
         max_crops: int = 6,
@@ -132,7 +132,7 @@ class DeepSeekOcrPipeline:
             profiler=profiler,
             strict_page_files=False,
             warning_message=(
-                "Parsed with DeepSeek-OCR-2 MLX backend. Page text was generated from rendered images; exact source "
+                "Parsed with Qwen 3.5 2B MLX-VLM OCR backend. Page text was generated from rendered images; exact source "
                 "bounding boxes are unavailable."
             ),
         )
@@ -396,10 +396,10 @@ class DeepSeekOcrPipeline:
             if on_ocr_progress is None:
                 for line in stdout.splitlines():
                     if '"event"' in line:
-                        logger.info("DeepSeek OCR worker: %s", line)
+                        logger.info("Qwen OCR worker: %s", line)
         except FileNotFoundError as exc:
             raise RuntimeError(
-                "DeepSeek OCR requires a Python environment with mlx-vlm. "
+                "Qwen OCR requires a Python environment with mlx-vlm. "
                 "Run scripts/setup_deepseek_ocr_env.sh and set DEEPSEEK_OCR_PYTHON=.venv-deepseek-ocr/bin/python."
             ) from exc
         except subprocess.CalledProcessError as exc:
@@ -407,8 +407,8 @@ class DeepSeekOcrPipeline:
             if exc.returncode == -15 and cancel_requested is not None and cancel_requested():
                 raise RuntimeError("Cancelled by user") from exc
             raise RuntimeError(
-                f"DeepSeek OCR failed. If this mentions transformers/mlx-vlm dependency "
-                f"conflicts, use a separate DeepSeek OCR env via DEEPSEEK_OCR_PYTHON. Details: {stderr[-1000:]}"
+                f"Qwen OCR failed. If this mentions transformers/mlx-vlm dependency "
+                f"conflicts, use a separate OCR env via DEEPSEEK_OCR_PYTHON. Details: {stderr[-1000:]}"
             ) from exc
 
     def run_ocr_on_images(
@@ -417,9 +417,9 @@ class DeepSeekOcrPipeline:
         image_paths: list[Path],
         output_dir: Path,
         output_names: list[str],
-        model_name: str = "mlx-community/DeepSeek-OCR-2-bf16",
+        model_name: str = "mlx-community/Qwen3.5-4B-4bit",
         max_tokens: int = 4096,
-        prompt: str = "<image>\n<|grounding|>Convert the document to markdown.",
+        prompt: str = "convert this text to markdown",
         crop_mode: bool = True,
         min_crops: int = 2,
         max_crops: int = 6,
@@ -508,7 +508,7 @@ class DeepSeekOcrPipeline:
             except json.JSONDecodeError:
                 logger.debug("Unable to parse OCR worker progress event: %s", line.strip())
                 return
-            logger.info("DeepSeek OCR worker: %s", line.strip())
+            logger.info("Qwen OCR worker: %s", line.strip())
             if on_ocr_progress is not None:
                 on_ocr_progress(event)
 

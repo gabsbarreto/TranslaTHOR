@@ -36,4 +36,4 @@ upsert_env() {
 upsert_env "DEEPSEEK_OCR_PYTHON" ".venv-deepseek-ocr/bin/python"
 
 echo "Local runtime is ready."
-echo "DeepSeek OCR Python: .venv-deepseek-ocr/bin/python"
+echo "Qwen OCR Python: .venv-deepseek-ocr/bin/python"

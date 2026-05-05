@@ -135,7 +135,7 @@ class TranslationPipeline:
                     job_id,
                     stage=JobStage.OCR_LAYOUT,
                     progress=0.3,
-                    message="Running DeepSeek-OCR-2 MLX parser",
+                    message="Running Qwen 3.5 2B MLX-VLM OCR",
                 ):
                     return
                 preprocess = {
@@ -148,7 +148,7 @@ class TranslationPipeline:
                     job_id,
                     stage=JobStage.OCR_LAYOUT,
                     progress=0.32,
-                    message="Running DeepSeek-OCR-2 MLX parser",
+                    message="Running Qwen 3.5 2B MLX-VLM OCR",
                 ):
                     return
                 with profiler.step("ocr_layout_detection"):

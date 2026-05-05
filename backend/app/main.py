@@ -694,7 +694,7 @@ def _terminate_process_tree(process: subprocess.Popen) -> None:
 
 
 def _selected_ocr_progress_from_event(event: dict) -> tuple[float, str] | None:
-    """Map DeepSeek OCR worker events onto the existing job progress bar.
+    """Map Qwen OCR worker events onto the existing job progress bar.
 
     Selected-region OCR sends one image per selected OCR box. The worker reports
     per-image progress, so the UI can display useful counters like 1/15 without
