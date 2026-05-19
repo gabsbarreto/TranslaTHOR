@@ -56,6 +56,26 @@ def test_job_settings_include_all_deepseek_ocr_defaults() -> None:
     assert settings["deepseek_ocr_ngram_window"] == config.DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW
 
 
+def test_job_settings_include_qwen_ocr_fallback_defaults() -> None:
+    settings = _settings()
+
+    assert settings["qwen_ocr_fallback"] == config.ENABLE_QWEN_OCR_FALLBACK
+    assert settings["qwen_ocr_model"] == config.DEFAULT_QWEN_OCR_MODEL
+    assert settings["qwen_ocr_max_tokens"] == config.DEFAULT_QWEN_OCR_MAX_TOKENS
+    assert settings["qwen_ocr_prompt"] == config.DEFAULT_QWEN_OCR_PROMPT
+    assert settings["qwen_ocr_dpi"] == config.DEFAULT_QWEN_OCR_DPI
+    assert settings["qwen_ocr_image_scale"] == config.DEFAULT_QWEN_OCR_IMAGE_SCALE
+    assert settings["qwen_ocr_jpeg_quality"] == config.DEFAULT_QWEN_OCR_JPEG_QUALITY
+    assert settings["qwen_ocr_batch_size"] == config.DEFAULT_QWEN_OCR_BATCH_SIZE
+    assert settings["qwen_ocr_mask_margins"] == config.DEFAULT_QWEN_OCR_MASK_MARGINS
+    assert settings["qwen_ocr_first_page_top_mask_ratio"] == config.DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO
+    assert settings["qwen_ocr_first_page_bottom_mask_ratio"] == config.DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO
+    assert settings["qwen_ocr_other_page_top_mask_ratio"] == config.DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO
+    assert settings["qwen_ocr_other_page_bottom_mask_ratio"] == config.DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO
+    assert settings["qwen_ocr_left_mask_ratio"] == config.DEFAULT_QWEN_OCR_LEFT_MASK_RATIO
+    assert settings["qwen_ocr_right_mask_ratio"] == config.DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO
+
+
 def test_pipeline_passes_deepseek_ocr_settings_to_parser(tmp_path, monkeypatch) -> None:
     job_dir = tmp_path / "job"
     (job_dir / "artifacts").mkdir(parents=True)

@@ -95,4 +95,4 @@ def test_cancel_stop_and_cleanup_force_page_refresh() -> None:
     assert 'url.searchParams.set("_refresh", Date.now().toString());' in APP_JS
     assert "window.location.replace(url.toString());" in APP_JS
     assert APP_JS.count("forcePageRefresh();") >= 3
-    assert "20260501-force-cancel-refresh" in INDEX_HTML
+    assert "20260505-marker-auto" in INDEX_HTML

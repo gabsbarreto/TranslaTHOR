@@ -24,6 +24,7 @@ if "pypdfium2" not in sys.modules:
     sys.modules["pypdfium2"] = pypdfium_stub
 
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
+from app.services.markdown_builder import MarkdownBuilder
 
 
 def _inspection() -> PdfInspection:
@@ -79,3 +80,39 @@ def test_parse_cached_document_requires_complete_page_files(tmp_path) -> None:
     pipeline = DeepSeekOcrPipeline()
     with pytest.raises(RuntimeError, match="missing page files"):
         pipeline.parse_cached_document(_inspection(), job_dir)
+
+
+def test_qwen_markdown_cleanup_strips_wrappers_and_merges_page_continuations(tmp_path) -> None:
+    markdown_dir = tmp_path / "qwen_ocr" / "markdown"
+    markdown_dir.mkdir(parents=True, exist_ok=True)
+    (markdown_dir / "page_0001.md").write_text(
+        "```markdown\n# Introdução\n\nA equipe oferece um espaço no qual seja possível\n\n---\n\n¹ Nota de rodapé.\n```\n",
+        encoding="utf-8",
+    )
+    (markdown_dir / "page_0002.md").write_text(
+        "<page>\n```markdown\naos sujeitos produzir elaborações sobre si mesmos.\n\n## Próxima seção\nTexto completo.\n```\n</page>\n",
+        encoding="utf-8",
+    )
+
+    pipeline = DeepSeekOcrPipeline()
+    document, marker_markdown = pipeline.build_document_from_markdown_dir(
+        inspection=_inspection(),
+        markdown_dir=markdown_dir,
+        warning_message="Parsed with Qwen OCR fallback.",
+        include_page_markers=False,
+        sanitize_ocr_markdown=True,
+        merge_page_continuations=True,
+    )
+
+    assert "```" not in marker_markdown
+    assert "<page>" not in marker_markdown
+    assert "<!-- page" not in marker_markdown
+    assert "possível aos sujeitos produzir elaborações sobre si mesmos." in marker_markdown
+    assert marker_markdown.index("possível aos sujeitos") < marker_markdown.index("Nota de rodapé")
+    assert all("```" not in block.text for block in document.blocks)
+    assert any("Merged 1 OCR sentence continuation" in warning for warning in document.warnings)
+
+    document.metadata.translation["suppress_page_markers"] = True
+    rebuilt_markdown = MarkdownBuilder().build(document)
+    assert "<!-- page" not in rebuilt_markdown
+    assert "possível aos sujeitos produzir elaborações sobre si mesmos." in rebuilt_markdown

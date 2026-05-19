@@ -31,9 +31,39 @@ from app.config import (
     DEFAULT_DEEPSEEK_OCR_PROMPT,
     DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
     DEFAULT_OUTPUT_MODE,
+    DEFAULT_QWEN_OCR_BASE_SIZE,
+    DEFAULT_QWEN_OCR_BATCH_SIZE,
+    DEFAULT_QWEN_OCR_CROP_MODE,
+    DEFAULT_QWEN_OCR_DPI,
+    DEFAULT_QWEN_OCR_IMAGE_SCALE,
+    DEFAULT_QWEN_OCR_IMAGE_SIZE,
+    DEFAULT_QWEN_OCR_JPEG_QUALITY,
+    DEFAULT_QWEN_OCR_LEFT_MASK_RATIO,
+    DEFAULT_QWEN_OCR_MASK_MARGINS,
+    DEFAULT_QWEN_OCR_MAX_CROPS,
+    DEFAULT_QWEN_OCR_MAX_TOKENS,
+    DEFAULT_QWEN_OCR_MIN_CROPS,
+    DEFAULT_QWEN_OCR_MODEL,
+    DEFAULT_QWEN_OCR_NGRAM_SIZE,
+    DEFAULT_QWEN_OCR_NGRAM_WINDOW,
+    DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
+    DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
+    DEFAULT_QWEN_OCR_PROMPT,
+    DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
+    DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
+    DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
+    DEFAULT_QWEN_OCR_SKIP_REPEAT,
     DEFAULT_RENDER_STRATEGY,
     DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_EXTRACTION_MODE,
+    ENABLE_DEEPSEEK_FALLBACK,
+    ENABLE_LEGACY_VISUAL_OCR,
+    ENABLE_LOCAL_VLM_REPAIR,
+    ENABLE_MARKER_PIPELINE,
+    ENABLE_QWEN_OCR_FALLBACK,
     FRONTEND_DIR,
+    KEEP_EXTRACTION_DEBUG_ARTIFACTS,
+    MARKER_TIMEOUT_SECONDS,
 )
 from app.models.schema import JobStage
 from app.models.regions import OcrResultsPayload, PageRegionPayload
@@ -106,11 +136,27 @@ class StartJobRequest(BaseModel):
     ocr_input_mode: str = "selected_regions"
     ocr_full_page_fallback: bool = True
     translation_input_mode: str = "continuous_document"
+    extraction_mode: str = DEFAULT_EXTRACTION_MODE
+    use_local_vlm_repair: bool = ENABLE_LOCAL_VLM_REPAIR
+    use_deepseek_fallback: bool = ENABLE_DEEPSEEK_FALLBACK
+    keep_debug_artifacts: bool = KEEP_EXTRACTION_DEBUG_ARTIFACTS
 
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/features")
+def features() -> dict[str, bool | str]:
+    return {
+        "marker_pipeline": ENABLE_MARKER_PIPELINE,
+        "legacy_visual_ocr": ENABLE_LEGACY_VISUAL_OCR,
+        "local_vlm_repair": ENABLE_LOCAL_VLM_REPAIR,
+        "deepseek_fallback": ENABLE_DEEPSEEK_FALLBACK,
+        "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
+        "default_extraction_mode": DEFAULT_EXTRACTION_MODE,
+    }
 
 
 @app.get("/api/jobs")
@@ -189,6 +235,10 @@ async def create_job(
     output_mode: str = Form(DEFAULT_OUTPUT_MODE),
     profile_pipeline: bool = Form(False),
     defer_ocr_selection: bool = Form(False),
+    extraction_mode: str = Form(DEFAULT_EXTRACTION_MODE),
+    use_local_vlm_repair: bool = Form(ENABLE_LOCAL_VLM_REPAIR),
+    use_deepseek_fallback: bool = Form(ENABLE_DEEPSEEK_FALLBACK),
+    keep_debug_artifacts: bool = Form(KEEP_EXTRACTION_DEBUG_ARTIFACTS),
 ) -> dict:
     created: list[dict] = []
     for upload in files:
@@ -208,6 +258,11 @@ async def create_job(
             reuse_ocr_cache=False,
             ocr_input_mode="full_page",
             translation_input_mode="continuous_document",
+            extraction_engine="marker" if ENABLE_MARKER_PIPELINE else "legacy_deepseek",
+            extraction_mode=extraction_mode,
+            use_local_vlm_repair=use_local_vlm_repair,
+            use_deepseek_fallback=use_deepseek_fallback,
+            keep_debug_artifacts=keep_debug_artifacts,
         )
         if not defer_ocr_selection:
             job_queue.enqueue(job_id, in_pdf, settings)
@@ -256,6 +311,11 @@ def start_job(job_id: str, request: StartJobRequest) -> dict[str, str]:
         reuse_ocr_cache=False,
         ocr_input_mode=ocr_input_mode,
         translation_input_mode=request.translation_input_mode,
+        extraction_engine="legacy_deepseek" if ocr_input_mode in {"selected_regions", "full_page"} else "marker",
+        extraction_mode=request.extraction_mode,
+        use_local_vlm_repair=request.use_local_vlm_repair,
+        use_deepseek_fallback=request.use_deepseek_fallback,
+        keep_debug_artifacts=request.keep_debug_artifacts,
     )
     job_queue.enqueue(job_id, pdf_path, settings)
     return {"status": "queued", "job_id": job_id, "ocr_input_mode": ocr_input_mode}
@@ -898,6 +958,8 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
         "profile_json": "application/json",
         "profile_csv": "text/csv",
         "profile_summary": "text/plain",
+        "extraction_result": "application/json",
+        "marker_detection": "application/json",
     }.get(artifact_type, "application/octet-stream")
 
     filename = path.name
@@ -1062,6 +1124,11 @@ def _build_job_settings(
     reuse_ocr_cache: bool,
     ocr_input_mode: str = "full_page",
     translation_input_mode: str = "continuous_document",
+    extraction_engine: str = "legacy_deepseek",
+    extraction_mode: str = DEFAULT_EXTRACTION_MODE,
+    use_local_vlm_repair: bool = ENABLE_LOCAL_VLM_REPAIR,
+    use_deepseek_fallback: bool = ENABLE_DEEPSEEK_FALLBACK,
+    keep_debug_artifacts: bool = KEEP_EXTRACTION_DEBUG_ARTIFACTS,
 ) -> dict:
     selected_model = model if model in AVAILABLE_TRANSLATION_MODELS else DEFAULT_TRANSLATION_MODEL
     return {
@@ -1079,6 +1146,14 @@ def _build_job_settings(
         "translation_input_mode": translation_input_mode
         if translation_input_mode in {"continuous_document", "page_by_page"}
         else "continuous_document",
+        "extraction_engine": extraction_engine if extraction_engine in {"marker", "legacy_deepseek"} else "marker",
+        "extraction_mode": extraction_mode
+        if extraction_mode in {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair", "deepseek_fallback"}
+        else DEFAULT_EXTRACTION_MODE,
+        "use_local_vlm_repair": bool(use_local_vlm_repair),
+        "use_deepseek_fallback": bool(use_deepseek_fallback),
+        "keep_debug_artifacts": bool(keep_debug_artifacts),
+        "marker_timeout_seconds": MARKER_TIMEOUT_SECONDS,
         "deepseek_ocr_model": DEFAULT_DEEPSEEK_OCR_MODEL,
         "deepseek_ocr_max_tokens": DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
         "deepseek_ocr_prompt": DEFAULT_DEEPSEEK_OCR_PROMPT,
@@ -1090,6 +1165,29 @@ def _build_job_settings(
         "deepseek_ocr_skip_repeat": DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
         "deepseek_ocr_ngram_size": DEFAULT_DEEPSEEK_OCR_NGRAM_SIZE,
         "deepseek_ocr_ngram_window": DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
+        "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
+        "qwen_ocr_model": DEFAULT_QWEN_OCR_MODEL,
+        "qwen_ocr_max_tokens": DEFAULT_QWEN_OCR_MAX_TOKENS,
+        "qwen_ocr_prompt": DEFAULT_QWEN_OCR_PROMPT,
+        "qwen_ocr_dpi": DEFAULT_QWEN_OCR_DPI,
+        "qwen_ocr_image_scale": DEFAULT_QWEN_OCR_IMAGE_SCALE,
+        "qwen_ocr_jpeg_quality": DEFAULT_QWEN_OCR_JPEG_QUALITY,
+        "qwen_ocr_batch_size": DEFAULT_QWEN_OCR_BATCH_SIZE,
+        "qwen_ocr_crop_mode": DEFAULT_QWEN_OCR_CROP_MODE,
+        "qwen_ocr_min_crops": DEFAULT_QWEN_OCR_MIN_CROPS,
+        "qwen_ocr_max_crops": DEFAULT_QWEN_OCR_MAX_CROPS,
+        "qwen_ocr_base_size": DEFAULT_QWEN_OCR_BASE_SIZE,
+        "qwen_ocr_image_size": DEFAULT_QWEN_OCR_IMAGE_SIZE,
+        "qwen_ocr_skip_repeat": DEFAULT_QWEN_OCR_SKIP_REPEAT,
+        "qwen_ocr_ngram_size": DEFAULT_QWEN_OCR_NGRAM_SIZE,
+        "qwen_ocr_ngram_window": DEFAULT_QWEN_OCR_NGRAM_WINDOW,
+        "qwen_ocr_mask_margins": DEFAULT_QWEN_OCR_MASK_MARGINS,
+        "qwen_ocr_first_page_top_mask_ratio": DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
+        "qwen_ocr_first_page_bottom_mask_ratio": DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
+        "qwen_ocr_other_page_top_mask_ratio": DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
+        "qwen_ocr_other_page_bottom_mask_ratio": DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
+        "qwen_ocr_left_mask_ratio": DEFAULT_QWEN_OCR_LEFT_MASK_RATIO,
+        "qwen_ocr_right_mask_ratio": DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
         "translation_model": {
             "provider": "mlx",
             "model_id": selected_model,

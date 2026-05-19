@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from app.models.schema import BlockType, DocumentModel
 
 
@@ -12,34 +14,46 @@ class MarkdownBuilder:
 
         lines: list[str] = []
         page = 0
+        suppress_page_markers = bool(document.metadata.translation.get("suppress_page_markers"))
         tables_by_page: dict[int, list] = {}
         for table in document.tables:
             for page_number in table.page_numbers:
                 tables_by_page.setdefault(page_number, []).append(table)
         rendered_tables: set[str] = set()
         for block in document.blocks:
+            if self._is_suppressed_running_marginalia(block):
+                continue
+            if self._is_marker_table_cell(block):
+                continue
             if block.block_type != BlockType.TABLE and not block.text.strip():
                 continue
             if block.page_number != page:
                 page = block.page_number
-                lines.append(f"\n<!-- page: {page} -->\n")
+                if not suppress_page_markers:
+                    lines.append(f"\n<!-- page: {page} -->\n")
 
             if block.block_type == BlockType.HEADING:
                 lines.append(f"## {block.text}\n")
             elif block.block_type == BlockType.LIST:
-                lines.append(f"- {block.text}\n")
+                lines.append(self._list_markdown(block.text))
             elif block.block_type == BlockType.TABLE:
-                for table in tables_by_page.get(block.page_number, []):
+                table = self._table_for_block(document, block, tables_by_page.get(block.page_number, []))
+                if table is not None:
                     if table.id in rendered_tables:
                         continue
-                    title = table.caption or f"Table {len(rendered_tables) + 1}"
-                    lines.append(f"\n### {title}\n")
-                    lines.append(self._table_html(table))
-                    if table.notes:
-                        lines.append(f"\n<small>{table.notes}</small>\n")
-                    if table.fallback_image_path:
-                        lines.append(f"\n![{title}]({table.fallback_image_path})\n")
+                    if self._render_table_from_block_text(table, block.text):
+                        lines.append(block.text.strip() + "\n")
+                    else:
+                        title = table.caption or f"Table {len(rendered_tables) + 1}"
+                        lines.append(f"\n### {title}\n")
+                        lines.append(self._table_html(table))
+                        if table.notes:
+                            lines.append(f"\n<small>{table.notes}</small>\n")
+                        if table.fallback_image_path:
+                            lines.append(f"\n![{title}]({table.fallback_image_path})\n")
                     rendered_tables.add(table.id)
+                elif block.text.strip():
+                    lines.append(block.text.strip() + "\n")
             elif block.block_type == BlockType.CAPTION:
                 lines.append(f"*{block.text}*\n")
             elif block.block_type == BlockType.FOOTNOTE:
@@ -68,6 +82,49 @@ class MarkdownBuilder:
             lines.append(extra)
 
         return "\n".join(lines)
+
+    def _list_markdown(self, text: str) -> str:
+        stripped = self._clean_list_text(text)
+        if self._is_explicit_numbered_item(stripped):
+            return f"{stripped}\n"
+        return f"- {stripped}\n"
+
+    def _clean_list_text(self, text: str) -> str:
+        stripped = text.strip()
+        # Marker can merge a repeated section heading into the first list item
+        # at a page boundary, for example "REFERENCES 11. Johns ...".
+        return re.sub(
+            r"^(references|referencias|bibliography|bibliograf[ií]a)\s+(\d+[.)]\s+)",
+            r"\2",
+            stripped,
+            flags=re.IGNORECASE,
+        )
+
+    def _is_explicit_numbered_item(self, text: str) -> bool:
+        return bool(re.match(r"^\d+[.)]\s+\S", text.strip()))
+
+    def _table_for_block(self, document: DocumentModel, block, page_tables: list) -> object | None:
+        for table in page_tables:
+            if getattr(table, "debug", {}).get("marker_block_id") == block.id:
+                return table
+        if page_tables:
+            return page_tables[0]
+        return None
+
+    def _render_table_from_block_text(self, table, block_text: str) -> bool:
+        debug = getattr(table, "debug", {})
+        return bool(
+            (debug.get("render_from_block_text") or debug.get("marker_block_id"))
+            and "<table" in block_text.lower()
+        )
+
+    def _is_marker_table_cell(self, block) -> bool:
+        metadata = getattr(block, "metadata", {}) or {}
+        return str(metadata.get("marker_block_type", "")).lower() == "tablecell"
+
+    def _is_suppressed_running_marginalia(self, block) -> bool:
+        metadata = getattr(block, "metadata", {}) or {}
+        return bool(metadata.get("running_header_footer_suppressed"))
 
     def _table_block_markdown(self, text: str) -> str:
         # Marker table blocks can arrive as plain cell text; keep them visually separate even when

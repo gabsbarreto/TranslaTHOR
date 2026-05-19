@@ -156,6 +156,29 @@ class DeepSeekOcrPipeline:
             ),
         )
 
+    def build_document_from_markdown_dir(
+        self,
+        *,
+        inspection: PdfInspection,
+        markdown_dir: Path,
+        profiler: PipelineProfiler | None = None,
+        strict_page_files: bool = False,
+        warning_message: str,
+        include_page_markers: bool = True,
+        sanitize_ocr_markdown: bool = False,
+        merge_page_continuations: bool = False,
+    ) -> tuple[DocumentModel, str]:
+        return self._build_document_from_markdown_files(
+            inspection=inspection,
+            ocr_output_dir=markdown_dir,
+            profiler=profiler,
+            strict_page_files=strict_page_files,
+            warning_message=warning_message,
+            include_page_markers=include_page_markers,
+            sanitize_ocr_markdown=sanitize_ocr_markdown,
+            merge_page_continuations=merge_page_continuations,
+        )
+
     def parse_selected_regions_document(
         self,
         inspection: PdfInspection,
@@ -541,6 +564,38 @@ class DeepSeekOcrPipeline:
         text = re.sub(r"\[\[\d+\s*,\s*\d+\s*,\s*\d+\s*,?\s*$", "", text)
         return text.strip()
 
+    def _sanitize_ocr_markdown(self, markdown: str) -> str:
+        """Remove page-level wrappers commonly emitted by VLM OCR models.
+
+        Qwen/MLX-VLM often returns a whole page wrapped as ```markdown even when
+        the prompt asks for raw Markdown. In this pipeline those fences are OCR
+        transport noise: keeping them makes the translator preserve code blocks
+        and makes the PDF renderer typeset normal prose as preformatted text.
+        """
+        text = self._clean_mlx_vlm_output(markdown)
+        text = text.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"(?is)</?\s*page\b[^>]*>", "", text)
+        text = re.sub(r"(?im)^\s*<!--\s*page\s*:\s*\d+\s*-->\s*$", "", text)
+
+        lines: list[str] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            line = re.sub(r"(?i)^\s*```(?:markdown|md)?\s*", "", line)
+            line = re.sub(r"\s*```\s*$", "", line)
+            if line:
+                lines.append(line)
+            else:
+                lines.append("")
+
+        text = "\n".join(lines).strip()
+        text = re.sub(r"(?im)^\s*```(?:markdown|md)?\s*$", "", text)
+        text = re.sub(r"(?im)^\s*```\s*$", "", text)
+        text = re.sub(r"(?i)```(?:markdown|md)?", "", text)
+        text = text.replace("```", "")
+        text = re.sub(r"[ \t]+\n", "\n", text)
+        text = re.sub(r"\n{4,}", "\n\n\n", text)
+        return text.strip()
+
     def _looks_like_echoed_prompt(self, line: str) -> bool:
         lowered = line.lower()
         return "convert" in lowered and ("markdown" in lowered or "document" in lowered)
@@ -662,6 +717,126 @@ class DeepSeekOcrPipeline:
         flush_table()
         return tables, figures
 
+    def _merge_page_continuations(self, page_items: list[tuple[int, str]]) -> tuple[list[tuple[int, str]], int]:
+        merged: list[list[int | str]] = [[page_number, markdown] for page_number, markdown in page_items]
+        merge_count = 0
+
+        for index in range(len(merged) - 1):
+            previous_text = str(merged[index][1]).rstrip()
+            next_text = str(merged[index + 1][1]).lstrip()
+            if not previous_text or not next_text:
+                continue
+
+            next_bounds = self._first_paragraph_bounds(next_text)
+            if next_bounds is None:
+                continue
+
+            next_start, next_end = next_bounds
+            next_para = next_text[next_start:next_end].strip()
+            previous_bounds = self._previous_page_continuation_bounds(previous_text, next_para)
+            if previous_bounds is None:
+                continue
+
+            previous_start, previous_end = previous_bounds
+            previous_para = previous_text[previous_start:previous_end].strip()
+            if not self._should_merge_page_continuation(previous_para, next_para):
+                continue
+
+            joined = f"{self._paragraph_as_line(previous_para)} {self._paragraph_as_line(next_para)}".strip()
+            merged[index][1] = previous_text[:previous_start] + joined + previous_text[previous_end:]
+            merged[index + 1][1] = next_text[next_end:].lstrip()
+            merge_count += 1
+
+        return [(int(page_number), str(markdown)) for page_number, markdown in merged], merge_count
+
+    def _previous_page_continuation_bounds(self, previous_text: str, next_para: str) -> tuple[int, int] | None:
+        for start, end in reversed(self._paragraph_bounds(previous_text)):
+            paragraph = previous_text[start:end].strip()
+            if self._should_merge_page_continuation(paragraph, next_para):
+                return start, end
+            if not self._looks_like_trailing_page_artifact(paragraph):
+                return None
+        return None
+
+    def _paragraph_bounds(self, text: str) -> list[tuple[int, int]]:
+        stripped = text.rstrip()
+        if not stripped:
+            return []
+        bounds: list[tuple[int, int]] = []
+        start = 0
+        for separator in re.finditer(r"\n\s*\n", stripped):
+            if separator.start() > start:
+                bounds.append((start, separator.start()))
+            start = separator.end()
+        if len(stripped) > start:
+            bounds.append((start, len(stripped)))
+        return bounds
+
+    def _looks_like_trailing_page_artifact(self, paragraph: str) -> bool:
+        text = self._paragraph_as_line(paragraph)
+        if not text:
+            return True
+        if re.fullmatch(r"[-*_]{3,}", text):
+            return True
+        if re.fullmatch(r"\d{1,4}", text):
+            return True
+        # Superscript footnotes often sit after the body text at the bottom of a
+        # page. They should not block joining the unfinished body sentence above.
+        return bool(re.match(r"^[¹²³⁴⁵⁶⁷⁸⁹⁰]+\s+\S", text) and len(text) < 260)
+
+    def _first_paragraph_bounds(self, text: str) -> tuple[int, int] | None:
+        stripped = text.lstrip()
+        if not stripped:
+            return None
+        separator = re.search(r"\n\s*\n", stripped)
+        end = separator.start() if separator else len(stripped)
+        return 0, end
+
+    def _paragraph_as_line(self, text: str) -> str:
+        return " ".join(line.strip() for line in text.splitlines() if line.strip())
+
+    def _should_merge_page_continuation(self, previous_para: str, next_para: str) -> bool:
+        previous = self._paragraph_as_line(previous_para)
+        next_text = self._paragraph_as_line(next_para)
+        if len(previous) < 8 or len(next_text) < 2:
+            return False
+        if self._looks_like_structural_markdown(previous) or self._looks_like_structural_markdown(next_text):
+            return False
+        if re.match(r"^\d+[.)]\s+\S", next_text):
+            return False
+        if previous.endswith((".", "!", "?", ":", ";", "…")):
+            return False
+        if previous.endswith((".", "!", "?", ":", ";", "…", "\"", "'", "”", "’", ")", "]")) and next_text[:1].isupper():
+            return False
+        if next_text[:1].islower() or next_text[:1].isdigit():
+            return True
+        return self._ends_with_continuation_word(previous)
+
+    def _looks_like_structural_markdown(self, text: str) -> bool:
+        first_line = text.strip().splitlines()[0] if text.strip() else ""
+        if re.match(r"^#{1,6}\s+\S", first_line):
+            return True
+        if first_line.startswith("|"):
+            return True
+        if re.match(r"^[-*+]\s+\S", first_line):
+            return True
+        if re.match(r"^(table|figure)\s+\d+", first_line, flags=re.IGNORECASE):
+            return True
+        return False
+
+    def _ends_with_continuation_word(self, text: str) -> bool:
+        lowered = re.sub(r"[^\wÀ-ÿ]+$", "", text.strip().lower())
+        return bool(
+            re.search(
+                r"\b("
+                r"que|de|do|da|dos|das|e|ou|a|o|os|as|ao|aos|à|às|no|na|nos|nas|"
+                r"com|para|por|sem|sob|entre|sobre|como|quais|cujo|cuja|cujos|cujas|"
+                r"that|which|where|who|whose|to|of|and|or|with|for|from|about"
+                r")$",
+                lowered,
+            )
+        )
+
     def _detect_language(self, blocks: list[Block]) -> str | None:
         text = "\n".join(b.text for b in blocks if b.block_type in {BlockType.PARAGRAPH, BlockType.HEADING})
         text = text[:4000].strip()
@@ -687,12 +862,16 @@ class DeepSeekOcrPipeline:
         profiler: PipelineProfiler | None,
         strict_page_files: bool,
         warning_message: str,
+        include_page_markers: bool = True,
+        sanitize_ocr_markdown: bool = False,
+        merge_page_continuations: bool = False,
     ) -> tuple[DocumentModel, str]:
         pages_md: list[str] = []
         blocks: list[Block] = []
         tables: list[TableModel] = []
         figures: list[FigureAsset] = []
         missing_pages: list[int] = []
+        page_items: list[tuple[int, str]] = []
 
         for page in inspection.pages:
             markdown_path = ocr_output_dir / f"page_{page.page_number:04d}.md"
@@ -701,9 +880,21 @@ class DeepSeekOcrPipeline:
                 markdown = ""
             else:
                 markdown = markdown_path.read_text(encoding="utf-8", errors="ignore")
-            pages_md.append(f"\n<!-- page: {page.page_number} -->\n\n{markdown.strip()}\n")
-            blocks.extend(self._blocks_from_markdown(markdown, page.page_number, len(blocks)))
-            table_objs, figure_objs = self._extract_structures_from_markdown(markdown, page.page_number)
+            if sanitize_ocr_markdown:
+                markdown = self._sanitize_ocr_markdown(markdown)
+            page_items.append((page.page_number, markdown))
+
+        page_continuation_merges = 0
+        if merge_page_continuations:
+            page_items, page_continuation_merges = self._merge_page_continuations(page_items)
+
+        for page_number, markdown in page_items:
+            if include_page_markers:
+                pages_md.append(f"\n<!-- page: {page_number} -->\n\n{markdown.strip()}\n")
+            elif markdown.strip():
+                pages_md.append(markdown.strip() + "\n")
+            blocks.extend(self._blocks_from_markdown(markdown, page_number, len(blocks)))
+            table_objs, figure_objs = self._extract_structures_from_markdown(markdown, page_number)
             tables.extend(table_objs)
             figures.extend(figure_objs)
 
@@ -719,6 +910,10 @@ class DeepSeekOcrPipeline:
             warnings.append(
                 "Some OCR page markdown files were missing. Missing page numbers: "
                 + ", ".join(str(page) for page in missing_pages[:20])
+            )
+        if page_continuation_merges:
+            warnings.append(
+                f"Merged {page_continuation_merges} OCR sentence continuation(s) across page boundaries before translation."
             )
 
         doc = DocumentModel(
