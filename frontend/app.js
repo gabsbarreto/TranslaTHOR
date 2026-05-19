@@ -105,6 +105,8 @@ addBoxBtn?.addEventListener("click", addManualBox);
 drawRegionModeBtn?.addEventListener("click", toggleDrawRegionMode);
 runOcrSelectedBtn?.addEventListener("click", runSelectedOcr);
 
+loadFeatureFlags();
+
 window.addEventListener("resize", () => {
   if (!state.region.jobId) return;
   renderCurrentPageCanvas();
@@ -121,6 +123,19 @@ dropzone.addEventListener("drop", (e) => {
   handleUploadedFiles(e.dataTransfer.files);
 });
 
+async function loadFeatureFlags() {
+  try {
+    const res = await fetch("/api/features");
+    const flags = await parseJsonResponse(res);
+    if (res.ok && flags.legacy_visual_ocr) {
+      const legacyPanel = document.querySelector(".legacy-panel");
+      if (legacyPanel) legacyPanel.hidden = false;
+    }
+  } catch (_error) {
+    // Feature flags are optional; the default UI remains the automated pipeline.
+  }
+}
+
 async function handleUploadedFiles(fileList) {
   if (!fileList || !fileList.length) return;
   const pdfFiles = Array.from(fileList).filter((file) => {
@@ -129,10 +144,19 @@ async function handleUploadedFiles(fileList) {
   if (!pdfFiles.length) return;
 
   try {
-    await openRegionFromFile(pdfFiles[0]);
-    if (pdfFiles.length > 1) window.alert("Opened the first PDF. Add another PDF after finishing this one.");
+    const uploadItems = pdfFiles.map((file) => ({
+      local_id: nextStagedId(),
+      type: "upload",
+      filename: file.name,
+      file,
+    }));
+    await submitUploadBatch(uploadItems);
+    state.region.workflowStep = "ocr";
+    state.region.statusMessage = `Submitted ${uploadItems.length} document(s) for automatic Marker extraction.`;
+    renderRegionStatus();
+    await pollJobs();
   } catch (error) {
-    window.alert(error.message || "Unable to upload PDF for OCR region selection");
+    window.alert(error.message || "Unable to submit PDF for automatic extraction");
   }
 }
 
@@ -318,6 +342,10 @@ function appendTranslationFormFields(form) {
   form.append("model", getInputValue("model", "mlx-community/Qwen3.5-4B-OptiQ-4bit"));
   form.append("top_p", getInputValue("topP", "0.9"));
   form.append("output_mode", "readable");
+  form.append("extraction_mode", getInputValue("extractionMode", "auto"));
+  form.append("use_local_vlm_repair", checkboxValue("useLocalVlmRepair"));
+  form.append("use_deepseek_fallback", checkboxValue("useDeepseekFallback"));
+  form.append("keep_debug_artifacts", checkboxValue("keepDebugArtifacts"));
 }
 
 function buildTranslationPayload() {
@@ -330,7 +358,16 @@ function buildTranslationPayload() {
     output_mode: "readable",
     profile_pipeline: false,
     translation_input_mode: "continuous_document",
+    extraction_mode: getInputValue("extractionMode", "auto"),
+    use_local_vlm_repair: checkboxValue("useLocalVlmRepair") === "true",
+    use_deepseek_fallback: checkboxValue("useDeepseekFallback") === "true",
+    keep_debug_artifacts: checkboxValue("keepDebugArtifacts") === "true",
   };
+}
+
+function checkboxValue(id) {
+  const item = document.getElementById(id);
+  return item && item.checked ? "true" : "false";
 }
 
 async function parseJsonResponse(res) {
@@ -500,6 +537,7 @@ function renderQueue() {
       </div>
       <div class="stage">${stageLabel(job.stage)} - ${escapeHtml(job.message || "")}</div>
       ${translationInfoLine(job)}
+      ${translationWarningLine(job)}
       ${job.error ? `<div class="error">${escapeHtml(job.error)}</div>` : ""}
       <div class="downloads">
         ${cancelQueuedButton(job)}
@@ -510,6 +548,8 @@ function renderQueue() {
         ${pdfDownloadLink(job, "faithful", "Faithful PDF")}
         ${downloadLink(job, "markdown", "Markdown")}
         ${downloadLink(job, "json", "JSON")}
+        ${downloadLink(job, "extraction_result", "Extraction JSON")}
+        ${downloadLink(job, "marker_detection", "Detection JSON")}
         ${downloadLink(job, "profile_summary", "Timing Summary")}
         ${downloadLink(job, "profile_json", "Timing JSON")}
         ${downloadLink(job, "profile_csv", "Timing CSV")}
@@ -593,15 +633,27 @@ function sourcePdfDownloadLink(job, mode, label) {
 }
 
 function translationInfoLine(job) {
-  if (job.stage !== "complete" || !job.translation) return "";
+  if (!job.translation) return "";
   const model = String(job.translation.model || "").trim();
-  if (!model) return "";
+  if (!model && !job.translation.pdf_classification && !job.translation.marker_mode) return "";
   const modelLabel = model.split("/").pop() || model;
   const temp = Number(job.translation.temperature);
   const topP = Number(job.translation.top_p);
   const tempText = Number.isFinite(temp) ? temp.toFixed(2) : "n/a";
   const topPText = Number.isFinite(topP) ? topP.toFixed(2) : "n/a";
-  return `<div class="meta-line">Model: ${escapeHtml(modelLabel)} | temp: ${escapeHtml(tempText)} | top-p: ${escapeHtml(topPText)}</div>`;
+  const classification = job.translation.pdf_classification ? ` | PDF: ${job.translation.pdf_classification}` : "";
+  const markerMode = job.translation.marker_mode ? ` | Marker: ${job.translation.marker_mode}` : "";
+  const fallback = job.translation.fallback_engine ? ` | Fallback: ${job.translation.fallback_engine}` : "";
+  const ocr = typeof job.translation.ocr_used === "boolean" ? ` | OCR: ${job.translation.ocr_used ? "yes" : "no"}` : "";
+  const repair = job.translation.local_vlm_repair_used ? " | VLM repair: yes" : "";
+  const meta = `Model: ${modelLabel} | temp: ${tempText} | top-p: ${topPText}${classification}${markerMode}${fallback}${ocr}${repair}`;
+  return `<div class="meta-line">${escapeHtml(meta)}</div>`;
+}
+
+function translationWarningLine(job) {
+  const warnings = Array.isArray(job.translation?.warnings) ? job.translation.warnings.filter(Boolean) : [];
+  if (!warnings.length) return "";
+  return `<div class="warning-line">${escapeHtml(warnings.slice(0, 3).join(" | "))}</div>`;
 }
 
 function retranslateButton(job) {
@@ -766,7 +818,7 @@ function renderRegionStatus() {
   const hasJob = Boolean(state.region.jobId);
   const selectedCount = countSelectedRegions();
   if (!hasJob) {
-    regionStatusEl.textContent = "Upload a PDF to start selecting OCR regions.";
+    regionStatusEl.textContent = state.region.statusMessage || "Upload a PDF to start automatic extraction.";
   } else if (state.region.loading) {
     regionStatusEl.textContent = `Loading ${state.region.filename || state.region.jobId} page ${state.region.currentPage}...`;
   } else {
@@ -774,7 +826,7 @@ function renderRegionStatus() {
     const ocrLabel = state.region.ocrStatus.replace("_", " ");
     const translationLabel = state.region.translationStatus.replace("_", " ");
     const message = state.region.statusMessage ? ` | ${state.region.statusMessage}` : "";
-    regionStatusEl.textContent = `${state.region.filename} | page ${state.region.currentPage}/${state.region.pageCount} | OCR regions: ${selectedCount} | OCR: ${ocrLabel} | translation: ${translationLabel}${dirty}${message}`;
+    regionStatusEl.textContent = `${state.region.filename || "Current job"} | extraction: ${ocrLabel} | translation: ${translationLabel}${dirty}${message}`;
   }
 
   const disabled = !hasJob || state.region.loading;

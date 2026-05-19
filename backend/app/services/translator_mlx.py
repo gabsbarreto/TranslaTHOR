@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 import os
 import re
@@ -52,6 +53,7 @@ class MlxTranslator:
     _TABLE_ESCAPED_ROW_RE = re.compile(r"(?is)&lt;\s*tr\b")
     _TABLE_ROW_OPEN_RE = re.compile(r"(?is)<tr\b[^>]*>")
     _TABLE_ROW_CLOSE_RE = re.compile(r"(?is)</tr\s*>")
+    _TABLE_CELL_RE = re.compile(r"(?is)<t[dh]\b[^>]*>(?P<body>.*?)</t[dh]\s*>")
     _SENTENCE_ABBREVIATIONS = {
         "al",
         "approx",
@@ -264,6 +266,8 @@ class MlxTranslator:
         section_context = ""
 
         for block in document.blocks:
+            if self._is_marker_table_cell_block(block):
+                continue
             if block.block_type in {BlockType.HEADER, BlockType.FOOTER} or not block.text.strip():
                 continue
 
@@ -292,6 +296,12 @@ class MlxTranslator:
 
     def _append_table_units(self, document: DocumentModel, units: list[TranslationUnit], context: str) -> None:
         for table_index, table in enumerate(document.tables, start=1):
+            table_debug = getattr(table, "debug", {})
+            if table_debug.get("render_from_block_text") or table_debug.get("marker_block_id"):
+                # Marker table HTML is already represented by a table Block and translated as
+                # one HTML table chunk. Adding per-row TableModel chunks duplicates work and can
+                # overwrite cells with prompt text if a row translation fails.
+                continue
             table_context = (
                 f"{context}\nTable {table_index}\n"
                 f"Preserve the delimiter token exactly as written: |||CELL_BREAK||| . "
@@ -456,6 +466,9 @@ class MlxTranslator:
 
     def _is_table_target(self, target_id: str) -> bool:
         return target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(self.TABLE_ROW_PREFIX)
+
+    def _is_marker_table_cell_block(self, block: Block) -> bool:
+        return str((block.metadata or {}).get("marker_block_type", "")).lower() == "tablecell"
 
     def _split_table_translation(self, translated_text: str, source_text: str, expected_cells: int) -> list[str]:
         parts = [part.strip() for part in translated_text.split(self.TABLE_DELIMITER)]
@@ -886,6 +899,8 @@ class MlxTranslator:
                         return False
                     continue
                 return False
+        if not self._table_nonempty_cells_preserved(source_table, translated_table):
+            return False
         return True
 
     def _extract_primary_table(self, text: str) -> str | None:
@@ -896,6 +911,30 @@ class MlxTranslator:
         opens = len(re.findall(rf"(?is)<{tag}\b", text))
         closes = len(re.findall(rf"(?is)</{tag}>", text))
         return opens, closes
+
+    def _table_nonempty_cells_preserved(self, source_table: str, translated_table: str) -> bool:
+        source_cells = self._table_cell_texts(source_table)
+        translated_cells = self._table_cell_texts(translated_table)
+        if len(source_cells) != len(translated_cells):
+            return False
+        for source_cell, translated_cell in zip(source_cells, translated_cells):
+            if self._is_significant_table_cell(source_cell) and not translated_cell.strip():
+                return False
+        return True
+
+    def _table_cell_texts(self, table_html: str) -> list[str]:
+        cells: list[str] = []
+        for match in self._TABLE_CELL_RE.finditer(table_html or ""):
+            text = self._TAG_RE.sub(" ", match.group("body"))
+            text = html.unescape(text)
+            cells.append(" ".join(text.split()))
+        return cells
+
+    def _is_significant_table_cell(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        return bool(re.search(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ]", stripped))
 
     def _build_prompt(self, text: str, context: str = "", source_language: str | None = None) -> str:
         context_part = (
