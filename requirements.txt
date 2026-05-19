@@ -1,0 +1,17 @@
+# Main application runtime dependencies.
+# Marker is installed separately in .venv-marker because it currently needs
+# a different Transformers stack from the MLX translation runtime.
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+pydantic>=2.7.0
+pypdf>=4.2.0
+pymupdf>=1.24.0
+pdfplumber>=0.11.0
+pypdfium2>=4.30.0
+pillow>=10.3.0
+langdetect>=1.0.9
+markdown>=3.6
+weasyprint>=62.3
+mlx-lm>=0.31.0
+mlx-vlm>=0.4.4

@@ -57,6 +57,12 @@ Install:
 
 ```bash
 bash scripts/setup_local_runtime.sh
+pip install -r requirements.txt
+```
+
+For editable development installs, use:
+
+```bash
 pip install -e ".[mlx,deepseek_ocr,dev]"
 ```
 
@@ -76,5 +82,4 @@ bash scripts/run_dev.sh
 
 Open:
 - `http://127.0.0.1:8000`
-
 
