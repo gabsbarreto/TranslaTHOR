@@ -31,8 +31,12 @@ def _settings() -> dict:
     return _build_job_settings(
         chunk_size=1800,
         model=config.DEFAULT_TRANSLATION_MODEL,
-        temperature=0.2,
-        top_p=0.9,
+        temperature=config.DEFAULT_LLM_TEMPERATURE,
+        top_p=config.DEFAULT_LLM_TOP_P,
+        top_k=config.DEFAULT_LLM_TOP_K,
+        min_p=config.DEFAULT_LLM_MIN_P,
+        presence_penalty=config.DEFAULT_LLM_PRESENCE_PENALTY,
+        repetition_penalty=config.DEFAULT_LLM_REPETITION_PENALTY,
         max_tokens=2048,
         output_mode=config.DEFAULT_OUTPUT_MODE,
         profile_pipeline=False,
@@ -62,6 +66,12 @@ def test_job_settings_include_qwen_ocr_fallback_defaults() -> None:
     assert settings["qwen_ocr_fallback"] == config.ENABLE_QWEN_OCR_FALLBACK
     assert settings["qwen_ocr_model"] == config.DEFAULT_QWEN_OCR_MODEL
     assert settings["qwen_ocr_max_tokens"] == config.DEFAULT_QWEN_OCR_MAX_TOKENS
+    assert settings["qwen_ocr_temperature"] == config.DEFAULT_QWEN_OCR_TEMPERATURE
+    assert settings["qwen_ocr_top_p"] == config.DEFAULT_QWEN_OCR_TOP_P
+    assert settings["qwen_ocr_top_k"] == config.DEFAULT_QWEN_OCR_TOP_K
+    assert settings["qwen_ocr_min_p"] == config.DEFAULT_QWEN_OCR_MIN_P
+    assert settings["qwen_ocr_presence_penalty"] == config.DEFAULT_QWEN_OCR_PRESENCE_PENALTY
+    assert settings["qwen_ocr_repetition_penalty"] == config.DEFAULT_QWEN_OCR_REPETITION_PENALTY
     assert settings["qwen_ocr_prompt"] == config.DEFAULT_QWEN_OCR_PROMPT
     assert settings["qwen_ocr_dpi"] == config.DEFAULT_QWEN_OCR_DPI
     assert settings["qwen_ocr_image_scale"] == config.DEFAULT_QWEN_OCR_IMAGE_SCALE

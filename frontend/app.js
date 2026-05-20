@@ -2,6 +2,12 @@ const BOX_TYPES = ["page", "text", "table", "figure", "caption", "header", "foot
 const WORKFLOW_STEPS = ["upload", "select", "ocr", "translate", "export"];
 const MIN_DRAW_REGION_PIXELS = 20;
 const MIN_DRAW_REGION_RATIO = 0.015;
+const DEFAULT_LLM_TEMPERATURE = 0.4;
+const DEFAULT_LLM_TOP_P = 0.7;
+const DEFAULT_LLM_TOP_K = 10;
+const DEFAULT_LLM_MIN_P = 0.0;
+const DEFAULT_LLM_PRESENCE_PENALTY = 1.5;
+const DEFAULT_LLM_REPETITION_PENALTY = 1.0;
 
 const state = {
   jobs: [],
@@ -337,10 +343,14 @@ async function submitReuseItem(item) {
 
 function appendTranslationFormFields(form) {
   form.append("chunk_size", getInputValue("chunkSize", "1800"));
-  form.append("temperature", getInputValue("temp", "0.2"));
+  form.append("temperature", getInputValue("temp", String(DEFAULT_LLM_TEMPERATURE)));
   form.append("max_tokens", getInputValue("maxTokens", "2048"));
-  form.append("model", getInputValue("model", "mlx-community/Qwen3.5-4B-OptiQ-4bit"));
-  form.append("top_p", getInputValue("topP", "0.9"));
+  form.append("model", getInputValue("model", "mlx-community/Qwen3.5-9B-MLX-4bit"));
+  form.append("top_p", getInputValue("topP", String(DEFAULT_LLM_TOP_P)));
+  form.append("top_k", String(DEFAULT_LLM_TOP_K));
+  form.append("min_p", String(DEFAULT_LLM_MIN_P));
+  form.append("presence_penalty", String(DEFAULT_LLM_PRESENCE_PENALTY));
+  form.append("repetition_penalty", String(DEFAULT_LLM_REPETITION_PENALTY));
   form.append("output_mode", "readable");
   form.append("extraction_mode", getInputValue("extractionMode", "auto"));
   form.append("use_local_vlm_repair", checkboxValue("useLocalVlmRepair"));
@@ -351,9 +361,13 @@ function appendTranslationFormFields(form) {
 function buildTranslationPayload() {
   return {
     chunk_size: numberInput("chunkSize", 1800),
-    model: getInputValue("model", "mlx-community/Qwen3.5-4B-OptiQ-4bit"),
-    temperature: numberInput("temp", 0.2),
-    top_p: numberInput("topP", 0.9),
+    model: getInputValue("model", "mlx-community/Qwen3.5-9B-MLX-4bit"),
+    temperature: numberInput("temp", DEFAULT_LLM_TEMPERATURE),
+    top_p: numberInput("topP", DEFAULT_LLM_TOP_P),
+    top_k: DEFAULT_LLM_TOP_K,
+    min_p: DEFAULT_LLM_MIN_P,
+    presence_penalty: DEFAULT_LLM_PRESENCE_PENALTY,
+    repetition_penalty: DEFAULT_LLM_REPETITION_PENALTY,
     max_tokens: numberInput("maxTokens", 2048),
     output_mode: "readable",
     profile_pipeline: false,
@@ -639,14 +653,31 @@ function translationInfoLine(job) {
   const modelLabel = model.split("/").pop() || model;
   const temp = Number(job.translation.temperature);
   const topP = Number(job.translation.top_p);
+  const topK = Number(job.translation.top_k);
+  const minP = Number(job.translation.min_p);
+  const presencePenalty = Number(job.translation.presence_penalty);
+  const repetitionPenalty = Number(job.translation.repetition_penalty);
   const tempText = Number.isFinite(temp) ? temp.toFixed(2) : "n/a";
   const topPText = Number.isFinite(topP) ? topP.toFixed(2) : "n/a";
+  const topKText = Number.isFinite(topK) ? String(topK) : "n/a";
+  const minPText = Number.isFinite(minP) ? minP.toFixed(2) : "n/a";
+  const presenceText = Number.isFinite(presencePenalty) ? presencePenalty.toFixed(2) : "n/a";
+  const repetitionText = Number.isFinite(repetitionPenalty) ? repetitionPenalty.toFixed(2) : "n/a";
   const classification = job.translation.pdf_classification ? ` | PDF: ${job.translation.pdf_classification}` : "";
   const markerMode = job.translation.marker_mode ? ` | Marker: ${job.translation.marker_mode}` : "";
   const fallback = job.translation.fallback_engine ? ` | Fallback: ${job.translation.fallback_engine}` : "";
   const ocr = typeof job.translation.ocr_used === "boolean" ? ` | OCR: ${job.translation.ocr_used ? "yes" : "no"}` : "";
   const repair = job.translation.local_vlm_repair_used ? " | VLM repair: yes" : "";
-  const meta = `Model: ${modelLabel} | temp: ${tempText} | top-p: ${topPText}${classification}${markerMode}${fallback}${ocr}${repair}`;
+  const modelParams = [
+    `Model: ${modelLabel}`,
+    `temp: ${tempText}`,
+    `top-p: ${topPText}`,
+    `top-k: ${topKText}`,
+    `min-p: ${minPText}`,
+    `presence: ${presenceText}`,
+    `repeat: ${repetitionText}`,
+  ].join(" | ");
+  const meta = `${modelParams}${classification}${markerMode}${fallback}${ocr}${repair}`;
   return `<div class="meta-line">${escapeHtml(meta)}</div>`;
 }
 

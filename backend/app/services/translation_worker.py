@@ -4,7 +4,15 @@ import argparse
 import json
 from pathlib import Path
 
-from app.config import DEFAULT_TRANSLATION_MODEL
+from app.config import (
+    DEFAULT_LLM_MIN_P,
+    DEFAULT_LLM_PRESENCE_PENALTY,
+    DEFAULT_LLM_REPETITION_PENALTY,
+    DEFAULT_LLM_TEMPERATURE,
+    DEFAULT_LLM_TOP_K,
+    DEFAULT_LLM_TOP_P,
+    DEFAULT_TRANSLATION_MODEL,
+)
 from app.models.schema import DocumentModel
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.translator_mlx import MlxTranslator, TranslationSettings
@@ -24,10 +32,30 @@ def main() -> int:
     args = parser.parse_args()
 
     settings = json.loads(args.settings_json)
-    model_cfg = settings.get("translation_model", {}) if isinstance(settings.get("translation_model"), dict) else {}
+    model_cfg = (
+        settings.get("translation_model", {})
+        if isinstance(settings.get("translation_model"), dict)
+        else {}
+    )
     model_name = str(model_cfg.get("model_id", settings.get("model", DEFAULT_TRANSLATION_MODEL)))
-    temperature = float(model_cfg.get("temperature", settings.get("temperature", 0.2)))
-    top_p = float(model_cfg.get("top_p", settings.get("top_p", 0.9)))
+    temperature = float(
+        model_cfg.get("temperature", settings.get("temperature", DEFAULT_LLM_TEMPERATURE))
+    )
+    top_p = float(model_cfg.get("top_p", settings.get("top_p", DEFAULT_LLM_TOP_P)))
+    top_k = int(model_cfg.get("top_k", settings.get("top_k", DEFAULT_LLM_TOP_K)))
+    min_p = float(model_cfg.get("min_p", settings.get("min_p", DEFAULT_LLM_MIN_P)))
+    presence_penalty = float(
+        model_cfg.get(
+            "presence_penalty",
+            settings.get("presence_penalty", DEFAULT_LLM_PRESENCE_PENALTY),
+        )
+    )
+    repetition_penalty = float(
+        model_cfg.get(
+            "repetition_penalty",
+            settings.get("repetition_penalty", DEFAULT_LLM_REPETITION_PENALTY),
+        )
+    )
     max_tokens = int(model_cfg.get("max_tokens", settings.get("max_tokens", 2048)))
     document_path = Path(args.document)
     markdown_path = Path(args.markdown)
@@ -43,6 +71,10 @@ def main() -> int:
             chunk_size=int(settings.get("chunk_size", 1800)),
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
             max_tokens=max_tokens,
         )
     )
@@ -72,6 +104,10 @@ def main() -> int:
             "model": model_name,
             "temperature": temperature,
             "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
         }
         translated_md = MarkdownBuilder().build(translated_doc)
         output_document_path.write_text(translated_doc.model_dump_json(indent=2), encoding="utf-8")

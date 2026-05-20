@@ -28,14 +28,20 @@ from app.config import (
     DEFAULT_QWEN_OCR_MAX_CROPS,
     DEFAULT_QWEN_OCR_MAX_TOKENS,
     DEFAULT_QWEN_OCR_MIN_CROPS,
+    DEFAULT_QWEN_OCR_MIN_P,
     DEFAULT_QWEN_OCR_MODEL,
     DEFAULT_QWEN_OCR_NGRAM_SIZE,
     DEFAULT_QWEN_OCR_NGRAM_WINDOW,
     DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
     DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
+    DEFAULT_QWEN_OCR_PRESENCE_PENALTY,
     DEFAULT_QWEN_OCR_PROMPT,
+    DEFAULT_QWEN_OCR_REPETITION_PENALTY,
     DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
     DEFAULT_QWEN_OCR_SKIP_REPEAT,
+    DEFAULT_QWEN_OCR_TEMPERATURE,
+    DEFAULT_QWEN_OCR_TOP_K,
+    DEFAULT_QWEN_OCR_TOP_P,
 )
 from app.models.schema import Block
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
@@ -174,6 +180,18 @@ class QwenFullPageOCRFallback:
                 "force_ocr": False,
                 "strip_existing_ocr": False,
                 "qwen_ocr_model": str(settings.get("qwen_ocr_model", DEFAULT_QWEN_OCR_MODEL)),
+                "qwen_ocr_temperature": float(
+                    settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE)
+                ),
+                "qwen_ocr_top_p": float(settings.get("qwen_ocr_top_p", DEFAULT_QWEN_OCR_TOP_P)),
+                "qwen_ocr_top_k": int(settings.get("qwen_ocr_top_k", DEFAULT_QWEN_OCR_TOP_K)),
+                "qwen_ocr_min_p": float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P)),
+                "qwen_ocr_presence_penalty": float(
+                    settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY)
+                ),
+                "qwen_ocr_repetition_penalty": float(
+                    settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY)
+                ),
                 "qwen_ocr_dpi": dpi,
                 "qwen_ocr_image_scale": scale,
                 "qwen_ocr_jpeg_quality": quality,
@@ -223,7 +241,28 @@ class QwenFullPageOCRFallback:
             "--max-tokens",
             str(int(settings.get("qwen_ocr_max_tokens", DEFAULT_QWEN_OCR_MAX_TOKENS))),
             "--temperature",
-            "0.0",
+            str(float(settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE))),
+            "--top-p",
+            str(float(settings.get("qwen_ocr_top_p", DEFAULT_QWEN_OCR_TOP_P))),
+            "--top-k",
+            str(int(settings.get("qwen_ocr_top_k", DEFAULT_QWEN_OCR_TOP_K))),
+            "--min-p",
+            str(float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P))),
+            "--presence-penalty",
+            str(
+                float(
+                    settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY)
+                )
+            ),
+            "--repetition-penalty",
+            str(
+                float(
+                    settings.get(
+                        "qwen_ocr_repetition_penalty",
+                        DEFAULT_QWEN_OCR_REPETITION_PENALTY,
+                    )
+                )
+            ),
             "--prompt",
             str(settings.get("qwen_ocr_prompt", DEFAULT_QWEN_OCR_PROMPT)),
             "--crop-mode",

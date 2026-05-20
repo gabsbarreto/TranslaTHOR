@@ -23,6 +23,12 @@ from app.config import (
     DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
     DEFAULT_DEEPSEEK_OCR_PROMPT,
     DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
+    DEFAULT_LLM_MIN_P,
+    DEFAULT_LLM_PRESENCE_PENALTY,
+    DEFAULT_LLM_REPETITION_PENALTY,
+    DEFAULT_LLM_TEMPERATURE,
+    DEFAULT_LLM_TOP_K,
+    DEFAULT_LLM_TOP_P,
     DEFAULT_RENDER_STRATEGY,
     ENABLE_DEEPSEEK_FALLBACK,
     ENABLE_LOCAL_VLM_REPAIR,
@@ -92,8 +98,16 @@ class TranslationPipeline:
         translation_input_mode = str(settings.get("translation_input_mode", "continuous_document"))
         translation_metadata = {
             "model": str(settings.get("model", "")),
-            "temperature": float(settings.get("temperature", 0.2)),
-            "top_p": float(settings.get("top_p", 0.9)),
+            "temperature": float(settings.get("temperature", DEFAULT_LLM_TEMPERATURE)),
+            "top_p": float(settings.get("top_p", DEFAULT_LLM_TOP_P)),
+            "top_k": int(settings.get("top_k", DEFAULT_LLM_TOP_K)),
+            "min_p": float(settings.get("min_p", DEFAULT_LLM_MIN_P)),
+            "presence_penalty": float(
+                settings.get("presence_penalty", DEFAULT_LLM_PRESENCE_PENALTY)
+            ),
+            "repetition_penalty": float(
+                settings.get("repetition_penalty", DEFAULT_LLM_REPETITION_PENALTY)
+            ),
         }
 
         try:
@@ -342,8 +356,16 @@ class TranslationPipeline:
         keep_debug_artifacts = bool(settings.get("keep_debug_artifacts", KEEP_EXTRACTION_DEBUG_ARTIFACTS))
         translation_metadata = {
             "model": str(settings.get("model", "")),
-            "temperature": float(settings.get("temperature", 0.2)),
-            "top_p": float(settings.get("top_p", 0.9)),
+            "temperature": float(settings.get("temperature", DEFAULT_LLM_TEMPERATURE)),
+            "top_p": float(settings.get("top_p", DEFAULT_LLM_TOP_P)),
+            "top_k": int(settings.get("top_k", DEFAULT_LLM_TOP_K)),
+            "min_p": float(settings.get("min_p", DEFAULT_LLM_MIN_P)),
+            "presence_penalty": float(
+                settings.get("presence_penalty", DEFAULT_LLM_PRESENCE_PENALTY)
+            ),
+            "repetition_penalty": float(
+                settings.get("repetition_penalty", DEFAULT_LLM_REPETITION_PENALTY)
+            ),
         }
 
         try:

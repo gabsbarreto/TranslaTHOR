@@ -30,14 +30,14 @@
             </select>
           </label>
           <label>Chunk Tokens <input id="chunkSize" type="number" min="128" max="8000" value="1800" /></label>
-          <label>LLM Temperature <input id="temp" type="number" min="0" max="1" step="0.05" value="0.2" /></label>
+          <label>LLM Temperature <input id="temp" type="number" min="0" max="1" step="0.05" value="0.4" /></label>
           <label>LLM Max Tokens <input id="maxTokens" type="number" min="256" max="8192" value="2048" /></label>
           <label>Translation LLM
             <select id="model">
-              <option value="mlx-community/Qwen3.5-4B-OptiQ-4bit" selected>Qwen3.5 4B OptiQ-4bit</option>
+              <option value="mlx-community/Qwen3.5-9B-MLX-4bit" selected>Qwen3.5-9B-MLX-4bit</option>
             </select>
           </label>
-          <label>LLM Top P <input id="topP" type="number" min="0" max="1" step="0.05" value="0.9" /></label>
+          <label>LLM Top P <input id="topP" type="number" min="0" max="1" step="0.05" value="0.7" /></label>
         </div>
         <div class="checks">
           <label><input id="useLocalVlmRepair" type="checkbox" /> Local VLM repair</label>

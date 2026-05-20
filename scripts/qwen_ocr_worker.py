@@ -265,7 +265,12 @@ def main() -> int:
     parser.add_argument("--images-json", required=True)
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-tokens", type=int, default=4096)
-    parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument("--temperature", type=float, default=0.4)
+    parser.add_argument("--top-p", type=float, default=0.7)
+    parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--crop-mode", type=parse_bool_flag, default=True)
     parser.add_argument("--min-crops", type=int, default=1)
@@ -281,7 +286,7 @@ def main() -> int:
     parser.add_argument("--fallback-to-single", type=parse_bool_flag, default=True)
     args = parser.parse_args()
 
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_logits_processors, make_sampler
     from mlx_vlm.generate import batch_generate, generate
     from mlx_vlm.prompt_utils import apply_chat_template
 
@@ -293,17 +298,26 @@ def main() -> int:
     min_crops = max(int(args.min_crops), 0)
     max_crops = max(int(args.max_crops), min_crops)
     requested_batch_size = max(int(args.batch_size), 1)
-    use_batch = requested_batch_size > 1
+    force_single_for_penalties = (
+        float(args.presence_penalty) != 0.0 or float(args.repetition_penalty) != 1.0
+    )
+    use_batch = requested_batch_size > 1 and not force_single_for_penalties
     prompt_text = str(args.prompt)
 
     emit({"event": "model_loading", "model": str(args.model)})
     model, processor = load_qwen_vlm(str(args.model))
     config = model.config
-    logits_processors = build_logits_processors(
-        processor=processor,
-        skip_repeat=bool(args.skip_repeat),
-        ngram_size=max(int(args.ngram_size), 1),
-        ngram_window=max(int(args.ngram_window), 1),
+    logits_processors = make_logits_processors(
+        presence_penalty=float(args.presence_penalty),
+        repetition_penalty=max(float(args.repetition_penalty), 1e-6),
+    )
+    logits_processors.extend(
+        build_logits_processors(
+            processor=processor,
+            skip_repeat=bool(args.skip_repeat),
+            ngram_size=max(int(args.ngram_size), 1),
+            ngram_window=max(int(args.ngram_window), 1),
+        )
     )
     emit(
         {
@@ -312,8 +326,14 @@ def main() -> int:
             "pages": len(image_paths),
             "requested_batch_size": requested_batch_size,
             "use_batch_generate": bool(use_batch),
+            "batch_disabled_for_penalties": bool(force_single_for_penalties),
             "enable_thinking": bool(args.enable_thinking),
             "temperature": float(args.temperature),
+            "top_p": float(args.top_p),
+            "top_k": int(args.top_k),
+            "min_p": float(args.min_p),
+            "presence_penalty": float(args.presence_penalty),
+            "repetition_penalty": float(args.repetition_penalty),
             "max_tokens": int(args.max_tokens),
             "crop_mode": bool(args.crop_mode),
             "min_crops": min_crops,
@@ -326,9 +346,12 @@ def main() -> int:
     )
 
     try:
-        sampler = None
-        if float(args.temperature) > 0.0:
-            sampler = make_sampler(temp=float(args.temperature), top_p=1.0)
+        sampler = make_sampler(
+            temp=max(float(args.temperature), 0.0),
+            top_p=max(0.0, min(1.0, float(args.top_p))),
+            top_k=max(0, int(args.top_k)),
+            min_p=max(0.0, min(1.0, float(args.min_p))),
+        )
 
         if use_batch:
             prompts = [normalise_prompt_for_chat_template(prompt_text) for _ in image_paths]
@@ -337,7 +360,9 @@ def main() -> int:
             image_batches = chunk_list(image_path_strings, requested_batch_size)
             output_index = 1
 
-            for batch_idx, (prompt_batch, image_batch) in enumerate(zip(prompt_batches, image_batches), start=1):
+            for batch_idx, (prompt_batch, image_batch) in enumerate(
+                zip(prompt_batches, image_batches), start=1
+            ):
                 emit(
                     {
                         "event": "batch_started",
@@ -364,7 +389,13 @@ def main() -> int:
                 except Exception as exc:
                     if not bool(args.fallback_to_single):
                         raise
-                    emit({"event": "batch_failed_falling_back_to_single", "batch_index": batch_idx, "error": str(exc)})
+                    emit(
+                        {
+                            "event": "batch_failed_falling_back_to_single",
+                            "batch_index": batch_idx,
+                            "error": str(exc),
+                        }
+                    )
                     fallback_texts: list[str] = []
                     for single_prompt, single_image in zip(prompt_batch, image_batch):
                         formatted_prompt = build_generation_prompt(
@@ -380,6 +411,9 @@ def main() -> int:
                             formatted_prompt,
                             image=[single_image],
                             temperature=float(args.temperature),
+                            top_p=float(args.top_p),
+                            top_k=int(args.top_k),
+                            min_p=float(args.min_p),
                             max_tokens=int(args.max_tokens),
                             base_size=int(args.base_size),
                             image_size=int(args.image_size),
@@ -394,9 +428,20 @@ def main() -> int:
 
                 for text in response.texts:
                     image_path = image_paths[output_index - 1]
-                    emit({"event": "page_started", "index": output_index, "total": len(image_paths), "image": str(image_path)})
+                    emit(
+                        {
+                            "event": "page_started",
+                            "index": output_index,
+                            "total": len(image_paths),
+                            "image": str(image_path),
+                        }
+                    )
                     markdown = clean_generated_text(str(text), prompt_text)
-                    stem = str(names[output_index - 1]) if output_index - 1 < len(names) else f"page_{output_index:04d}"
+                    stem = (
+                        str(names[output_index - 1])
+                        if output_index - 1 < len(names)
+                        else f"page_{output_index:04d}"
+                    )
                     output_path = output_dir / f"{stem}.md"
                     output_path.write_text(markdown, encoding="utf-8")
                     emit(
@@ -411,7 +456,14 @@ def main() -> int:
                     output_index += 1
         else:
             for index, image_path in enumerate(image_paths, start=1):
-                emit({"event": "page_started", "index": index, "total": len(image_paths), "image": str(image_path)})
+                emit(
+                    {
+                        "event": "page_started",
+                        "index": index,
+                        "total": len(image_paths),
+                        "image": str(image_path),
+                    }
+                )
                 formatted_prompt = build_generation_prompt(
                     processor=processor,
                     config=config,
@@ -425,6 +477,9 @@ def main() -> int:
                     formatted_prompt,
                     image=[str(image_path)],
                     temperature=float(args.temperature),
+                    top_p=float(args.top_p),
+                    top_k=int(args.top_k),
+                    min_p=float(args.min_p),
                     max_tokens=int(args.max_tokens),
                     base_size=int(args.base_size),
                     image_size=int(args.image_size),
@@ -438,7 +493,15 @@ def main() -> int:
                 stem = str(names[index - 1]) if index - 1 < len(names) else f"page_{index:04d}"
                 output_path = output_dir / f"{stem}.md"
                 output_path.write_text(markdown, encoding="utf-8")
-                emit({"event": "page_done", "index": index, "total": len(image_paths), "output": str(output_path), "chars": len(markdown)})
+                emit(
+                    {
+                        "event": "page_done",
+                        "index": index,
+                        "total": len(image_paths),
+                        "output": str(output_path),
+                        "chars": len(markdown),
+                    }
+                )
 
         emit({"event": "complete", "pages": len(image_paths)})
     finally:

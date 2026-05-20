@@ -30,6 +30,12 @@ from app.config import (
     DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
     DEFAULT_DEEPSEEK_OCR_PROMPT,
     DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
+    DEFAULT_LLM_MIN_P,
+    DEFAULT_LLM_PRESENCE_PENALTY,
+    DEFAULT_LLM_REPETITION_PENALTY,
+    DEFAULT_LLM_TEMPERATURE,
+    DEFAULT_LLM_TOP_K,
+    DEFAULT_LLM_TOP_P,
     DEFAULT_OUTPUT_MODE,
     DEFAULT_QWEN_OCR_BASE_SIZE,
     DEFAULT_QWEN_OCR_BATCH_SIZE,
@@ -43,16 +49,22 @@ from app.config import (
     DEFAULT_QWEN_OCR_MAX_CROPS,
     DEFAULT_QWEN_OCR_MAX_TOKENS,
     DEFAULT_QWEN_OCR_MIN_CROPS,
+    DEFAULT_QWEN_OCR_MIN_P,
     DEFAULT_QWEN_OCR_MODEL,
     DEFAULT_QWEN_OCR_NGRAM_SIZE,
     DEFAULT_QWEN_OCR_NGRAM_WINDOW,
+    DEFAULT_QWEN_OCR_PRESENCE_PENALTY,
     DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
     DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
     DEFAULT_QWEN_OCR_PROMPT,
     DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
     DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
+    DEFAULT_QWEN_OCR_REPETITION_PENALTY,
     DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
     DEFAULT_QWEN_OCR_SKIP_REPEAT,
+    DEFAULT_QWEN_OCR_TEMPERATURE,
+    DEFAULT_QWEN_OCR_TOP_K,
+    DEFAULT_QWEN_OCR_TOP_P,
     DEFAULT_RENDER_STRATEGY,
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_EXTRACTION_MODE,
@@ -117,8 +129,12 @@ _selected_ocr_processes: dict[str, list[subprocess.Popen]] = {}
 class RetranslateRequest(BaseModel):
     chunk_size: int = DEFAULT_CHUNK_SIZE
     model: str = DEFAULT_TRANSLATION_MODEL
-    temperature: float = 0.2
-    top_p: float = 0.9
+    temperature: float = DEFAULT_LLM_TEMPERATURE
+    top_p: float = DEFAULT_LLM_TOP_P
+    top_k: int = DEFAULT_LLM_TOP_K
+    min_p: float = DEFAULT_LLM_MIN_P
+    presence_penalty: float = DEFAULT_LLM_PRESENCE_PENALTY
+    repetition_penalty: float = DEFAULT_LLM_REPETITION_PENALTY
     max_tokens: int = 2048
     output_mode: str = DEFAULT_OUTPUT_MODE
     profile_pipeline: bool = False
@@ -128,8 +144,12 @@ class RetranslateRequest(BaseModel):
 class StartJobRequest(BaseModel):
     chunk_size: int = DEFAULT_CHUNK_SIZE
     model: str = DEFAULT_TRANSLATION_MODEL
-    temperature: float = 0.2
-    top_p: float = 0.9
+    temperature: float = DEFAULT_LLM_TEMPERATURE
+    top_p: float = DEFAULT_LLM_TOP_P
+    top_k: int = DEFAULT_LLM_TOP_K
+    min_p: float = DEFAULT_LLM_MIN_P
+    presence_penalty: float = DEFAULT_LLM_PRESENCE_PENALTY
+    repetition_penalty: float = DEFAULT_LLM_REPETITION_PENALTY
     max_tokens: int = 2048
     output_mode: str = DEFAULT_OUTPUT_MODE
     profile_pipeline: bool = False
@@ -229,8 +249,12 @@ async def create_job(
     files: list[UploadFile] = File(...),
     chunk_size: int = Form(1800),
     model: str = Form(DEFAULT_TRANSLATION_MODEL),
-    temperature: float = Form(0.2),
-    top_p: float = Form(0.9),
+    temperature: float = Form(DEFAULT_LLM_TEMPERATURE),
+    top_p: float = Form(DEFAULT_LLM_TOP_P),
+    top_k: int = Form(DEFAULT_LLM_TOP_K),
+    min_p: float = Form(DEFAULT_LLM_MIN_P),
+    presence_penalty: float = Form(DEFAULT_LLM_PRESENCE_PENALTY),
+    repetition_penalty: float = Form(DEFAULT_LLM_REPETITION_PENALTY),
     max_tokens: int = Form(2048),
     output_mode: str = Form(DEFAULT_OUTPUT_MODE),
     profile_pipeline: bool = Form(False),
@@ -252,6 +276,10 @@ async def create_job(
             model=model,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
             max_tokens=max_tokens,
             output_mode=output_mode,
             profile_pipeline=profile_pipeline,
@@ -305,6 +333,10 @@ def start_job(job_id: str, request: StartJobRequest) -> dict[str, str]:
         model=request.model,
         temperature=request.temperature,
         top_p=request.top_p,
+        top_k=request.top_k,
+        min_p=request.min_p,
+        presence_penalty=request.presence_penalty,
+        repetition_penalty=request.repetition_penalty,
         max_tokens=request.max_tokens,
         output_mode=request.output_mode,
         profile_pipeline=request.profile_pipeline,
@@ -846,8 +878,12 @@ def retranslate_job_compat(
     job_id: str,
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     model: str = DEFAULT_TRANSLATION_MODEL,
-    temperature: float = 0.2,
-    top_p: float = 0.9,
+    temperature: float = DEFAULT_LLM_TEMPERATURE,
+    top_p: float = DEFAULT_LLM_TOP_P,
+    top_k: int = DEFAULT_LLM_TOP_K,
+    min_p: float = DEFAULT_LLM_MIN_P,
+    presence_penalty: float = DEFAULT_LLM_PRESENCE_PENALTY,
+    repetition_penalty: float = DEFAULT_LLM_REPETITION_PENALTY,
     max_tokens: int = 2048,
     output_mode: str = DEFAULT_OUTPUT_MODE,
     profile_pipeline: bool = False,
@@ -857,6 +893,10 @@ def retranslate_job_compat(
         model=model,
         temperature=temperature,
         top_p=top_p,
+        top_k=top_k,
+        min_p=min_p,
+        presence_penalty=presence_penalty,
+        repetition_penalty=repetition_penalty,
         max_tokens=max_tokens,
         output_mode=output_mode,
         profile_pipeline=profile_pipeline,
@@ -903,6 +943,10 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
             model=request.model,
             temperature=request.temperature,
             top_p=request.top_p,
+            top_k=request.top_k,
+            min_p=request.min_p,
+            presence_penalty=request.presence_penalty,
+            repetition_penalty=request.repetition_penalty,
             max_tokens=request.max_tokens,
             output_mode=request.output_mode,
             profile_pipeline=request.profile_pipeline,
@@ -1118,6 +1162,10 @@ def _build_job_settings(
     model: str,
     temperature: float,
     top_p: float,
+    top_k: int,
+    min_p: float,
+    presence_penalty: float,
+    repetition_penalty: float,
     max_tokens: int,
     output_mode: str,
     profile_pipeline: bool,
@@ -1137,6 +1185,10 @@ def _build_job_settings(
         "available_models": AVAILABLE_TRANSLATION_MODELS,
         "temperature": temperature,
         "top_p": top_p,
+        "top_k": top_k,
+        "min_p": min_p,
+        "presence_penalty": presence_penalty,
+        "repetition_penalty": repetition_penalty,
         "max_tokens": max_tokens,
         "output_mode": output_mode,
         "render_strategy": DEFAULT_RENDER_STRATEGY,
@@ -1168,6 +1220,12 @@ def _build_job_settings(
         "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
         "qwen_ocr_model": DEFAULT_QWEN_OCR_MODEL,
         "qwen_ocr_max_tokens": DEFAULT_QWEN_OCR_MAX_TOKENS,
+        "qwen_ocr_temperature": DEFAULT_QWEN_OCR_TEMPERATURE,
+        "qwen_ocr_top_p": DEFAULT_QWEN_OCR_TOP_P,
+        "qwen_ocr_top_k": DEFAULT_QWEN_OCR_TOP_K,
+        "qwen_ocr_min_p": DEFAULT_QWEN_OCR_MIN_P,
+        "qwen_ocr_presence_penalty": DEFAULT_QWEN_OCR_PRESENCE_PENALTY,
+        "qwen_ocr_repetition_penalty": DEFAULT_QWEN_OCR_REPETITION_PENALTY,
         "qwen_ocr_prompt": DEFAULT_QWEN_OCR_PROMPT,
         "qwen_ocr_dpi": DEFAULT_QWEN_OCR_DPI,
         "qwen_ocr_image_scale": DEFAULT_QWEN_OCR_IMAGE_SCALE,
@@ -1193,6 +1251,10 @@ def _build_job_settings(
             "model_id": selected_model,
             "temperature": temperature,
             "top_p": top_p,
+            "top_k": top_k,
+            "min_p": min_p,
+            "presence_penalty": presence_penalty,
+            "repetition_penalty": repetition_penalty,
             "max_tokens": max_tokens,
         },
     }

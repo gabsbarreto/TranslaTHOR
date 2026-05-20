@@ -9,7 +9,16 @@ from typing import Any, Callable
 
 from langdetect import detect
 
-from app.config import DEFAULT_CHUNK_SIZE, DEFAULT_TRANSLATION_MODEL
+from app.config import (
+    DEFAULT_CHUNK_SIZE,
+    DEFAULT_LLM_MIN_P,
+    DEFAULT_LLM_PRESENCE_PENALTY,
+    DEFAULT_LLM_REPETITION_PENALTY,
+    DEFAULT_LLM_TEMPERATURE,
+    DEFAULT_LLM_TOP_K,
+    DEFAULT_LLM_TOP_P,
+    DEFAULT_TRANSLATION_MODEL,
+)
 from app.models.schema import Block, BlockType, DocumentModel, TranslationChunk
 
 logger = logging.getLogger(__name__)
@@ -19,8 +28,12 @@ logger = logging.getLogger(__name__)
 class TranslationSettings:
     model_name: str = DEFAULT_TRANSLATION_MODEL
     chunk_size: int = DEFAULT_CHUNK_SIZE
-    temperature: float = 0.2
-    top_p: float = 0.9
+    temperature: float = DEFAULT_LLM_TEMPERATURE
+    top_p: float = DEFAULT_LLM_TOP_P
+    top_k: int = DEFAULT_LLM_TOP_K
+    min_p: float = DEFAULT_LLM_MIN_P
+    presence_penalty: float = DEFAULT_LLM_PRESENCE_PENALTY
+    repetition_penalty: float = DEFAULT_LLM_REPETITION_PENALTY
     max_tokens: int = 1024
 
 
@@ -652,6 +665,7 @@ class MlxTranslator:
 
         prompt = self._build_prompt(text, context, source_language)
         sampler = self._make_sampler(sample_utils)
+        logits_processors = self._make_logits_processors(sample_utils)
         max_tokens = force_max_tokens or self._estimated_output_tokens(prompt)
         try:
             out = generate(
@@ -660,6 +674,7 @@ class MlxTranslator:
                 prompt=prompt,
                 max_tokens=max_tokens,
                 sampler=sampler,
+                logits_processors=logits_processors,
             )
             translated = str(out).strip()
             return self._postprocess_translated_text(translated)
@@ -838,7 +853,7 @@ class MlxTranslator:
             group_table = prefix + "".join(group_rows) + suffix
             group_context = (
                 f"{context}\n"
-                "Translate this partial HTML table and keep tags intact. "
+                "Translate this HTML table to English and keep tags intact. "
                 "Return complete table markup."
             ).strip()
             translated_group = self._translate_chunk(
@@ -951,19 +966,37 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "symbols, abbreviations, units, numbers, and figure references. "
+            "units, numbers, and figure references. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
-            "Translate short section headings and titles as well. If TEXT is already English, return it unchanged."
+            "Translate short section headings and titles as well."
         )
 
     def _make_sampler(self, sample_utils):
+        kwargs = {
+            "temp": max(0.0, self.settings.temperature),
+            "top_p": max(0.0, min(1.0, self.settings.top_p)),
+            "top_k": max(0, int(self.settings.top_k)),
+            "min_p": max(0.0, min(1.0, self.settings.min_p)),
+        }
         try:
-            return sample_utils.make_sampler(
-                temp=max(0.0, self.settings.temperature),
-                top_p=max(0.0, min(1.0, self.settings.top_p)),
+            return sample_utils.make_sampler(**kwargs)
+        except TypeError:
+            kwargs.pop("min_p", None)
+            try:
+                return sample_utils.make_sampler(**kwargs)
+            except TypeError:
+                return sample_utils.make_sampler(temp=max(0.0, self.settings.temperature))
+
+    def _make_logits_processors(self, sample_utils):
+        if not hasattr(sample_utils, "make_logits_processors"):
+            return []
+        try:
+            return sample_utils.make_logits_processors(
+                presence_penalty=float(self.settings.presence_penalty),
+                repetition_penalty=max(float(self.settings.repetition_penalty), 1e-6),
             )
         except TypeError:
-            return sample_utils.make_sampler(temp=max(0.0, self.settings.temperature))
+            return []
 
     def _format_chat_prompt(self, system: str, user: str) -> str:
         messages = [
