@@ -952,13 +952,9 @@ class MlxTranslator:
         return bool(re.search(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ]", stripped))
 
     def _build_prompt(self, text: str, context: str = "", source_language: str | None = None) -> str:
-        context_part = (
-            f"\nSECTION CONTEXT (for terminology only, do not translate this unless it appears in TEXT):\n{context}\n"
-            if context
-            else ""
-        )
+        
         system = self._system_prompt()
-        user = f"{context_part}\nTEXT:\n{text}"
+        user = f"\nTEXT:\n{text}"
         return self._format_chat_prompt(system, user)
 
     def _system_prompt(self) -> str:

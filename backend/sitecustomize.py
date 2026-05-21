@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """Runtime compatibility shims for subprocess tools.
 
 Marker 1.10.2 / Surya 0.17.1 imports ``transformers.onnx.OnnxConfig``.
@@ -9,12 +7,14 @@ the app and Marker subprocesses, and supplies the small base class Surya uses
 for its OCR error config definitions.
 """
 
+from __future__ import annotations
+
 import sys
 import types
 
 
 try:
-    import transformers.onnx  # type: ignore[import-not-found]
+    __import__("transformers.onnx")
 except Exception:
     onnx_module = types.ModuleType("transformers.onnx")
 

@@ -13,7 +13,7 @@ DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_RENDER_STRATEGY = "pre_render_all"
 DEFAULT_OUTPUT_MODE = "readable"
 DEFAULT_DEEPSEEK_OCR_MODEL = "mlx-community/DeepSeek-OCR-2-bf16"
-DEFAULT_DEEPSEEK_OCR_MAX_TOKENS = 4096
+DEFAULT_DEEPSEEK_OCR_MAX_TOKENS = 8000
 DEFAULT_DEEPSEEK_OCR_PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 DEFAULT_DEEPSEEK_OCR_CROP_MODE = True
 DEFAULT_DEEPSEEK_OCR_MIN_CROPS = 2
@@ -28,7 +28,7 @@ DEFAULT_QWEN_OCR_MAX_TOKENS = int(os.getenv("QWEN_OCR_MAX_TOKENS", "4096"))
 DEFAULT_QWEN_OCR_PROMPT = os.getenv(
     "QWEN_OCR_PROMPT",
     (
-        "Convert this document image to Markdown. Return only the Markdown body. "
+        "Convert this document image to Markdown. "
         "Do not wrap the output in code fences. Do not include ```markdown, <page>, page labels, "
         "explanations, or commentary."
     ),

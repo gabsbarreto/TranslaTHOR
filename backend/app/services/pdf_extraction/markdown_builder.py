@@ -43,7 +43,6 @@ class MarkerDocumentBuilder:
         chunks: list[ExtractionChunk] = []
         reading_order = 0
 
-        page_meta_by_number = {page.page_number: page for page in detection.pages}
         for fallback_index, page_payload in enumerate(pages_payload, start=1):
             page_number = self._page_number(page_payload, fallback_index)
             for node in self._iter_content_blocks(page_payload):
