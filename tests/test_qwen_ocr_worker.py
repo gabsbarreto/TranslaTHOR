@@ -33,6 +33,31 @@ def test_qwen_worker_normalises_deepseek_image_prompt_tokens() -> None:
     assert prompt == "Convert the document to markdown."
 
 
+def test_qwen_worker_uses_ocr_prompt_as_system_message() -> None:
+    worker = _load_worker_module()
+    captured = {}
+
+    def fake_apply_chat_template(_processor, _config, prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured["kwargs"] = kwargs
+        return "FORMATTED"
+
+    formatted = worker.build_generation_prompt(
+        processor=object(),
+        config={"model_type": "qwen3_5"},
+        system_prompt="<image>\n<|grounding|>Convert the document to markdown.",
+        apply_chat_template=fake_apply_chat_template,
+        enable_thinking=False,
+    )
+
+    assert formatted == "FORMATTED"
+    assert captured["prompt"] == [
+        {"role": "system", "content": "Convert the document to markdown."},
+        {"role": "user", "content": ""},
+    ]
+    assert captured["kwargs"]["num_images"] == 1
+
+
 def test_qwen_no_repeat_ngram_processor_blocks_recent_repeat_token() -> None:
     worker = _load_worker_module()
     processor = worker.NoRepeatNGramLogitsProcessor(ngram_size=3, window_size=16)

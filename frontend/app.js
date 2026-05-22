@@ -94,7 +94,7 @@ clearStagedBtn?.addEventListener("click", clearStagedJobs);
 cleanTerminalBtn?.addEventListener("click", cleanTerminalJobs);
 
 openRegionFromFileBtn?.addEventListener("click", openRegionFromFilePicker);
-startSelectedModeBtn?.addEventListener("click", () => startRegionJob("selected_regions"));
+startSelectedModeBtn?.addEventListener("click", () => startRegionJob("full_page"));
 startFullPageModeBtn?.addEventListener("click", () => startRegionJob("full_page"));
 prevPageBtn?.addEventListener("click", () => gotoPage(state.region.currentPage - 1));
 nextPageBtn?.addEventListener("click", () => gotoPage(state.region.currentPage + 1));
@@ -354,7 +354,6 @@ function appendTranslationFormFields(form) {
   form.append("output_mode", "readable");
   form.append("extraction_mode", getInputValue("extractionMode", "auto"));
   form.append("use_local_vlm_repair", checkboxValue("useLocalVlmRepair"));
-  form.append("use_deepseek_fallback", checkboxValue("useDeepseekFallback"));
   form.append("keep_debug_artifacts", checkboxValue("keepDebugArtifacts"));
 }
 
@@ -374,7 +373,6 @@ function buildTranslationPayload() {
     translation_input_mode: "continuous_document",
     extraction_mode: getInputValue("extractionMode", "auto"),
     use_local_vlm_repair: checkboxValue("useLocalVlmRepair") === "true",
-    use_deepseek_fallback: checkboxValue("useDeepseekFallback") === "true",
     keep_debug_artifacts: checkboxValue("keepDebugArtifacts") === "true",
   };
 }
@@ -669,7 +667,7 @@ function translationInfoLine(job) {
   const ocr = typeof job.translation.ocr_used === "boolean" ? ` | OCR: ${job.translation.ocr_used ? "yes" : "no"}` : "";
   const repair = job.translation.local_vlm_repair_used ? " | VLM repair: yes" : "";
   const modelParams = [
-    `Model: ${modelLabel}`,
+    `Translation model: ${modelLabel}`,
     `temp: ${tempText}`,
     `top-p: ${topPText}`,
     `top-k: ${topKText}`,
@@ -1408,7 +1406,6 @@ function renderBoxList() {
     row.innerHTML = `
       <div class="box-row-head">
         <strong>${escapeHtml(box.id)}</strong>
-        <button type="button" class="tiny secondary-button" data-ocr-box="${box.id}">OCR this region</button>
       </div>
       <label>Reading order
         <input data-order-box="${box.id}" type="number" min="1" step="1" value="${Number(box.reading_order) || 1}" />
@@ -1453,15 +1450,6 @@ function renderBoxList() {
         applyBoxGeometryInput(box, field, event.target.value);
       });
     });
-
-    const ocrBoxButton = row.querySelector("button[data-ocr-box]");
-    if (ocrBoxButton) {
-      ocrBoxButton.addEventListener("click", async (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        await runSingleRegionOcr(box);
-      });
-    }
 
     boxListEl.appendChild(row);
   }
@@ -1947,24 +1935,14 @@ async function runSingleRegionOcr(box) {
 
 async function startRegionJob(mode) {
   if (!state.region.jobId) return;
-  if (mode === "selected_regions" && state.region.ocrStatus !== "completed") {
-    window.alert("Run OCR selected regions before translating OCR output.");
-    return;
-  }
   if (state.region.translationStatus === "running") return;
-
-  if (mode === "selected_regions") {
-    await saveAllLoadedPageBoxes();
-  }
 
   if (mode === "full_page") state.region.ocrStatus = "running";
   state.region.translationStatus = "running";
-  state.region.workflowStep = mode === "full_page" ? "ocr" : "translate";
+  state.region.workflowStep = "ocr";
   renderRegionStatus();
   const payload = {
     ...buildTranslationPayload(),
-    ocr_input_mode: mode,
-    ocr_full_page_fallback: mode === "full_page",
   };
 
   try {
@@ -1979,7 +1957,7 @@ async function startRegionJob(mode) {
   } catch (error) {
     if (mode === "full_page") state.region.ocrStatus = "failed";
     state.region.translationStatus = "failed";
-    state.region.workflowStep = mode === "full_page" ? "ocr" : "translate";
+    state.region.workflowStep = "ocr";
     window.alert(error.message || "Unable to start job");
   } finally {
     renderRegionStatus();

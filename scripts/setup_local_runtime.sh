@@ -15,10 +15,6 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -U pip
 .venv/bin/python -m pip install -e ".[mlx,deepseek_ocr,dev]"
 
-if [[ ! -x .venv-deepseek-ocr/bin/python ]]; then
-  bash scripts/setup_deepseek_ocr_env.sh
-fi
-
 touch .env.local
 
 upsert_env() {
@@ -33,7 +29,4 @@ upsert_env() {
   fi
 }
 
-upsert_env "DEEPSEEK_OCR_PYTHON" ".venv-deepseek-ocr/bin/python"
-
 echo "Local runtime is ready."
-echo "DeepSeek OCR Python: .venv-deepseek-ocr/bin/python"

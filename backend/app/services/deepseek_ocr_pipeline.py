@@ -625,6 +625,24 @@ class DeepSeekOcrPipeline:
                 flush_paragraph()
                 flush_table()
                 continue
+            if match := re.match(r"^<!--\s*(page-header|page-footer|page-number)\s*:\s*(.*?)\s*-->\s*$", line, flags=re.IGNORECASE):
+                flush_paragraph()
+                flush_table()
+                kind = match.group(1).lower()
+                text = match.group(2).strip()
+                if not text:
+                    continue
+                block_type = BlockType.FOOTER if kind in {"page-footer", "page-number"} else BlockType.HEADER
+                block = self._block(page_number, start_order + len(blocks), block_type, text)
+                block.metadata.update(
+                    {
+                        "ocr_markdown_comment_type": kind,
+                        "running_header_footer_suppressed": True,
+                        "running_header_footer_reason": "Qwen OCR marked this line as page marginalia.",
+                    }
+                )
+                blocks.append(block)
+                continue
             if line.startswith("|") and line.endswith("|"):
                 flush_paragraph()
                 in_table = True
@@ -646,7 +664,42 @@ class DeepSeekOcrPipeline:
 
         flush_paragraph()
         flush_table()
+        self._suppress_blocks_matching_marked_marginalia(blocks)
         return blocks
+
+    def _suppress_blocks_matching_marked_marginalia(self, blocks: list[Block]) -> None:
+        marked = {
+            self._normalize_marginalia_text(block.text)
+            for block in blocks
+            if block.metadata.get("ocr_markdown_comment_type") in {"page-header", "page-footer"}
+        }
+        marked.discard("")
+        if not marked:
+            return
+        for block in blocks:
+            if block.block_type in {BlockType.HEADER, BlockType.FOOTER}:
+                continue
+            if self._normalize_marginalia_text(block.text) not in marked:
+                continue
+            block.metadata.update(
+                {
+                    "running_header_footer_suppressed": True,
+                    "running_header_footer_reason": "OCR emitted the same text as an explicit page header/footer comment.",
+                    "original_block_type": block.block_type.value,
+                }
+            )
+            block.text = self._clean_marginalia_text(block.text)
+            block.block_type = BlockType.HEADER
+
+    def _normalize_marginalia_text(self, text: str) -> str:
+        text = self._clean_marginalia_text(text)
+        text = re.sub(r"\s+", " ", text)
+        return text.strip().casefold()
+
+    def _clean_marginalia_text(self, text: str) -> str:
+        text = re.sub(r"^#{1,6}\s+", "", text.strip())
+        text = re.sub(r"^\*{1,3}(.*?)\*{1,3}$", r"\1", text)
+        return re.sub(r"\s+", " ", text).strip()
 
     def _block(self, page_number: int, order: int, block_type: BlockType, text: str) -> Block:
         return Block(

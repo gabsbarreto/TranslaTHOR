@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from app.config import (
     BASE_DIR,
@@ -18,13 +18,7 @@ from app.config import (
     DEFAULT_QWEN_OCR_BATCH_SIZE,
     DEFAULT_QWEN_OCR_CROP_MODE,
     DEFAULT_QWEN_OCR_DPI,
-    DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
-    DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
-    DEFAULT_QWEN_OCR_IMAGE_SCALE,
     DEFAULT_QWEN_OCR_IMAGE_SIZE,
-    DEFAULT_QWEN_OCR_JPEG_QUALITY,
-    DEFAULT_QWEN_OCR_LEFT_MASK_RATIO,
-    DEFAULT_QWEN_OCR_MASK_MARGINS,
     DEFAULT_QWEN_OCR_MAX_CROPS,
     DEFAULT_QWEN_OCR_MAX_TOKENS,
     DEFAULT_QWEN_OCR_MIN_CROPS,
@@ -32,12 +26,9 @@ from app.config import (
     DEFAULT_QWEN_OCR_MODEL,
     DEFAULT_QWEN_OCR_NGRAM_SIZE,
     DEFAULT_QWEN_OCR_NGRAM_WINDOW,
-    DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
-    DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
     DEFAULT_QWEN_OCR_PRESENCE_PENALTY,
     DEFAULT_QWEN_OCR_PROMPT,
     DEFAULT_QWEN_OCR_REPETITION_PENALTY,
-    DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
     DEFAULT_QWEN_OCR_SKIP_REPEAT,
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
@@ -82,16 +73,11 @@ class QwenFullPageOCRFallback:
         inspection = self.inspector.inspect(pdf_path)
         qwen_dir = job_dir / "qwen_ocr"
         render_dir = qwen_dir / "rendered_pages"
-        image_dir = qwen_dir / "compressed_pages"
         markdown_dir = qwen_dir / "markdown"
-        for path in (render_dir, image_dir, markdown_dir):
+        for path in (render_dir, markdown_dir):
             path.mkdir(parents=True, exist_ok=True)
 
         dpi = int(settings.get("qwen_ocr_dpi", DEFAULT_QWEN_OCR_DPI))
-        scale = float(settings.get("qwen_ocr_image_scale", DEFAULT_QWEN_OCR_IMAGE_SCALE))
-        quality = int(settings.get("qwen_ocr_jpeg_quality", DEFAULT_QWEN_OCR_JPEG_QUALITY))
-        mask_margins = bool(settings.get("qwen_ocr_mask_margins", DEFAULT_QWEN_OCR_MASK_MARGINS))
-        mask_config = self._margin_mask_config(settings)
 
         image_paths: list[Path] = []
         output_names: list[str] = []
@@ -108,19 +94,10 @@ class QwenFullPageOCRFallback:
                     profiler=profiler,
                     stage_prefix="qwen_page_rendering",
                 )
-            compressed = image_dir / f"page_{page.page_number:04d}.jpg"
-            metadata = self._save_compressed_full_page(
-                input_path=rendered,
-                output_path=compressed,
-                scale=scale,
-                quality=quality,
-                page_number=page.page_number,
-                mask_margins=mask_margins,
-                mask_config=mask_config,
-            )
+            metadata = self._rendered_page_metadata(rendered)
             metadata.update({"page_number": page.page_number, "render_dpi": dpi})
             image_metadata.append(metadata)
-            image_paths.append(compressed)
+            image_paths.append(rendered)
             output_names.append(f"page_{page.page_number:04d}")
 
         self._run_qwen_ocr(
@@ -134,7 +111,7 @@ class QwenFullPageOCRFallback:
             on_ocr_progress=on_ocr_progress,
         )
 
-        document, marker_md = self.markdown_parser.build_document_from_markdown_dir(
+        document, _marker_md = self.markdown_parser.build_document_from_markdown_dir(
             inspection=inspection,
             markdown_dir=markdown_dir,
             profiler=profiler,
@@ -156,12 +133,18 @@ class QwenFullPageOCRFallback:
         )
         for block in document.blocks:
             block.metadata.setdefault("parser", "qwen_full_page_ocr")
-        markdown = self.markdown_builder.build(document, marker_md)
+        markdown = self.markdown_builder.build(document)
         chunks = self._chunks_from_blocks(document.blocks)
         elapsed = time.perf_counter() - started
+        marker_skipped = bool(marker_metadata.get("marker_skipped"))
+        qwen_reason = (
+            "PDF text-quality detection classified the document as poor text; Marker was skipped and Qwen full-page OCR was used."
+            if marker_skipped
+            else "Marker first pass did not classify the document as good digital text; Qwen full-page OCR fallback was used."
+        )
         warnings = [
             *marker_warnings,
-            "Marker first pass did not classify the document as good digital text; Qwen full-page OCR fallback was used.",
+            qwen_reason,
             *document.warnings,
         ]
         document.warnings = warnings
@@ -193,10 +176,7 @@ class QwenFullPageOCRFallback:
                     settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY)
                 ),
                 "qwen_ocr_dpi": dpi,
-                "qwen_ocr_image_scale": scale,
-                "qwen_ocr_jpeg_quality": quality,
-                "qwen_ocr_mask_margins": mask_margins,
-                "qwen_ocr_margin_mask_config": mask_config,
+                "qwen_ocr_image_mode": "rendered_page_png",
                 "qwen_ocr_batch_size": int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)),
                 "qwen_ocr_image_metadata": image_metadata,
                 "qwen_ocr_output_dir": str(qwen_dir),
@@ -227,7 +207,7 @@ class QwenFullPageOCRFallback:
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         on_ocr_progress: Callable[[dict], None] | None,
     ) -> None:
-        python_executable = os.getenv("QWEN_OCR_PYTHON") or os.getenv("DEEPSEEK_OCR_PYTHON") or sys.executable
+        python_executable = self._resolve_worker_python_executable()
         worker = Path(os.getenv("QWEN_OCR_WORKER", str(BASE_DIR / "scripts" / "qwen_ocr_worker.py")))
         cmd = [
             python_executable,
@@ -285,6 +265,8 @@ class QwenFullPageOCRFallback:
             str(int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE))),
             "--enable-thinking",
             "false",
+            "--verbose",
+            "true",
             "--names-json",
             json.dumps(output_names),
         ]
@@ -299,7 +281,7 @@ class QwenFullPageOCRFallback:
             )
         except FileNotFoundError as exc:
             raise RuntimeError(
-                "Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON or DEEPSEEK_OCR_PYTHON."
+                "Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON."
             ) from exc
 
         if on_process_started is not None:
@@ -316,16 +298,41 @@ class QwenFullPageOCRFallback:
                 raise RuntimeError("Cancelled by user")
             raise RuntimeError(f"Qwen OCR failed: {(stderr or stdout)[-2000:]}")
 
+    def _resolve_worker_python_executable(self) -> str:
+        qwen_python = os.getenv("QWEN_OCR_PYTHON")
+        if qwen_python:
+            qwen_path = Path(qwen_python).expanduser()
+            if qwen_path.exists():
+                return str(qwen_path)
+            logger.warning("Ignoring QWEN_OCR_PYTHON because it does not exist: %s", qwen_python)
+
+        # Backward-compatible fallback for older environments that still define this variable.
+        legacy_python = os.getenv("DEEPSEEK_OCR_PYTHON")
+        if legacy_python:
+            legacy_path = Path(legacy_python).expanduser()
+            if legacy_path.exists():
+                return str(legacy_path)
+            logger.warning(
+                "Ignoring DEEPSEEK_OCR_PYTHON because it does not exist: %s",
+                legacy_python,
+            )
+
+        return sys.executable
+
     def _ocr_worker_line_handler(self, on_ocr_progress: Callable[[dict], None] | None) -> Callable[[str], None]:
         def handle(line: str) -> None:
+            stripped = line.strip()
+            if not stripped:
+                return
             if '"event"' not in line:
+                logger.info("Qwen OCR worker: %s", stripped)
                 return
             try:
                 event = json.loads(line)
             except json.JSONDecodeError:
-                logger.debug("Unable to parse Qwen OCR progress event: %s", line.strip())
+                logger.info("Qwen OCR worker: %s", stripped)
                 return
-            logger.info("Qwen OCR worker: %s", line.strip())
+            logger.info("Qwen OCR worker: %s", stripped)
             if on_ocr_progress is not None:
                 on_ocr_progress(event)
 
@@ -359,114 +366,19 @@ class QwenFullPageOCRFallback:
         thread.join()
         return result["stdout"], result["stderr"]
 
-    def _margin_mask_config(self, settings: dict) -> dict[str, float]:
-        return {
-            "first_page_top_ratio": self._ratio(
-                settings.get("qwen_ocr_first_page_top_mask_ratio", DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO)
-            ),
-            "first_page_bottom_ratio": self._ratio(
-                settings.get("qwen_ocr_first_page_bottom_mask_ratio", DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO)
-            ),
-            "other_page_top_ratio": self._ratio(
-                settings.get("qwen_ocr_other_page_top_mask_ratio", DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO)
-            ),
-            "other_page_bottom_ratio": self._ratio(
-                settings.get("qwen_ocr_other_page_bottom_mask_ratio", DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO)
-            ),
-            "left_ratio": self._ratio(settings.get("qwen_ocr_left_mask_ratio", DEFAULT_QWEN_OCR_LEFT_MASK_RATIO)),
-            "right_ratio": self._ratio(settings.get("qwen_ocr_right_mask_ratio", DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO)),
-        }
-
-    def _ratio(self, value: object) -> float:
-        try:
-            ratio = float(value)
-        except (TypeError, ValueError):
-            return 0.0
-        return max(0.0, min(0.45, ratio))
-
-    def _save_compressed_full_page(
-        self,
-        *,
-        input_path: Path,
-        output_path: Path,
-        scale: float,
-        quality: int,
-        page_number: int = 1,
-        mask_margins: bool = False,
-        mask_config: dict[str, float] | None = None,
-    ) -> dict:
-        with Image.open(input_path) as image:
-            source = image.convert("RGB")
-            original_size = {"width": source.width, "height": source.height}
-            mask_metadata = self._mask_headers_footers(source, page_number, mask_config or {}) if mask_margins else None
-            if scale != 1.0:
-                width = max(1, int(source.width * scale))
-                height = max(1, int(source.height * scale))
-                source = source.resize((width, height), Image.Resampling.LANCZOS)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            source.save(output_path, format="JPEG", quality=quality, optimize=True)
-            metadata = {
-                "input_path": str(input_path),
-                "ocr_image_path": str(output_path),
-                "ocr_image_mode": "full_page_masked_margins_jpeg_s075_q75"
-                if mask_metadata is not None
-                else "full_page_jpeg_s075_q75",
-                "original_width": original_size["width"],
-                "original_height": original_size["height"],
-                "ocr_image_width": source.width,
-                "ocr_image_height": source.height,
-                "ocr_raw_page_scale": scale,
-                "ocr_jpeg_quality": quality,
-                "ocr_margin_mask_enabled": mask_metadata is not None,
+    def _rendered_page_metadata(self, rendered_path: Path) -> dict:
+        with Image.open(rendered_path) as image:
+            return {
+                "input_path": str(rendered_path),
+                "ocr_image_path": str(rendered_path),
+                "ocr_image_mode": "rendered_page_png",
+                "original_width": image.width,
+                "original_height": image.height,
+                "ocr_image_width": image.width,
+                "ocr_image_height": image.height,
+                "ocr_raw_page_scale": 1.0,
+                "ocr_margin_mask_enabled": False,
             }
-            if mask_metadata is not None:
-                metadata["ocr_margin_mask"] = mask_metadata
-            return metadata
-
-    def _mask_headers_footers(
-        self,
-        image: Image.Image,
-        page_number: int,
-        config: dict[str, float],
-    ) -> dict:
-        width, height = image.size
-        top_ratio = config.get("first_page_top_ratio", 0.0) if page_number == 1 else config.get("other_page_top_ratio", 0.07)
-        bottom_ratio = (
-            config.get("first_page_bottom_ratio", 0.035)
-            if page_number == 1
-            else config.get("other_page_bottom_ratio", 0.06)
-        )
-        left_ratio = config.get("left_ratio", 0.06)
-        right_ratio = config.get("right_ratio", 0.03)
-
-        top_px = int(height * self._ratio(top_ratio))
-        bottom_px = int(height * self._ratio(bottom_ratio))
-        left_px = int(width * self._ratio(left_ratio))
-        right_px = int(width * self._ratio(right_ratio))
-
-        draw = ImageDraw.Draw(image)
-        if top_px > 0:
-            draw.rectangle((0, 0, width, top_px), fill="white")
-        if bottom_px > 0:
-            draw.rectangle((0, max(0, height - bottom_px), width, height), fill="white")
-        if left_px > 0:
-            draw.rectangle((0, 0, left_px, height), fill="white")
-        if right_px > 0:
-            draw.rectangle((max(0, width - right_px), 0, width, height), fill="white")
-
-        return {
-            "page_number": page_number,
-            "top_px": top_px,
-            "bottom_px": bottom_px,
-            "left_px": left_px,
-            "right_px": right_px,
-            "first_page_top_ratio": self._ratio(config.get("first_page_top_ratio", 0.0)),
-            "first_page_bottom_ratio": self._ratio(config.get("first_page_bottom_ratio", 0.035)),
-            "other_page_top_ratio": self._ratio(config.get("other_page_top_ratio", 0.07)),
-            "other_page_bottom_ratio": self._ratio(config.get("other_page_bottom_ratio", 0.06)),
-            "left_ratio": self._ratio(left_ratio),
-            "right_ratio": self._ratio(right_ratio),
-        }
 
     def _chunks_from_blocks(self, blocks: list[Block]) -> list[ExtractionChunk]:
         chunks: list[ExtractionChunk] = []

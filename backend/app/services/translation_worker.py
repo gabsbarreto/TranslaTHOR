@@ -69,6 +69,7 @@ def main() -> int:
         TranslationSettings(
             model_name=model_name,
             chunk_size=int(settings.get("chunk_size", 1800)),
+            chunk_group_size=int(settings.get("translation_chunk_group_size", 5)),
             temperature=temperature,
             top_p=top_p,
             top_k=top_k,

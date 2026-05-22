@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 class TranslationSettings:
     model_name: str = DEFAULT_TRANSLATION_MODEL
     chunk_size: int = DEFAULT_CHUNK_SIZE
+    chunk_group_size: int = 5
     temperature: float = DEFAULT_LLM_TEMPERATURE
     top_p: float = DEFAULT_LLM_TOP_P
     top_k: int = DEFAULT_LLM_TOP_K
@@ -167,6 +168,7 @@ class MlxTranslator:
     def build_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
         units = self._build_translation_units(document)
         chunks: list[TranslationChunk] = []
+        chunk_block_types: dict[str, BlockType] = {}
         self._document_language = self._normalize_lang_code(document.metadata.detected_language)
         for unit in units:
             if unit.block_ids and (
@@ -178,17 +180,17 @@ class MlxTranslator:
             else:
                 text_parts = self._split_to_token_budget(unit.text)
             for text_part in text_parts:
-                chunks.append(
-                    TranslationChunk(
-                        id=f"chunk-{len(chunks)}",
-                        block_ids=unit.block_ids,
-                        source_text=text_part,
-                        context=unit.context,
-                        source_language=self._chunk_source_language(text_part, unit.block_type),
-                        source_token_count=self._token_count(text_part),
-                    )
+                chunk = TranslationChunk(
+                    id=f"chunk-{len(chunks)}",
+                    block_ids=unit.block_ids,
+                    source_text=text_part,
+                    context=unit.context,
+                    source_language=self._chunk_source_language(text_part, unit.block_type),
+                    source_token_count=self._token_count(text_part),
                 )
-        return chunks
+                chunks.append(chunk)
+                chunk_block_types[chunk.id] = unit.block_type
+        return self._merge_adjacent_translation_chunks(chunks, chunk_block_types)
 
     def translate_document(
         self,
@@ -214,20 +216,22 @@ class MlxTranslator:
 
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
-            if on_chunk_started is not None:
-                on_chunk_started(index, total_chunks)
             block_type = self._chunk_block_type(chunk, block_by_id)
             effective_context = self._augment_context_for_block_type(chunk.context, block_type)
             is_table_like = self._is_table_heavy_markup(chunk.source_text)
+            is_english = loaded and self._is_already_english(chunk)
+
+            if on_chunk_started is not None:
+                on_chunk_started(index, total_chunks)
+
             if is_table_like and on_table_progress is not None:
                 on_table_progress(
                     table_chunk_index.get(id(chunk), 1),
                     max(1, len(table_like_chunks)),
                     f"chunk-{index}",
                 )
-            if not loaded:
-                translated = chunk.source_text
-            elif self._is_already_english(chunk):
+
+            if not loaded or is_english:
                 translated = chunk.source_text
             elif is_table_like:
                 translated = self._translate_table_markup_chunk(
@@ -523,6 +527,80 @@ class MlxTranslator:
         if current:
             parts.append(current)
         return parts or [text]
+
+    def _is_batchable_block_type(self, block_type: BlockType | None) -> bool:
+        return block_type in {BlockType.PARAGRAPH, BlockType.LIST}
+
+    def _merge_adjacent_translation_chunks(
+        self,
+        chunks: list[TranslationChunk],
+        chunk_block_types: dict[str, BlockType] | None = None,
+    ) -> list[TranslationChunk]:
+        group_size = max(1, int(self.settings.chunk_group_size or 1))
+        if group_size <= 1:
+            return chunks
+
+        merged: list[TranslationChunk] = []
+        index = 0
+        max_group_tokens = max(256, int(self.settings.max_tokens * 0.75))
+        while index < len(chunks):
+            chunk = chunks[index]
+            block_type = (chunk_block_types or {}).get(chunk.id)
+            if not self._can_merge_translation_chunk(chunk, block_type):
+                merged.append(chunk)
+                index += 1
+                continue
+
+            group = [chunk]
+            group_token_count = int(chunk.source_token_count or self._token_count(chunk.source_text))
+            index += 1
+            while index < len(chunks) and len(group) < group_size:
+                candidate = chunks[index]
+                candidate_type = (chunk_block_types or {}).get(candidate.id)
+                candidate_tokens = int(candidate.source_token_count or self._token_count(candidate.source_text))
+                if (
+                    not self._can_merge_translation_chunk(candidate, candidate_type)
+                    or candidate.context != chunk.context
+                    or candidate.source_language != chunk.source_language
+                    or (group_token_count + candidate_tokens) > max_group_tokens
+                ):
+                    break
+                group.append(candidate)
+                group_token_count += candidate_tokens
+                index += 1
+
+            if len(group) == 1:
+                merged.append(chunk)
+                continue
+
+            merged.append(
+                TranslationChunk(
+                    id=group[0].id,
+                    block_ids=self._unique_block_ids([block_id for item in group for block_id in item.block_ids]),
+                    source_text="\n\n".join(item.source_text.strip() for item in group if item.source_text.strip()),
+                    context=group[0].context,
+                    source_language=group[0].source_language,
+                    source_token_count=group_token_count,
+                )
+            )
+        return merged
+
+    def _unique_block_ids(self, block_ids: list[str]) -> list[str]:
+        seen: set[str] = set()
+        unique: list[str] = []
+        for block_id in block_ids:
+            if block_id in seen:
+                continue
+            seen.add(block_id)
+            unique.append(block_id)
+        return unique
+
+    def _can_merge_translation_chunk(self, chunk: TranslationChunk, block_type: BlockType | None) -> bool:
+        if not chunk.block_ids or self._is_table_target(chunk.block_ids[0]):
+            return False
+        if self._is_table_heavy_markup(chunk.source_text):
+            return False
+        return self._is_batchable_block_type(block_type)
 
     def _split_into_sentences(self, text: str) -> list[str]:
         compact = " ".join(text.strip().split())

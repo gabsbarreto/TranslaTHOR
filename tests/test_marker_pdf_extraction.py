@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
@@ -505,64 +506,55 @@ def test_local_vlm_selects_portuguese_hidden_ocr_candidates() -> None:
     assert selected == [block]
 
 
-def test_qwen_fallback_compresses_full_page_with_q75_s75(tmp_path: Path) -> None:
+def test_qwen_fallback_uses_rendered_png_metadata_for_ocr_input(tmp_path: Path) -> None:
     from PIL import Image
 
     source = tmp_path / "page.png"
-    target = tmp_path / "page.jpg"
     Image.new("RGB", (400, 200), "white").save(source)
 
-    metadata = QwenFullPageOCRFallback()._save_compressed_full_page(
-        input_path=source,
-        output_path=target,
-        scale=0.75,
-        quality=75,
-    )
+    metadata = QwenFullPageOCRFallback()._rendered_page_metadata(source)
 
-    with Image.open(target) as image:
-        assert image.size == (300, 150)
-        assert image.format == "JPEG"
-    assert metadata["ocr_image_mode"] == "full_page_jpeg_s075_q75"
-    assert metadata["ocr_jpeg_quality"] == 75
-    assert metadata["ocr_raw_page_scale"] == 0.75
+    assert metadata["input_path"] == str(source)
+    assert metadata["ocr_image_path"] == str(source)
+    assert metadata["ocr_image_mode"] == "rendered_page_png"
+    assert metadata["ocr_image_width"] == 400
+    assert metadata["ocr_image_height"] == 200
+    assert metadata["ocr_raw_page_scale"] == 1.0
 
 
-def test_qwen_fallback_masks_repeated_margin_regions_before_ocr(tmp_path: Path) -> None:
+def test_qwen_fallback_preserves_full_page_margins_before_ocr(tmp_path: Path) -> None:
     from PIL import Image
 
     source = tmp_path / "page.png"
-    target = tmp_path / "page.jpg"
-    Image.new("RGB", (100, 100), "black").save(source)
+    image = Image.new("RGB", (100, 100), "white")
+    for x in range(100):
+        image.putpixel((x, 0), (0, 0, 0))
+        image.putpixel((x, 99), (0, 0, 0))
+    for y in range(100):
+        image.putpixel((0, y), (0, 0, 0))
+        image.putpixel((99, y), (0, 0, 0))
+    image.save(source)
 
-    metadata = QwenFullPageOCRFallback()._save_compressed_full_page(
-        input_path=source,
-        output_path=target,
-        scale=1.0,
-        quality=95,
-        page_number=2,
-        mask_margins=True,
-        mask_config={
-            "first_page_top_ratio": 0.0,
-            "first_page_bottom_ratio": 0.0,
-            "other_page_top_ratio": 0.10,
-            "other_page_bottom_ratio": 0.10,
-            "left_ratio": 0.10,
-            "right_ratio": 0.10,
-        },
-    )
+    metadata = QwenFullPageOCRFallback()._rendered_page_metadata(source)
 
-    with Image.open(target) as image:
-        assert image.getpixel((50, 5))[0] > 240
-        assert image.getpixel((50, 95))[0] > 240
-        assert image.getpixel((5, 50))[0] > 240
-        assert image.getpixel((95, 50))[0] > 240
-        assert image.getpixel((50, 50))[0] < 20
-    assert metadata["ocr_image_mode"] == "full_page_masked_margins_jpeg_s075_q75"
-    assert metadata["ocr_margin_mask_enabled"] is True
-    assert metadata["ocr_margin_mask"]["top_px"] == 10
-    assert metadata["ocr_margin_mask"]["bottom_px"] == 10
-    assert metadata["ocr_margin_mask"]["left_px"] == 10
-    assert metadata["ocr_margin_mask"]["right_px"] == 10
+    with Image.open(metadata["ocr_image_path"]) as image:
+        assert image.getpixel((50, 0))[0] < 60
+        assert image.getpixel((50, 99))[0] < 60
+        assert image.getpixel((0, 50))[0] < 60
+        assert image.getpixel((99, 50))[0] < 60
+    assert metadata["ocr_image_mode"] == "rendered_page_png"
+    assert metadata["ocr_margin_mask_enabled"] is False
+    assert "ocr_margin_mask" not in metadata
+
+
+def test_qwen_fallback_ignores_missing_legacy_python_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    fallback = QwenFullPageOCRFallback()
+    monkeypatch.delenv("QWEN_OCR_PYTHON", raising=False)
+    monkeypatch.setenv("DEEPSEEK_OCR_PYTHON", ".venv-deepseek-ocr/bin/python")
+
+    resolved = fallback._resolve_worker_python_executable()
+
+    assert resolved == sys.executable
 
 
 def _page_stats(page_number: int) -> PageTextStats:

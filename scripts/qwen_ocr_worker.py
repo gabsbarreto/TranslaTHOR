@@ -119,6 +119,13 @@ def normalise_prompt_for_chat_template(prompt_text: str) -> str:
     return text.strip()
 
 
+def build_ocr_chat_messages(system_prompt: str) -> list[dict[str, str]]:
+    return [
+        {"role": "system", "content": normalise_prompt_for_chat_template(system_prompt)},
+        {"role": "user", "content": ""},
+    ]
+
+
 def clean_generated_text(text: str, prompt: str) -> str:
     text = str(text).strip()
     text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
@@ -147,26 +154,26 @@ def _looks_like_echoed_prompt(line: str) -> bool:
 def build_generation_prompt(
     processor: Any,
     config: Any,
-    prompt_text: str,
+    system_prompt: str,
     apply_chat_template: Any,
     enable_thinking: bool = False,
 ) -> str:
-    text = normalise_prompt_for_chat_template(prompt_text)
+    messages = build_ocr_chat_messages(system_prompt)
     template_kwargs: dict[str, Any] = {
         "num_images": 1,
         "num_audios": 0,
         "enable_thinking": bool(enable_thinking),
     }
     try:
-        return apply_chat_template(processor, config, text, **template_kwargs)
+        return apply_chat_template(processor, config, messages, **template_kwargs)
     except TypeError as exc:
         message = str(exc)
         if "enable_thinking" in message:
             template_kwargs.pop("enable_thinking", None)
-            return apply_chat_template(processor, config, text, **template_kwargs)
+            return apply_chat_template(processor, config, messages, **template_kwargs)
         if "num_audios" in message:
             template_kwargs.pop("num_audios", None)
-            return apply_chat_template(processor, config, text, **template_kwargs)
+            return apply_chat_template(processor, config, messages, **template_kwargs)
         raise
 
 
@@ -284,6 +291,7 @@ def main() -> int:
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--enable-thinking", type=parse_bool_flag, default=False)
     parser.add_argument("--fallback-to-single", type=parse_bool_flag, default=True)
+    parser.add_argument("--verbose", type=parse_bool_flag, default=True)
     args = parser.parse_args()
 
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -354,7 +362,7 @@ def main() -> int:
         )
 
         if use_batch:
-            prompts = [normalise_prompt_for_chat_template(prompt_text) for _ in image_paths]
+            prompts = [build_ocr_chat_messages(prompt_text) for _ in image_paths]
             image_path_strings = [str(path) for path in image_paths]
             prompt_batches = chunk_list(prompts, requested_batch_size)
             image_batches = chunk_list(image_path_strings, requested_batch_size)
@@ -381,7 +389,7 @@ def main() -> int:
                             images=image_batch,
                             prompts=prompt_batch,
                             max_tokens=int(args.max_tokens),
-                            verbose=False,
+                            verbose=bool(args.verbose),
                             group_by_shape=True,
                             track_image_sizes=False,
                             sampler=sampler,
@@ -397,11 +405,11 @@ def main() -> int:
                         }
                     )
                     fallback_texts: list[str] = []
-                    for single_prompt, single_image in zip(prompt_batch, image_batch):
+                    for _single_prompt, single_image in zip(prompt_batch, image_batch):
                         formatted_prompt = build_generation_prompt(
                             processor=processor,
                             config=config,
-                            prompt_text=single_prompt,
+                            system_prompt=prompt_text,
                             apply_chat_template=apply_chat_template,
                             enable_thinking=bool(args.enable_thinking),
                         )
@@ -421,7 +429,7 @@ def main() -> int:
                             min_patches=min_crops,
                             max_patches=max_crops,
                             logits_processors=logits_processors,
-                            verbose=False,
+                            verbose=bool(args.verbose),
                         )
                         fallback_texts.append(str(result.text))
                     response = FallbackResponse(fallback_texts)
@@ -467,7 +475,7 @@ def main() -> int:
                 formatted_prompt = build_generation_prompt(
                     processor=processor,
                     config=config,
-                    prompt_text=prompt_text,
+                    system_prompt=prompt_text,
                     apply_chat_template=apply_chat_template,
                     enable_thinking=bool(args.enable_thinking),
                 )
@@ -487,7 +495,7 @@ def main() -> int:
                     min_patches=min_crops,
                     max_patches=max_crops,
                     logits_processors=logits_processors,
-                    verbose=False,
+                    verbose=bool(args.verbose),
                 )
                 markdown = clean_generated_text(str(result.text), prompt_text)
                 stem = str(names[index - 1]) if index - 1 < len(names) else f"page_{index:04d}"

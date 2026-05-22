@@ -9,6 +9,7 @@ if "langdetect" not in sys.modules:
     sys.modules["langdetect"] = langdetect_stub
 
 from app.services.translator_mlx import MlxTranslator, TranslationSettings
+from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
 
 
 def _block(block_id: str, text: str, y0: float, y1: float, x0: float = 50.0) -> Block:
@@ -109,7 +110,7 @@ def test_split_chunks_for_same_block_are_appended_back_to_target() -> None:
     assert "Alpha starts a long OCR page." in text
     assert "Beta continues the same OCR page." in text
     assert "Gamma closes the page." in text
-    assert text.count("[") >= 2
+    assert text.count("[") == 1
 
 
 def test_chunk_structure_validator_retries_collapsed_translation() -> None:
@@ -234,3 +235,89 @@ def test_table_translation_uses_row_group_fallback_when_whole_table_is_invalid()
     assert calls["count"] >= 3
     assert translated.endswith("</table>")
     assert "Alpha" in translated
+
+
+def test_adjacent_prose_chunks_are_merged_before_translation() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            _block("a", "Primeiro paragrafo com contexto.", 100, 110),
+            _block("b", "Segundo paragrafo com separador ----- no meio.", 140, 150),
+            _block("c", "Terceiro paragrafo para manter continuidade.", 180, 190),
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=4))
+    translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
+
+    chunks = translator.build_chunks(document)
+
+    assert len(chunks) == 1
+    assert chunks[0].block_ids == ["a", "b", "c"]
+    assert "Primeiro paragrafo com contexto." in chunks[0].source_text
+    assert "Segundo paragrafo com separador ----- no meio." in chunks[0].source_text
+    assert "Terceiro paragrafo para manter continuidade." in chunks[0].source_text
+
+
+def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            _block("a", "Primeiro bloco.", 100, 110),
+            _block("b", "Segundo bloco.", 140, 150),
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def fake_translate(text, context, source_language, block_type):
+        _ = (context, source_language, block_type)
+        calls.append(text)
+        return f"T::{text}"
+
+    translator._translate_chunk_with_validation = fake_translate  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    assert len(calls) == 1
+    assert "Primeiro bloco." in calls[0]
+    assert "Segundo bloco." in calls[0]
+    assert translated_doc.blocks[0].text.startswith("T::Primeiro bloco.")
+    assert translated_doc.blocks[1].text == ""
+
+
+def test_qwen_markdown_page_header_comments_are_suppressed_from_translation() -> None:
+    blocks = DeepSeekOcrPipeline()._blocks_from_markdown(
+        "**Repeated Article Title**\n\nBody text.\n\n<!-- page-header: Repeated Article Title -->",
+        page_number=2,
+        start_order=0,
+    )
+
+    assert blocks[0].block_type == BlockType.HEADER
+    assert blocks[0].metadata["running_header_footer_suppressed"] is True
+    assert blocks[0].text == "Repeated Article Title"
+    assert blocks[1].block_type == BlockType.PARAGRAPH
+    assert blocks[2].block_type == BlockType.HEADER
+    assert blocks[2].metadata["ocr_markdown_comment_type"] == "page-header"

@@ -26,7 +26,6 @@
               <option value="scanned">Scanned / OCR</option>
               <option value="strip_and_force_ocr">Force OCR + strip existing OCR</option>
               <option value="auto_repair">Auto + local VLM repair</option>
-              <option value="deepseek_fallback">DeepSeek fallback</option>
             </select>
           </label>
           <label>Chunk Tokens <input id="chunkSize" type="number" min="128" max="8000" value="1800" /></label>
@@ -41,7 +40,6 @@
         </div>
         <div class="checks">
           <label><input id="useLocalVlmRepair" type="checkbox" /> Local VLM repair</label>
-          <label><input id="useDeepseekFallback" type="checkbox" /> DeepSeek fallback</label>
           <label><input id="keepDebugArtifacts" type="checkbox" /> Keep debug artifacts</label>
         </div>
       </section>
@@ -79,7 +77,6 @@
           <button id="drawRegionModeBtn" class="secondary-button" type="button">Draw region: Off</button>
         </div>
         <div class="workflow-actions">
-          <button id="runOcrSelectedBtn" type="button">Next: OCR selected regions</button>
           <button id="startSelectedModeBtn" type="button" hidden>Translate now</button>
         </div>
         <div class="region-layout">

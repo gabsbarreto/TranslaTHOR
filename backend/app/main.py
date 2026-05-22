@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import os
-import signal
 import shutil
-import subprocess
 import sys
-import threading
 import time
 import types
 from pathlib import Path
@@ -19,17 +15,7 @@ from pydantic import BaseModel
 from app.config import (
     AVAILABLE_TRANSLATION_MODELS,
     DEFAULT_CHUNK_SIZE,
-    DEFAULT_DEEPSEEK_OCR_BASE_SIZE,
-    DEFAULT_DEEPSEEK_OCR_CROP_MODE,
-    DEFAULT_DEEPSEEK_OCR_IMAGE_SIZE,
-    DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
-    DEFAULT_DEEPSEEK_OCR_MAX_CROPS,
-    DEFAULT_DEEPSEEK_OCR_MODEL,
-    DEFAULT_DEEPSEEK_OCR_MIN_CROPS,
-    DEFAULT_DEEPSEEK_OCR_NGRAM_SIZE,
-    DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
-    DEFAULT_DEEPSEEK_OCR_PROMPT,
-    DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
+    DEFAULT_TRANSLATION_CHUNK_GROUP_SIZE,
     DEFAULT_LLM_MIN_P,
     DEFAULT_LLM_PRESENCE_PENALTY,
     DEFAULT_LLM_REPETITION_PENALTY,
@@ -41,11 +27,7 @@ from app.config import (
     DEFAULT_QWEN_OCR_BATCH_SIZE,
     DEFAULT_QWEN_OCR_CROP_MODE,
     DEFAULT_QWEN_OCR_DPI,
-    DEFAULT_QWEN_OCR_IMAGE_SCALE,
     DEFAULT_QWEN_OCR_IMAGE_SIZE,
-    DEFAULT_QWEN_OCR_JPEG_QUALITY,
-    DEFAULT_QWEN_OCR_LEFT_MASK_RATIO,
-    DEFAULT_QWEN_OCR_MASK_MARGINS,
     DEFAULT_QWEN_OCR_MAX_CROPS,
     DEFAULT_QWEN_OCR_MAX_TOKENS,
     DEFAULT_QWEN_OCR_MIN_CROPS,
@@ -54,13 +36,8 @@ from app.config import (
     DEFAULT_QWEN_OCR_NGRAM_SIZE,
     DEFAULT_QWEN_OCR_NGRAM_WINDOW,
     DEFAULT_QWEN_OCR_PRESENCE_PENALTY,
-    DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
-    DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
     DEFAULT_QWEN_OCR_PROMPT,
-    DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
-    DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
     DEFAULT_QWEN_OCR_REPETITION_PENALTY,
-    DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
     DEFAULT_QWEN_OCR_SKIP_REPEAT,
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
@@ -68,7 +45,6 @@ from app.config import (
     DEFAULT_RENDER_STRATEGY,
     DEFAULT_TRANSLATION_MODEL,
     DEFAULT_EXTRACTION_MODE,
-    ENABLE_DEEPSEEK_FALLBACK,
     ENABLE_LEGACY_VISUAL_OCR,
     ENABLE_LOCAL_VLM_REPAIR,
     ENABLE_MARKER_PIPELINE,
@@ -78,16 +54,11 @@ from app.config import (
     MARKER_TIMEOUT_SECONDS,
 )
 from app.models.schema import JobStage
-from app.models.regions import OcrResultsPayload, PageRegionPayload
+from app.models.regions import PageRegionPayload
 from app.services.job_store import JobStore
 from app.services.job_queue import JobQueue
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.ocr_region_service import OcrRegionService
-from app.services.ocr_results import (
-    selected_ocr_progress_from_event as _selected_ocr_progress_from_event,
-    summarize_ocr_results as _summarize_ocr_results,
-    write_selected_ocr_source_markdown as _write_selected_ocr_source_markdown_to_dir,
-)
 from app.services.pipeline import TranslationPipeline
 from app.services.reconstructor import Reconstructor
 from app.utils.logging import configure_logging
@@ -126,9 +97,6 @@ job_queue = JobQueue(job_store, pipeline)
 reconstructor = Reconstructor()
 markdown_builder = MarkdownBuilder()
 ocr_region_service = OcrRegionService()
-_selected_ocr_lock = threading.RLock()
-_selected_ocr_cancelled_jobs: set[str] = set()
-_selected_ocr_processes: dict[str, list[subprocess.Popen]] = {}
 
 
 class RetranslateRequest(BaseModel):
@@ -158,12 +126,9 @@ class StartJobRequest(BaseModel):
     max_tokens: int = 2048
     output_mode: str = DEFAULT_OUTPUT_MODE
     profile_pipeline: bool = False
-    ocr_input_mode: str = "selected_regions"
-    ocr_full_page_fallback: bool = True
     translation_input_mode: str = "continuous_document"
     extraction_mode: str = DEFAULT_EXTRACTION_MODE
     use_local_vlm_repair: bool = ENABLE_LOCAL_VLM_REPAIR
-    use_deepseek_fallback: bool = ENABLE_DEEPSEEK_FALLBACK
     keep_debug_artifacts: bool = KEEP_EXTRACTION_DEBUG_ARTIFACTS
 
 
@@ -178,7 +143,6 @@ def features() -> dict[str, bool | str]:
         "marker_pipeline": ENABLE_MARKER_PIPELINE,
         "legacy_visual_ocr": ENABLE_LEGACY_VISUAL_OCR,
         "local_vlm_repair": ENABLE_LOCAL_VLM_REPAIR,
-        "deepseek_fallback": ENABLE_DEEPSEEK_FALLBACK,
         "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
         "default_extraction_mode": DEFAULT_EXTRACTION_MODE,
     }
@@ -214,10 +178,9 @@ def _clear_terminal_jobs_impl() -> dict[str, int]:
 @app.post("/api/jobs/stop-all")
 def stop_all_jobs() -> dict[str, int]:
     result = job_queue.stop_all()
-    selected_result = _cancel_selected_ocr_jobs()
     interrupted_result = _mark_interrupted_processing_jobs_cancelled()
     draft_result = _mark_uploaded_draft_jobs_cancelled()
-    return {**result, **selected_result, **interrupted_result, **draft_result}
+    return {**result, **interrupted_result, **draft_result}
 
 
 @app.post("/api/jobs/{job_id}/cancel")
@@ -233,8 +196,6 @@ def cancel_job_compat(job_id: str) -> dict[str, str]:
 def _cancel_job_impl(job_id: str) -> dict[str, str]:
     result = job_queue.cancel_job(job_id)
     if result["status"] == "not_found":
-        if _cancel_selected_ocr_job(job_id):
-            return {"status": "selected_ocr_cancelled"}
         if _mark_uploaded_draft_job_cancelled(job_id):
             return {"status": "draft_cancelled"}
         raise HTTPException(status_code=404, detail="Job is not queued or active.")
@@ -266,7 +227,6 @@ async def create_job(
     defer_ocr_selection: bool = Form(False),
     extraction_mode: str = Form(DEFAULT_EXTRACTION_MODE),
     use_local_vlm_repair: bool = Form(ENABLE_LOCAL_VLM_REPAIR),
-    use_deepseek_fallback: bool = Form(ENABLE_DEEPSEEK_FALLBACK),
     keep_debug_artifacts: bool = Form(KEEP_EXTRACTION_DEBUG_ARTIFACTS),
 ) -> dict:
     created: list[dict] = []
@@ -289,12 +249,9 @@ async def create_job(
             output_mode=output_mode,
             profile_pipeline=profile_pipeline,
             reuse_ocr_cache=False,
-            ocr_input_mode="full_page",
             translation_input_mode="continuous_document",
-            extraction_engine="marker" if ENABLE_MARKER_PIPELINE else "legacy_deepseek",
             extraction_mode=extraction_mode,
             use_local_vlm_repair=use_local_vlm_repair,
-            use_deepseek_fallback=use_deepseek_fallback,
             keep_debug_artifacts=keep_debug_artifacts,
         )
         if not defer_ocr_selection:
@@ -316,22 +273,6 @@ async def create_draft_job(file: UploadFile = File(...)) -> dict[str, str]:
 @app.post("/api/jobs/{job_id}/start")
 def start_job(job_id: str, request: StartJobRequest) -> dict[str, str]:
     pdf_path = _job_pdf_path(job_id)
-    ocr_input_mode = request.ocr_input_mode if request.ocr_input_mode in {"selected_regions", "full_page"} else "selected_regions"
-
-    if ocr_input_mode == "selected_regions":
-        ocr_payload = ocr_region_service.region_store.load_ocr_results(job_store.get_job_dir(job_id))
-        if (ocr_payload is None or not ocr_payload.results) and request.ocr_full_page_fallback:
-            ocr_input_mode = "full_page"
-        elif ocr_payload is None or not ocr_payload.results:
-            raise HTTPException(
-                status_code=400,
-                detail="No selected-region OCR results found. Run OCR on selected boxes first, or enable full-page fallback.",
-            )
-        elif _summarize_ocr_results(ocr_payload)["nonempty_region_count"] == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Selected-region OCR completed, but no selected region produced text. Re-run OCR or adjust the regions before translation.",
-            )
 
     settings = _build_job_settings(
         chunk_size=request.chunk_size,
@@ -346,16 +287,13 @@ def start_job(job_id: str, request: StartJobRequest) -> dict[str, str]:
         output_mode=request.output_mode,
         profile_pipeline=request.profile_pipeline,
         reuse_ocr_cache=False,
-        ocr_input_mode=ocr_input_mode,
         translation_input_mode=request.translation_input_mode,
-        extraction_engine="legacy_deepseek" if ocr_input_mode in {"selected_regions", "full_page"} else "marker",
         extraction_mode=request.extraction_mode,
         use_local_vlm_repair=request.use_local_vlm_repair,
-        use_deepseek_fallback=request.use_deepseek_fallback,
         keep_debug_artifacts=request.keep_debug_artifacts,
     )
     job_queue.enqueue(job_id, pdf_path, settings)
-    return {"status": "queued", "job_id": job_id, "ocr_input_mode": ocr_input_mode}
+    return {"status": "queued", "job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}/pages/{page_number}/image")
@@ -506,200 +444,6 @@ def duplicate_job_for_ocr_rerun(job_id: str) -> dict[str, str]:
     }
 
 
-@app.post("/api/jobs/{job_id}/ocr/selected")
-def run_ocr_for_selected_boxes(
-    job_id: str,
-    dpi: int = Query(300, ge=100, le=600),
-    page_number: int | None = Query(default=None, ge=1),
-    box_id: str | None = Query(default=None, min_length=1),
-) -> dict:
-    job_dir = job_store.get_job_dir(job_id)
-    pdf_path = _job_pdf_path(job_id)
-    try:
-        job_store.update_status(
-            job_id,
-            stage=JobStage.OCR_LAYOUT,
-            progress=0.35,
-            message="Running OCR on selected regions",
-            error=None,
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    try:
-        _start_selected_ocr_tracking(job_id)
-
-        def on_ocr_progress(event: dict) -> None:
-            update = _selected_ocr_progress_from_event(event)
-            if update is None:
-                return
-            progress, message = update
-            try:
-                job_store.update_status(
-                    job_id,
-                    stage=JobStage.OCR_LAYOUT,
-                    progress=progress,
-                    message=message,
-                    error=None,
-                )
-            except FileNotFoundError:
-                pass
-
-        results = ocr_region_service.run_selected_ocr(
-            pdf_file_id=job_id,
-            pdf_path=pdf_path,
-            job_dir=job_dir,
-            dpi=dpi,
-            model_name=DEFAULT_DEEPSEEK_OCR_MODEL,
-            max_tokens=DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
-            prompt=DEFAULT_DEEPSEEK_OCR_PROMPT,
-            crop_mode=DEFAULT_DEEPSEEK_OCR_CROP_MODE,
-            min_crops=DEFAULT_DEEPSEEK_OCR_MIN_CROPS,
-            max_crops=DEFAULT_DEEPSEEK_OCR_MAX_CROPS,
-            base_size=DEFAULT_DEEPSEEK_OCR_BASE_SIZE,
-            image_size=DEFAULT_DEEPSEEK_OCR_IMAGE_SIZE,
-            skip_repeat=DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
-            ngram_size=DEFAULT_DEEPSEEK_OCR_NGRAM_SIZE,
-            ngram_window=DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
-            page_number=page_number,
-            box_id=box_id,
-            on_ocr_progress=on_ocr_progress,
-            cancel_requested=lambda: _is_selected_ocr_cancelled(job_id),
-            on_process_started=lambda process: _register_selected_ocr_process(job_id, process),
-            on_process_finished=lambda process: _unregister_selected_ocr_process(job_id, process),
-        )
-    except ValueError as exc:
-        job_store.update_status(
-            job_id,
-            stage=JobStage.UPLOADED,
-            progress=0.0,
-            message="Selected-region OCR did not run",
-            error=str(exc),
-        )
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        if _is_selected_ocr_cancelled(job_id) or str(exc) == "Cancelled by user":
-            try:
-                job_store.update_status(
-                    job_id,
-                    stage=JobStage.CANCELLED,
-                    progress=1.0,
-                    message="Selected-region OCR cancelled by user.",
-                    error=None,
-                )
-            except FileNotFoundError:
-                pass
-            raise HTTPException(status_code=409, detail="Selected-region OCR cancelled by user.") from exc
-        job_store.update_status(
-            job_id,
-            stage=JobStage.UPLOADED,
-            progress=0.0,
-            message="Selected-region OCR failed",
-            error=str(exc),
-        )
-        raise HTTPException(status_code=500, detail=f"Selected-region OCR failed: {exc}") from exc
-    finally:
-        _finish_selected_ocr_tracking(job_id)
-    status = job_store.load_status(job_id)
-    updated_artifacts = dict(status.artifacts)
-    updated_artifacts["ocr_results"] = str(ocr_region_service.region_store.ocr_results_path(job_dir))
-    source_md_path = _write_selected_ocr_source_markdown(job_id, results)
-    updated_artifacts["source_markdown"] = str(source_md_path)
-    summary = _summarize_ocr_results(results)
-    empty_note = ""
-    if summary["pages_without_text_count"]:
-        empty_note = f" {summary['pages_without_text_count']} selected page(s) returned empty OCR."
-    job_store.update_status(
-        job_id,
-        stage=JobStage.UPLOADED,
-        progress=0.0,
-        message=(
-            f"Selected-region OCR completed for {summary['total_region_count']} region(s) "
-            f"across {summary['selected_page_count']} page(s); text found on "
-            f"{summary['pages_with_text_count']} page(s).{empty_note}"
-        ),
-        error=None,
-        artifacts=updated_artifacts,
-    )
-    return {"pdf_file_id": results.pdf_file_id, "count": len(results.results), **summary}
-
-
-@app.get("/api/jobs/{job_id}/ocr-results")
-def get_ocr_results(job_id: str) -> dict:
-    job_dir = job_store.get_job_dir(job_id)
-    payload = ocr_region_service.region_store.load_ocr_results(job_dir)
-    if payload is None:
-        return OcrResultsPayload(pdf_file_id=job_id, results=[]).model_dump(mode="json")
-    return payload.model_dump(mode="json")
-
-
-def _start_selected_ocr_tracking(job_id: str) -> None:
-    with _selected_ocr_lock:
-        _selected_ocr_cancelled_jobs.discard(job_id)
-        _selected_ocr_processes[job_id] = []
-
-
-def _finish_selected_ocr_tracking(job_id: str) -> None:
-    with _selected_ocr_lock:
-        _selected_ocr_cancelled_jobs.discard(job_id)
-        _selected_ocr_processes.pop(job_id, None)
-
-
-def _is_selected_ocr_cancelled(job_id: str) -> bool:
-    with _selected_ocr_lock:
-        return job_id in _selected_ocr_cancelled_jobs
-
-
-def _register_selected_ocr_process(job_id: str, process: subprocess.Popen) -> None:
-    with _selected_ocr_lock:
-        _selected_ocr_processes.setdefault(job_id, []).append(process)
-        cancelled = job_id in _selected_ocr_cancelled_jobs
-    if cancelled:
-        _terminate_process_tree(process)
-
-
-def _unregister_selected_ocr_process(job_id: str, process: subprocess.Popen) -> None:
-    with _selected_ocr_lock:
-        processes = _selected_ocr_processes.get(job_id, [])
-        _selected_ocr_processes[job_id] = [item for item in processes if item.pid != process.pid]
-
-
-def _cancel_selected_ocr_job(job_id: str) -> bool:
-    with _selected_ocr_lock:
-        processes = list(_selected_ocr_processes.get(job_id, []))
-        is_active = job_id in _selected_ocr_processes
-        if is_active:
-            _selected_ocr_cancelled_jobs.add(job_id)
-
-    if not is_active:
-        return False
-
-    for process in processes:
-        _terminate_process_tree(process)
-
-    try:
-        job_store.update_status(
-            job_id,
-            stage=JobStage.CANCELLED,
-            progress=1.0,
-            message="Selected-region OCR cancelled by user.",
-            error=None,
-        )
-    except FileNotFoundError:
-        pass
-    return True
-
-
-def _cancel_selected_ocr_jobs() -> dict[str, int]:
-    with _selected_ocr_lock:
-        job_ids = list(_selected_ocr_processes)
-    cancelled = 0
-    for job_id in job_ids:
-        if _cancel_selected_ocr_job(job_id):
-            cancelled += 1
-    return {"selected_ocr_cancelled": cancelled}
-
-
 def _mark_interrupted_processing_jobs_cancelled() -> dict[str, int]:
     processing_stages = {
         JobStage.EXTRACTION,
@@ -751,26 +495,6 @@ def _mark_uploaded_draft_jobs_cancelled() -> dict[str, int]:
         if _mark_uploaded_draft_job_cancelled(status.job_id):
             cancelled += 1
     return {"draft_cancelled": cancelled}
-
-
-def _terminate_process_tree(process: subprocess.Popen) -> None:
-    try:
-        if process.poll() is not None:
-            return
-        try:
-            pgid = os.getpgid(process.pid)
-        except Exception:
-            pgid = None
-        if pgid is not None:
-            os.killpg(pgid, signal.SIGTERM)
-        else:
-            process.terminate()
-    except Exception:
-        try:
-            if process.poll() is None:
-                process.kill()
-        except Exception:
-            pass
 
 
 def _status_dump_with_region_artifacts(status) -> dict:
@@ -857,14 +581,11 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
     source_job_dir = job_store.get_job_dir(job_id)
     source_pdf = source_job_dir / "input.pdf"
     source_ocr_dir = source_job_dir / "deepseek_ocr"
-    source_region_ocr_dir = source_job_dir / "ocr_regions"
-    source_region_results = source_region_ocr_dir / "results.json"
 
     if not source_pdf.exists():
         raise HTTPException(status_code=404, detail="Source PDF is missing for this job.")
     has_page_cache = source_ocr_dir.exists() and any(source_ocr_dir.glob("page_*.md"))
-    has_region_cache = source_region_results.exists()
-    if not has_page_cache and not has_region_cache:
+    if not has_page_cache:
         raise HTTPException(status_code=400, detail="OCR cache is unavailable for this job.")
 
     source_name = source_status.source_filename or source_status.filename
@@ -872,16 +593,8 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
     try:
         new_pdf = new_job_dir / "input.pdf"
         shutil.copy2(source_pdf, new_pdf)
-        ocr_input_mode = "full_page"
-        reuse_ocr_cache = False
-        if has_page_cache:
-            _copy_cached_ocr_data(source_ocr_dir, new_job_dir / "deepseek_ocr")
-            ocr_input_mode = "full_page"
-            reuse_ocr_cache = True
-        elif has_region_cache:
-            _copy_selected_region_ocr_data(source_region_ocr_dir, new_job_dir / "ocr_regions")
-            ocr_input_mode = "selected_regions"
-            reuse_ocr_cache = False
+        reuse_ocr_cache = True
+        _copy_cached_ocr_data(source_ocr_dir, new_job_dir / "deepseek_ocr")
         settings = _build_job_settings(
             chunk_size=request.chunk_size,
             model=request.model,
@@ -895,7 +608,6 @@ def _create_retranslation_job(job_id: str, request: RetranslateRequest) -> dict[
             output_mode=request.output_mode,
             profile_pipeline=request.profile_pipeline,
             reuse_ocr_cache=reuse_ocr_cache,
-            ocr_input_mode=ocr_input_mode,
             translation_input_mode=request.translation_input_mode,
         )
         job_queue.enqueue(new_job_id, new_pdf, settings)
@@ -1044,12 +756,6 @@ def _ensure_ocr_source_markdown(job_id: str) -> Path:
         _record_source_markdown_artifact(job_id, source_md_path)
         return source_md_path
 
-    payload = ocr_region_service.region_store.load_ocr_results(job_dir)
-    if payload is not None and payload.results:
-        source_md_path = _write_selected_ocr_source_markdown(job_id, payload)
-        _record_source_markdown_artifact(job_id, source_md_path)
-        return source_md_path
-
     raise HTTPException(status_code=404, detail="Original OCR markdown is not available for this job.")
 
 
@@ -1068,11 +774,6 @@ def _ensure_ocr_source_pdf_artifact(job_id: str, mode: str) -> Path:
         updated_artifacts[key] = str(pdf_path)
         job_store.update_status(job_id, artifacts=updated_artifacts)
     return pdf_path
-
-
-def _write_selected_ocr_source_markdown(job_id: str, payload: OcrResultsPayload) -> Path:
-    job_dir = job_store.get_job_dir(job_id)
-    return _write_selected_ocr_source_markdown_to_dir(job_dir, payload)
 
 
 def _record_source_markdown_artifact(job_id: str, source_md_path: Path) -> None:
@@ -1099,17 +800,15 @@ def _build_job_settings(
     output_mode: str,
     profile_pipeline: bool,
     reuse_ocr_cache: bool,
-    ocr_input_mode: str = "full_page",
     translation_input_mode: str = "continuous_document",
-    extraction_engine: str = "legacy_deepseek",
     extraction_mode: str = DEFAULT_EXTRACTION_MODE,
     use_local_vlm_repair: bool = ENABLE_LOCAL_VLM_REPAIR,
-    use_deepseek_fallback: bool = ENABLE_DEEPSEEK_FALLBACK,
     keep_debug_artifacts: bool = KEEP_EXTRACTION_DEBUG_ARTIFACTS,
 ) -> dict:
     selected_model = model if model in AVAILABLE_TRANSLATION_MODELS else DEFAULT_TRANSLATION_MODEL
     return {
         "chunk_size": chunk_size,
+        "translation_chunk_group_size": DEFAULT_TRANSLATION_CHUNK_GROUP_SIZE,
         "model": selected_model,
         "available_models": AVAILABLE_TRANSLATION_MODELS,
         "temperature": temperature,
@@ -1123,29 +822,16 @@ def _build_job_settings(
         "render_strategy": DEFAULT_RENDER_STRATEGY,
         "profile_pipeline": profile_pipeline,
         "reuse_ocr_cache": reuse_ocr_cache,
-        "ocr_input_mode": ocr_input_mode,
         "translation_input_mode": translation_input_mode
         if translation_input_mode in {"continuous_document", "page_by_page"}
         else "continuous_document",
-        "extraction_engine": extraction_engine if extraction_engine in {"marker", "legacy_deepseek"} else "marker",
+        "extraction_engine": "marker",
         "extraction_mode": extraction_mode
-        if extraction_mode in {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair", "deepseek_fallback"}
+        if extraction_mode in {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair"}
         else DEFAULT_EXTRACTION_MODE,
         "use_local_vlm_repair": bool(use_local_vlm_repair),
-        "use_deepseek_fallback": bool(use_deepseek_fallback),
         "keep_debug_artifacts": bool(keep_debug_artifacts),
         "marker_timeout_seconds": MARKER_TIMEOUT_SECONDS,
-        "deepseek_ocr_model": DEFAULT_DEEPSEEK_OCR_MODEL,
-        "deepseek_ocr_max_tokens": DEFAULT_DEEPSEEK_OCR_MAX_TOKENS,
-        "deepseek_ocr_prompt": DEFAULT_DEEPSEEK_OCR_PROMPT,
-        "deepseek_ocr_crop_mode": DEFAULT_DEEPSEEK_OCR_CROP_MODE,
-        "deepseek_ocr_min_crops": DEFAULT_DEEPSEEK_OCR_MIN_CROPS,
-        "deepseek_ocr_max_crops": DEFAULT_DEEPSEEK_OCR_MAX_CROPS,
-        "deepseek_ocr_base_size": DEFAULT_DEEPSEEK_OCR_BASE_SIZE,
-        "deepseek_ocr_image_size": DEFAULT_DEEPSEEK_OCR_IMAGE_SIZE,
-        "deepseek_ocr_skip_repeat": DEFAULT_DEEPSEEK_OCR_SKIP_REPEAT,
-        "deepseek_ocr_ngram_size": DEFAULT_DEEPSEEK_OCR_NGRAM_SIZE,
-        "deepseek_ocr_ngram_window": DEFAULT_DEEPSEEK_OCR_NGRAM_WINDOW,
         "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
         "qwen_ocr_model": DEFAULT_QWEN_OCR_MODEL,
         "qwen_ocr_max_tokens": DEFAULT_QWEN_OCR_MAX_TOKENS,
@@ -1157,8 +843,6 @@ def _build_job_settings(
         "qwen_ocr_repetition_penalty": DEFAULT_QWEN_OCR_REPETITION_PENALTY,
         "qwen_ocr_prompt": DEFAULT_QWEN_OCR_PROMPT,
         "qwen_ocr_dpi": DEFAULT_QWEN_OCR_DPI,
-        "qwen_ocr_image_scale": DEFAULT_QWEN_OCR_IMAGE_SCALE,
-        "qwen_ocr_jpeg_quality": DEFAULT_QWEN_OCR_JPEG_QUALITY,
         "qwen_ocr_batch_size": DEFAULT_QWEN_OCR_BATCH_SIZE,
         "qwen_ocr_crop_mode": DEFAULT_QWEN_OCR_CROP_MODE,
         "qwen_ocr_min_crops": DEFAULT_QWEN_OCR_MIN_CROPS,
@@ -1168,13 +852,6 @@ def _build_job_settings(
         "qwen_ocr_skip_repeat": DEFAULT_QWEN_OCR_SKIP_REPEAT,
         "qwen_ocr_ngram_size": DEFAULT_QWEN_OCR_NGRAM_SIZE,
         "qwen_ocr_ngram_window": DEFAULT_QWEN_OCR_NGRAM_WINDOW,
-        "qwen_ocr_mask_margins": DEFAULT_QWEN_OCR_MASK_MARGINS,
-        "qwen_ocr_first_page_top_mask_ratio": DEFAULT_QWEN_OCR_FIRST_PAGE_TOP_MASK_RATIO,
-        "qwen_ocr_first_page_bottom_mask_ratio": DEFAULT_QWEN_OCR_FIRST_PAGE_BOTTOM_MASK_RATIO,
-        "qwen_ocr_other_page_top_mask_ratio": DEFAULT_QWEN_OCR_OTHER_PAGE_TOP_MASK_RATIO,
-        "qwen_ocr_other_page_bottom_mask_ratio": DEFAULT_QWEN_OCR_OTHER_PAGE_BOTTOM_MASK_RATIO,
-        "qwen_ocr_left_mask_ratio": DEFAULT_QWEN_OCR_LEFT_MASK_RATIO,
-        "qwen_ocr_right_mask_ratio": DEFAULT_QWEN_OCR_RIGHT_MASK_RATIO,
         "translation_model": {
             "provider": "mlx",
             "model_id": selected_model,
@@ -1192,23 +869,12 @@ def _build_job_settings(
 def _copy_cached_ocr_data(source_ocr_dir: Path, target_ocr_dir: Path) -> None:
     target_ocr_dir.mkdir(parents=True, exist_ok=True)
     copied = 0
-    for pattern in ("page_*.md", "page_*.json", "metadata*.json"):
+    for pattern in ("page_*.md", "metadata*.json"):
         for source_file in source_ocr_dir.glob(pattern):
             shutil.copy2(source_file, target_ocr_dir / source_file.name)
             copied += 1
     if copied == 0:
         raise RuntimeError("No OCR cache files were copied.")
-
-
-def _copy_selected_region_ocr_data(source_ocr_dir: Path, target_ocr_dir: Path) -> None:
-    if not source_ocr_dir.exists():
-        raise RuntimeError("Selected-region OCR directory does not exist.")
-    if target_ocr_dir.exists():
-        shutil.rmtree(target_ocr_dir)
-    shutil.copytree(source_ocr_dir, target_ocr_dir)
-    results_path = target_ocr_dir / "results.json"
-    if not results_path.exists():
-        raise RuntimeError("Selected-region OCR results.json is missing.")
 
 
 if FRONTEND_DIR.exists():
