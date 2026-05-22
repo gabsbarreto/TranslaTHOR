@@ -288,7 +288,7 @@ def main() -> int:
     parser.add_argument("--ngram-size", type=int, default=20)
     parser.add_argument("--ngram-window", type=int, default=90)
     parser.add_argument("--names-json")
-    parser.add_argument("--batch-size", type=int, default=2)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--enable-thinking", type=parse_bool_flag, default=False)
     parser.add_argument("--fallback-to-single", type=parse_bool_flag, default=True)
     parser.add_argument("--verbose", type=parse_bool_flag, default=True)

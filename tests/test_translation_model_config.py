@@ -5,6 +5,7 @@ from app.config import (
     DEFAULT_LLM_TEMPERATURE,
     DEFAULT_LLM_TOP_K,
     DEFAULT_LLM_TOP_P,
+    DEFAULT_QWEN_OCR_BATCH_SIZE,
     DEFAULT_TRANSLATION_MODEL,
 )
 from app.services.translator_mlx import TranslationSettings
@@ -19,3 +20,7 @@ def test_translation_default_model_is_qwen35() -> None:
     assert settings.min_p == DEFAULT_LLM_MIN_P
     assert settings.presence_penalty == DEFAULT_LLM_PRESENCE_PENALTY
     assert settings.repetition_penalty == DEFAULT_LLM_REPETITION_PENALTY
+
+
+def test_qwen_ocr_defaults_to_single_page_batches() -> None:
+    assert DEFAULT_QWEN_OCR_BATCH_SIZE == 1
