@@ -18,69 +18,44 @@ DEFAULT_QWEN_OCR_MAX_TOKENS = int(os.getenv("QWEN_OCR_MAX_TOKENS", "4096"))
 DEFAULT_QWEN_OCR_PROMPT = os.getenv(
     "QWEN_OCR_PROMPT",
     (
-        """You are an OCR and document-to-Markdown transcription engine.
+        """You are an OCR-to-Markdown transcription engine.
 
-Your task is to convert the provided document image into clean, logical Markdown.
+Convert the document image into clean, logical Markdown.
 
-Rules:
-1. Transcribe only the visible text in the image.
-2. Do not summarise, explain, translate, or add information.
-3. Do not invent missing text. If text is unreadable, write: [illegible].
-4. Preserve the original reading order.
-5. Preserve headings, subheadings, paragraphs, lists, tables, footnotes, captions, and page numbers when visible.
-6. Use Markdown formatting:
-   - Use #, ##, ### for clear headings.
-   - Use bullet lists or numbered lists when the document uses lists.
-   - Use Markdown tables for tabular content.
-   - Use **bold** and *italic* only when clearly visible in the document.
-7. Do not wrap the output in a code block.
-8. Return only the Markdown content.
+Core task:
+- Transcribe the visible document text faithfully.
+- Preserve the original reading order.
+- Return only Markdown.
+- Use [illegible] for unreadable text.
 
-Paragraph and line-break rules:
-- Output logical paragraphs, not visual lines.
-- Do not reproduce line breaks that exist only because the text was wrapped on the page.
-- Join wrapped lines from the same paragraph into one continuous Markdown paragraph.
-- Only insert a blank line when there is a real paragraph break, section break, heading, list, table, caption, or other distinct document element.
-- If a sentence continues on the next visual line, keep it in the same Markdown paragraph.
-- If a word is split at the end of a line using a hyphen, reconstruct the full word and remove the line-break hyphen unless the word is genuinely hyphenated.
-- Do not split a paragraph after every sentence unless the original document clearly uses separate paragraphs.
+Paragraph rules:
+- Output paragraphs as continuous text blocks.
+- Join visual line wraps into the same paragraph.
+- Start a new paragraph only when the document shows a real paragraph break.
+- Reconstruct words split by line-break hyphenation.
+  Example: "forma-\nción" → "formación".
 
 Heading rules:
-- If a title or heading is visually broken across multiple lines, merge the full heading into one Markdown heading.
-- Use only one Markdown heading marker for the full heading.
-- Do not create multiple headings just because the printed heading spans multiple visual lines.
+- Merge multi-line headings into one Markdown heading.
+- Use a single heading marker for the complete heading.
+- Preserve the heading level logically with #, ##, or ###.
 
-Page header and footer rules:
-- Identify possible page headers and footers separately from the main body text.
-- A page header is text located near the top margin that appears visually separated from the main body, such as journal names, article titles, author names, running titles, volume/issue information, or DOI information.
-- A page footer is text located near the bottom margin, such as page numbers, journal information, copyright notices, or repeated publication details.
-- Do not mix page headers or footers into the main paragraph text.
-- If the article title, abbreviated title, journal name, author name, or running title repeats at the top of later pages, treat it as a page header, not as a document title or section heading.
-- Never output a repeated running page header as #, ##, or ###.
-- If a top or bottom line appears to be a repeated running header/footer, place it inside a Markdown comment:
-  <!-- page-header: text here -->
-  <!-- page-footer: text here -->
-- Preserve visible page numbers separately:
-  <!-- page-number: 123 -->
-- If the text is clearly a section heading, article title, abstract heading, introduction heading, or body heading, keep it in the main Markdown body.
-- If uncertain whether a line is a header/footer or body content, keep it in the main body and do not mark it as a header/footer.
+Page header/footer rules:
+- Detect running page headers and footers near the top or bottom margin. These are usually seen above lines such as 'Title\n ________'
+- Keep body headings, article titles, table titles, and figure captions in the main Markdown body.
+- When uncertain, treat the text as body content.
 
 Table rules:
-- If a table is present, convert it to a valid Markdown table.
-- Preserve column names and row order.
-- If a cell is empty, leave it empty.
-- If a cell is unreadable, write [illegible].
-- Do not merge rows or columns unless the visual table clearly does so.
-- Preserve line breaks inside table cells only when they indicate separate items within the same cell.
+- Convert tables into valid Markdown tables.
+- Preserve columns, rows, cell text, and order.
+- Use [illegible] inside unreadable cells.
 
 Layout rules:
-- For multi-column pages, read each column from top to bottom before moving to the next column.
+- Read multi-column pages column by column, top to bottom.
 - Keep captions close to their figures or tables.
-- Ignore decorative lines, borders, and logos unless they contain text.
-- Preserve mathematical symbols, units, punctuation, superscripts, and subscripts as accurately as possible.
-- Preserve deliberate line-based structures such as lists, forms, addresses, poetry, references, and tables.
+- Preserve symbols, units, punctuation, superscripts, and subscripts as accurately as possible.
 
-Now convert the image to clean logical Markdown."""
+Now convert the image into clean logical Markdown."""
     ),
 )
 DEFAULT_QWEN_OCR_DPI = int(os.getenv("QWEN_OCR_DPI", str(DEFAULT_DPI)))
@@ -93,6 +68,12 @@ DEFAULT_QWEN_OCR_IMAGE_SIZE = int(os.getenv("QWEN_OCR_IMAGE_SIZE", "768"))
 DEFAULT_QWEN_OCR_SKIP_REPEAT = os.getenv("QWEN_OCR_SKIP_REPEAT", "true").lower() in {"1", "true", "yes"}
 DEFAULT_QWEN_OCR_NGRAM_SIZE = int(os.getenv("QWEN_OCR_NGRAM_SIZE", "20"))
 DEFAULT_QWEN_OCR_NGRAM_WINDOW = int(os.getenv("QWEN_OCR_NGRAM_WINDOW", "90"))
+DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION = (
+    os.getenv("QWEN_OCR_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION", "true").lower()
+    in {"1", "true", "yes"}
+)
+DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS = int(os.getenv("QWEN_OCR_PREVIOUS_CONTEXT_PARAGRAPHS", "2"))
+DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS = int(os.getenv("QWEN_OCR_MAX_PREVIOUS_CONTEXT_CHARS", "1600"))
 DEFAULT_LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 DEFAULT_LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.7"))
 DEFAULT_LLM_TOP_K = int(os.getenv("LLM_TOP_K", "10"))

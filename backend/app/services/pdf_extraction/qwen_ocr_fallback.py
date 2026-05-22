@@ -33,6 +33,9 @@ from app.config import (
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
     DEFAULT_QWEN_OCR_TOP_P,
+    DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS,
+    DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS,
+    DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
 )
 from app.models.schema import Block
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
@@ -118,7 +121,7 @@ class QwenFullPageOCRFallback:
             strict_page_files=False,
             warning_message=(
                 "Parsed with Qwen 3.5 4B MLX-VLM full-page OCR fallback. "
-                "Page images were JPEG compressed at 75 percent scale and quality by default."
+                "Page images were sent as raw rendered PNG pages."
             ),
             include_page_markers=False,
             sanitize_ocr_markdown=True,
@@ -178,6 +181,18 @@ class QwenFullPageOCRFallback:
                 "qwen_ocr_dpi": dpi,
                 "qwen_ocr_image_mode": "rendered_page_png",
                 "qwen_ocr_batch_size": int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)),
+                "use_previous_page_context_for_header_detection": bool(
+                    settings.get(
+                        "use_previous_page_context_for_header_detection",
+                        DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
+                    )
+                ),
+                "previous_context_paragraphs": int(
+                    settings.get("previous_context_paragraphs", DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS)
+                ),
+                "max_previous_context_chars": int(
+                    settings.get("max_previous_context_chars", DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS)
+                ),
                 "qwen_ocr_image_metadata": image_metadata,
                 "qwen_ocr_output_dir": str(qwen_dir),
                 "marker_first_pass": marker_metadata,
@@ -267,6 +282,19 @@ class QwenFullPageOCRFallback:
             "false",
             "--verbose",
             "true",
+            "--use-previous-page-context",
+            "true"
+            if bool(
+                settings.get(
+                    "use_previous_page_context_for_header_detection",
+                    DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
+                )
+            )
+            else "false",
+            "--previous-context-paragraphs",
+            str(int(settings.get("previous_context_paragraphs", DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS))),
+            "--max-previous-context-chars",
+            str(int(settings.get("max_previous_context_chars", DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS))),
             "--names-json",
             json.dumps(output_names),
         ]

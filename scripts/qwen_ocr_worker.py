@@ -14,6 +14,8 @@ DEFAULT_PROMPT = (
     "Do not include ```markdown, <page>, page labels, reasoning, explanations, or <think> blocks."
 )
 TABLE_WHITELIST_TOKENS = ("<td>", "</td>")
+MIN_CONTEXT_WORDS = 8
+MIN_CONTEXT_CHARS = 45
 
 
 def parse_bool_flag(value: str) -> bool:
@@ -124,6 +126,131 @@ def build_ocr_chat_messages(system_prompt: str) -> list[dict[str, str]]:
         {"role": "system", "content": normalise_prompt_for_chat_template(system_prompt)},
         {"role": "user", "content": ""},
     ]
+
+
+def clean_context_candidate_blocks(markdown: str) -> list[str]:
+    text = str(markdown)
+    text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
+    text = re.sub(r"(?is)<!--\s*page-(?:header|footer|number)\s*:[\s\S]*?-->", "\n\n", text)
+    text = re.sub(r"(?m)^```.*?$", "", text)
+    blocks: list[str] = []
+    in_references = False
+
+    for raw_block in re.split(r"\n\s*\n+", text):
+        lines = [line.strip() for line in raw_block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if any(_is_references_heading(line) for line in lines):
+            in_references = True
+            continue
+        if in_references:
+            continue
+        if any(_is_structural_context_line(line) for line in lines):
+            continue
+        block = re.sub(r"\s+", " ", " ".join(lines)).strip()
+        if _is_body_context_candidate(block):
+            blocks.append(block)
+
+    return blocks
+
+
+def extract_previous_page_context(markdown: str, n_paragraphs: int = 2, max_chars: int = 1600) -> str:
+    if n_paragraphs <= 0 or max_chars <= 0:
+        return ""
+    candidates = clean_context_candidate_blocks(markdown)
+    selected = candidates[-max(int(n_paragraphs), 1) :]
+    while selected:
+        context = "\n\n".join(selected).strip()
+        if len(context) <= max_chars:
+            return context
+        if len(selected) == 1:
+            return f"...{context[-max_chars + 3:].lstrip()}" if max_chars > 3 else context[-max_chars:]
+        selected = selected[1:]
+    return ""
+
+
+def build_ocr_prompt(base_prompt: str, previous_page_context: str | None = None) -> str:
+    base = normalise_prompt_for_chat_template(base_prompt)
+    context = str(previous_page_context or "").strip()
+    if not context:
+        return base
+    return f"""{base}
+
+Previous-page context for continuity only:
+---
+{context}
+---
+
+Current page task:
+Transcribe only the visible text from the current page image into clean Markdown.
+
+Use the previous-page context only to decide whether the first lines of this page are body-text continuation, a genuine heading, or a running page header.
+The previous-page context is not part of this page. Never copy it into the output.
+
+Include:
+- body text visible on the current page;
+- genuine headings and subheadings visible on the current page;
+- lists, tables, captions, and footnotes when they are part of the page body.
+
+Exclude:
+- running page headers;
+- page footers;
+- page numbers;
+- article/chapter/journal metadata that appears in the top or bottom margin;
+- repeated or variable page metadata such as author names, journal names, article titles, short titles, DOI labels, journal labels, volume/issue labels, or chapter labels.
+
+Decision rule:
+At the top of the page, keep a line only if it is part of the document body or a genuine section heading.
+Remove it if it is visually separated in the margin and does not connect naturally with either the previous-page context or the body text that follows.
+Do not remove real headings such as Methods, Results, Discussion, or numbered section headings when they introduce the following text.
+Keep body text that continues from the previous page.
+
+Return only the Markdown transcription for the current page."""
+
+
+def _is_structural_context_line(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped:
+        return True
+    if re.match(r"^#{1,6}\s+", stripped):
+        return True
+    if re.match(r"^[-*_]{3,}$", stripped):
+        return True
+    if re.match(r"^(?:page\s*)?\d{1,4}$", stripped, flags=re.IGNORECASE):
+        return True
+    if re.match(r"^[ivxlcdm]{1,8}$", stripped, flags=re.IGNORECASE):
+        return True
+    if stripped.startswith("|") or re.match(r"^\|?\s*:?-{3,}:?\s*(?:\|.*)?$", stripped):
+        return True
+    if re.match(r"^(?:fig(?:ure)?|table|chart|graph|source|note|notes|caption|quadro|tabela|fonte)\b", stripped, flags=re.IGNORECASE):
+        return True
+    return False
+
+
+def _is_body_context_candidate(block: str) -> bool:
+    if len(block) < MIN_CONTEXT_CHARS:
+        return False
+    words = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9]+", block)
+    if len(words) < MIN_CONTEXT_WORDS:
+        return False
+    if re.match(r"^(?:fig(?:ure)?|table|source|note|notes|references|bibliography)\b", block, flags=re.IGNORECASE):
+        return False
+    if _looks_like_reference_entry(block):
+        return False
+    return True
+
+
+def _is_references_heading(line: str) -> bool:
+    stripped = re.sub(r"^#{1,6}\s+", "", line.strip()).strip(":")
+    return stripped.lower() in {"references", "bibliography", "works cited", "literature cited"}
+
+
+def _looks_like_reference_entry(block: str) -> bool:
+    if re.search(r"\(\d{4}[a-z]?\)", block) and re.search(r"\bdoi\b|https?://|[A-Z][a-z]+,\s+[A-Z]\.", block):
+        return True
+    if re.match(r"^\[\d+\]\s+", block):
+        return True
+    return False
 
 
 def clean_generated_text(text: str, prompt: str) -> str:
@@ -292,6 +419,9 @@ def main() -> int:
     parser.add_argument("--enable-thinking", type=parse_bool_flag, default=False)
     parser.add_argument("--fallback-to-single", type=parse_bool_flag, default=True)
     parser.add_argument("--verbose", type=parse_bool_flag, default=True)
+    parser.add_argument("--use-previous-page-context", type=parse_bool_flag, default=True)
+    parser.add_argument("--previous-context-paragraphs", type=int, default=2)
+    parser.add_argument("--max-previous-context-chars", type=int, default=1600)
     args = parser.parse_args()
 
     from mlx_lm.sample_utils import make_logits_processors, make_sampler
@@ -309,7 +439,10 @@ def main() -> int:
     force_single_for_penalties = (
         float(args.presence_penalty) != 0.0 or float(args.repetition_penalty) != 1.0
     )
-    use_batch = requested_batch_size > 1 and not force_single_for_penalties
+    use_previous_page_context = bool(args.use_previous_page_context)
+    # Page N needs the cleaned Markdown from page N-1 before its prompt can be built,
+    # so continuity-aware header detection must run sequentially.
+    use_batch = requested_batch_size > 1 and not force_single_for_penalties and not use_previous_page_context
     prompt_text = str(args.prompt)
 
     emit({"event": "model_loading", "model": str(args.model)})
@@ -335,6 +468,10 @@ def main() -> int:
             "requested_batch_size": requested_batch_size,
             "use_batch_generate": bool(use_batch),
             "batch_disabled_for_penalties": bool(force_single_for_penalties),
+            "batch_disabled_for_previous_page_context": bool(use_previous_page_context),
+            "use_previous_page_context": bool(use_previous_page_context),
+            "previous_context_paragraphs": max(int(args.previous_context_paragraphs), 0),
+            "max_previous_context_chars": max(int(args.max_previous_context_chars), 0),
             "enable_thinking": bool(args.enable_thinking),
             "temperature": float(args.temperature),
             "top_p": float(args.top_p),
@@ -463,6 +600,7 @@ def main() -> int:
                     )
                     output_index += 1
         else:
+            previous_page_context = ""
             for index, image_path in enumerate(image_paths, start=1):
                 emit(
                     {
@@ -470,12 +608,18 @@ def main() -> int:
                         "index": index,
                         "total": len(image_paths),
                         "image": str(image_path),
+                        "previous_page_context_chars": len(previous_page_context),
                     }
+                )
+                page_prompt = (
+                    build_ocr_prompt(prompt_text, previous_page_context)
+                    if use_previous_page_context and previous_page_context
+                    else prompt_text
                 )
                 formatted_prompt = build_generation_prompt(
                     processor=processor,
                     config=config,
-                    system_prompt=prompt_text,
+                    system_prompt=page_prompt,
                     apply_chat_template=apply_chat_template,
                     enable_thinking=bool(args.enable_thinking),
                 )
@@ -497,10 +641,19 @@ def main() -> int:
                     logits_processors=logits_processors,
                     verbose=bool(args.verbose),
                 )
-                markdown = clean_generated_text(str(result.text), prompt_text)
+                markdown = clean_generated_text(str(result.text), page_prompt)
                 stem = str(names[index - 1]) if index - 1 < len(names) else f"page_{index:04d}"
                 output_path = output_dir / f"{stem}.md"
                 output_path.write_text(markdown, encoding="utf-8")
+                previous_page_context = (
+                    extract_previous_page_context(
+                        markdown,
+                        n_paragraphs=max(int(args.previous_context_paragraphs), 0),
+                        max_chars=max(int(args.max_previous_context_chars), 0),
+                    )
+                    if use_previous_page_context
+                    else ""
+                )
                 emit(
                     {
                         "event": "page_done",
@@ -508,6 +661,7 @@ def main() -> int:
                         "total": len(image_paths),
                         "output": str(output_path),
                         "chars": len(markdown),
+                        "next_previous_page_context_chars": len(previous_page_context),
                     }
                 )
 
