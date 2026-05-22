@@ -61,6 +61,39 @@ def empty_document_metadata() -> dict[str, Any]:
     }
 
 
+def coerce_document_metadata(value: dict[str, Any] | None) -> dict[str, Any]:
+    source = value if isinstance(value, dict) else {}
+    metadata = empty_document_metadata()
+    for key in METADATA_KEYS:
+        raw = source.get(key)
+        if key == "authors":
+            if isinstance(raw, list):
+                metadata[key] = [str(item).strip() for item in raw if str(item).strip()]
+            elif isinstance(raw, str) and raw.strip():
+                metadata[key] = [part.strip() for part in re.split(r"\s*(?:,|;|\band\b|&)\s*", raw) if part.strip()]
+            continue
+        metadata[key] = str(raw or "").strip()
+    return metadata
+
+
+def merge_document_metadata(primary: dict[str, Any], fallback: dict[str, Any]) -> dict[str, Any]:
+    primary = coerce_document_metadata(primary)
+    fallback = coerce_document_metadata(fallback)
+    merged = empty_document_metadata()
+    for key in METADATA_KEYS:
+        if key == "authors":
+            merged[key] = primary[key] or fallback[key]
+        else:
+            merged[key] = primary[key] or fallback[key]
+    if primary["authors"] and not primary["first_author"]:
+        merged["first_author"] = _surname(primary["authors"][0])
+    elif not merged["first_author"] and merged["authors"]:
+        merged["first_author"] = _surname(merged["authors"][0])
+    if not merged["short_title"] and merged["title"]:
+        merged["short_title"] = _shorten_title(merged["title"])
+    return merged
+
+
 def extract_document_metadata(text: str) -> dict[str, Any]:
     metadata = empty_document_metadata()
     lines = _meaningful_lines(text)
@@ -198,11 +231,18 @@ def clean_page_furniture(
 def clean_pages_with_metadata(
     pages: list[tuple[int, str]],
     config: PageFurnitureCleanupConfig,
+    metadata: dict[str, Any] | None = None,
 ) -> tuple[list[tuple[int, str]], dict[str, Any]]:
     combined_text = "\n\n".join(markdown for _page_number, markdown in pages)
     first_page_text = pages[0][1] if pages else ""
     metadata_source = f"{first_page_text}\n\n{combined_text}" if first_page_text else combined_text
-    metadata = extract_document_metadata(metadata_source) if config.extract_document_metadata else empty_document_metadata()
+    metadata = (
+        coerce_document_metadata(metadata)
+        if metadata is not None
+        else extract_document_metadata(metadata_source)
+        if config.extract_document_metadata
+        else empty_document_metadata()
+    )
     if not config.clean_page_furniture_with_metadata:
         return pages, metadata
     return [

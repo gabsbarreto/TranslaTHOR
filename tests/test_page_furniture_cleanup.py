@@ -6,6 +6,7 @@ from app.services.pdf_extraction.page_furniture import (
     clean_page_furniture,
     extract_document_metadata,
     is_metadata_like_line,
+    merge_document_metadata,
     normalise_for_matching,
 )
 
@@ -64,6 +65,33 @@ def test_metadata_fuzzy_matching_matches_title_journal_doi_and_author_patterns()
     assert is_metadata_like_line("JOURNAL OF TESTING STUDIES", patterns)
     assert is_metadata_like_line("https://doi.org/10.1234/example.2024.55", patterns)
     assert is_metadata_like_line("Smith et al. 2024", patterns)
+
+
+def test_llm_metadata_can_be_merged_with_heuristic_fallback() -> None:
+    merged = merge_document_metadata(
+        {
+            "title": "LLM Extracted Title",
+            "authors": ["Jane Smith"],
+            "doi": "",
+        },
+        {
+            "title": "Heuristic Title",
+            "short_title": "Heuristic Title",
+            "authors": ["Fallback Author"],
+            "first_author": "Fallback",
+            "journal": "Journal of Testing Studies",
+            "doi": "10.1234/example.2024.55",
+            "publisher": "Example Publisher",
+            "year": "2024",
+            "copyright_or_licence": "Copyright 2024",
+        },
+    )
+
+    assert merged["title"] == "LLM Extracted Title"
+    assert merged["authors"] == ["Jane Smith"]
+    assert merged["first_author"] == "Smith"
+    assert merged["journal"] == "Journal of Testing Studies"
+    assert merged["doi"] == "10.1234/example.2024.55"
 
 
 def test_clean_page_furniture_removes_duplicated_title_header_from_later_page() -> None:

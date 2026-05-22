@@ -35,6 +35,11 @@ from app.config import (
     DEFAULT_QWEN_OCR_TOP_P,
     DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA,
     DEFAULT_EXTRACT_DOCUMENT_METADATA,
+    DEFAULT_EXTRACT_DOCUMENT_METADATA_WITH_LLM,
+    DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS,
+    DEFAULT_METADATA_EXTRACTION_MAX_TOKENS,
+    DEFAULT_METADATA_EXTRACTION_MODEL,
+    DEFAULT_METADATA_EXTRACTION_TIMEOUT_SECONDS,
     DEFAULT_METADATA_CLEANUP_BOTTOM_LINES,
     DEFAULT_METADATA_CLEANUP_TOP_LINES,
     DEFAULT_METADATA_SIMILARITY_THRESHOLD,
@@ -44,7 +49,12 @@ from app.models.schema import Block
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
 from app.services.markdown_builder import MarkdownBuilder as AppMarkdownBuilder
 from app.services.pdf_extraction.models import ExtractionChunk, PDFExtractionResult
-from app.services.pdf_extraction.page_furniture import PageFurnitureCleanupConfig, clean_pages_with_metadata
+from app.services.pdf_extraction.page_furniture import (
+    PageFurnitureCleanupConfig,
+    clean_pages_with_metadata,
+    extract_document_metadata,
+    merge_document_metadata,
+)
 from app.services.pdf_inspector import PdfInspector
 from app.services.profiler import PipelineProfiler
 from app.services.renderer import PageRenderer
@@ -238,7 +248,13 @@ class QwenFullPageOCRFallback:
                 pages.append((index, path.read_text(encoding="utf-8")))
                 page_paths.append(path)
 
-        cleaned_pages, metadata = clean_pages_with_metadata(pages, config)
+        metadata, metadata_source = self._extract_page_furniture_metadata(
+            pages=pages,
+            markdown_dir=markdown_dir,
+            settings=settings,
+            config=config,
+        )
+        cleaned_pages, metadata = clean_pages_with_metadata(pages, config, metadata=metadata)
         changed_pages: list[int] = []
         for (page_number, original), (_cleaned_page_number, cleaned), path in zip(pages, cleaned_pages, page_paths):
             if cleaned != original:
@@ -254,9 +270,87 @@ class QwenFullPageOCRFallback:
                 "metadata_cleanup_bottom_lines": config.bottom_lines,
                 "metadata_similarity_threshold": config.similarity_threshold,
                 "preserve_first_page_metadata": config.preserve_first_page_metadata,
+                "metadata_source": metadata_source,
+                "metadata_extraction_model": str(
+                    settings.get("metadata_extraction_model", DEFAULT_METADATA_EXTRACTION_MODEL)
+                )
+                if metadata_source == "llm"
+                else "",
                 "changed_pages": changed_pages,
             },
         }
+
+    def _extract_page_furniture_metadata(
+        self,
+        *,
+        pages: list[tuple[int, str]],
+        markdown_dir: Path,
+        settings: dict,
+        config: PageFurnitureCleanupConfig,
+    ) -> tuple[dict, str]:
+        if not config.extract_document_metadata:
+            return {}, "disabled"
+
+        text = self._metadata_source_text(pages)
+        heuristic_metadata = extract_document_metadata(text)
+        if not bool(settings.get("extract_document_metadata_with_llm", DEFAULT_EXTRACT_DOCUMENT_METADATA_WITH_LLM)):
+            return heuristic_metadata, "heuristic"
+
+        llm_metadata = self._run_metadata_extraction_worker(text=text, markdown_dir=markdown_dir, settings=settings)
+        if llm_metadata is None:
+            return heuristic_metadata, "heuristic_fallback"
+        return merge_document_metadata(llm_metadata, heuristic_metadata), "llm"
+
+    def _metadata_source_text(self, pages: list[tuple[int, str]]) -> str:
+        combined_text = "\n\n".join(markdown for _page_number, markdown in pages)
+        first_page_text = pages[0][1] if pages else ""
+        return f"{first_page_text}\n\n{combined_text}" if first_page_text else combined_text
+
+    def _run_metadata_extraction_worker(self, *, text: str, markdown_dir: Path, settings: dict) -> dict | None:
+        input_path = markdown_dir.parent / "metadata_extraction_input.txt"
+        output_path = markdown_dir.parent / "metadata_extraction.json"
+        input_text = text[: int(settings.get("metadata_extraction_max_input_chars", DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS))]
+        input_path.write_text(input_text, encoding="utf-8")
+        worker = Path(os.getenv("METADATA_EXTRACTION_WORKER", str(BASE_DIR / "scripts" / "extract_metadata_worker.py")))
+        cmd = [
+            self._resolve_text_worker_python_executable(),
+            str(worker),
+            "--model",
+            str(settings.get("metadata_extraction_model", DEFAULT_METADATA_EXTRACTION_MODEL)),
+            "--input",
+            str(input_path),
+            "--output",
+            str(output_path),
+            "--max-input-chars",
+            str(int(settings.get("metadata_extraction_max_input_chars", DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS))),
+            "--max-tokens",
+            str(int(settings.get("metadata_extraction_max_tokens", DEFAULT_METADATA_EXTRACTION_MAX_TOKENS))),
+        ]
+        try:
+            process = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=int(
+                    settings.get(
+                        "metadata_extraction_timeout_seconds",
+                        DEFAULT_METADATA_EXTRACTION_TIMEOUT_SECONDS,
+                    )
+                ),
+                check=False,
+            )
+        except Exception as exc:
+            logger.warning("LLM metadata extraction could not start; using heuristic metadata: %s", exc)
+            return None
+        if process.returncode != 0:
+            logger.warning("LLM metadata extraction failed; using heuristic metadata: %s", process.stderr[-1200:])
+            return None
+        try:
+            return json.loads(output_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("LLM metadata extraction produced invalid JSON; using heuristic metadata: %s", exc)
+            return None
 
     def _run_qwen_ocr(
         self,
@@ -380,6 +474,15 @@ class QwenFullPageOCRFallback:
                 legacy_python,
             )
 
+        return sys.executable
+
+    def _resolve_text_worker_python_executable(self) -> str:
+        metadata_python = os.getenv("METADATA_EXTRACTION_PYTHON")
+        if metadata_python:
+            metadata_path = Path(metadata_python).expanduser()
+            if metadata_path.exists():
+                return str(metadata_path)
+            logger.warning("Ignoring METADATA_EXTRACTION_PYTHON because it does not exist: %s", metadata_python)
         return sys.executable
 
     def _ocr_worker_line_handler(self, on_ocr_progress: Callable[[dict], None] | None) -> Callable[[str], None]:
