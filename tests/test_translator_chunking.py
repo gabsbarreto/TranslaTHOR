@@ -301,6 +301,61 @@ def test_adjacent_prose_chunks_are_merged_before_translation() -> None:
     assert "Terceiro paragrafo para manter continuidade." in chunks[0].source_text
 
 
+def test_separator_only_blocks_are_not_sent_to_translation() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            _block("a", "---", 100, 110),
+            _block("b", "Texto real para traduzir.", 140, 150),
+            _block("c", "-----", 180, 190),
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
+
+    chunks = translator.build_chunks(document)
+
+    assert len(chunks) == 1
+    assert chunks[0].block_ids == ["b"]
+    assert chunks[0].source_text == "Texto real para traduzir."
+
+
+def test_separator_only_blocks_do_not_call_llm() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[_block("a", "---", 100, 110)],
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    calls: list[str] = []
+    translator._translate_chunk_with_validation = lambda *args: calls.append(str(args[0])) or "BAD"  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    assert calls == []
+    assert translated_doc.blocks[0].text == "---"
+
+
 def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
     document = DocumentModel(
         metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),

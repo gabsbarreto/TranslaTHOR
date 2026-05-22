@@ -180,6 +180,8 @@ class MlxTranslator:
             else:
                 text_parts = self._split_to_token_budget(unit.text)
             for text_part in text_parts:
+                if unit.block_type != BlockType.TABLE and not self._has_translatable_content(text_part):
+                    continue
                 chunk = TranslationChunk(
                     id=f"chunk-{len(chunks)}",
                     block_ids=unit.block_ids,
@@ -600,7 +602,19 @@ class MlxTranslator:
             return False
         if self._is_table_heavy_markup(chunk.source_text):
             return False
+        if not self._has_translatable_content(chunk.source_text):
+            return False
         return self._is_batchable_block_type(block_type)
+
+    def _has_translatable_content(self, text: str) -> bool:
+        stripped = text.strip()
+        if not stripped:
+            return False
+        if re.fullmatch(r"(?:[-*_]\s*){3,}", stripped):
+            return False
+        if re.fullmatch(r"[^\wÀ-ÖØ-öø-ÿ]+", stripped):
+            return False
+        return bool(re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]", stripped))
 
     def _split_into_sentences(self, text: str) -> list[str]:
         compact = " ".join(text.strip().split())
