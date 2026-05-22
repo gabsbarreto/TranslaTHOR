@@ -12,6 +12,39 @@ from app.services.translator_mlx import MlxTranslator, TranslationSettings
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
 
 
+def test_ocr_page_continuation_merges_after_non_period_boundary_punctuation() -> None:
+    pipeline = DeepSeekOcrPipeline()
+
+    merged, merge_count = pipeline._merge_page_continuations(
+        [
+            (2, "Es probable que de este modo,"),
+            (
+                3,
+                'puedan ir determinándose diferentes "tipos" dentro del trastorno en la actual denominación genérica.',
+            ),
+        ]
+    )
+
+    assert merge_count == 1
+    assert (
+        'Es probable que de este modo, puedan ir determinándose diferentes "tipos"'
+        in merged[0][1]
+    )
+    assert merged[1][1] == ""
+
+
+def test_ocr_page_continuation_does_not_merge_after_full_stop() -> None:
+    pipeline = DeepSeekOcrPipeline()
+
+    merged, merge_count = pipeline._merge_page_continuations(
+        [(1, "This paragraph is complete."), (2, "This starts a new paragraph.")]
+    )
+
+    assert merge_count == 0
+    assert merged[0][1] == "This paragraph is complete."
+    assert merged[1][1] == "This starts a new paragraph."
+
+
 def _block(block_id: str, text: str, y0: float, y1: float, x0: float = 50.0) -> Block:
     return Block(
         id=block_id,

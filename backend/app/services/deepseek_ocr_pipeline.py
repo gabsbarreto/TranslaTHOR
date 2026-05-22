@@ -857,13 +857,18 @@ class DeepSeekOcrPipeline:
             return False
         if re.match(r"^\d+[.)]\s+\S", next_text):
             return False
-        if previous.endswith((".", "!", "?", ":", ";", "…")):
+        if self._ends_with_full_stop(previous):
             return False
-        if previous.endswith((".", "!", "?", ":", ";", "…", "\"", "'", "”", "’", ")", "]")) and next_text[:1].isupper():
-            return False
+        if previous.endswith((",", ";", ":", "-", "(", ")", "[", "]")):
+            return True
         if next_text[:1].islower() or next_text[:1].isdigit():
             return True
-        return self._ends_with_continuation_word(previous)
+        return True
+
+    def _ends_with_full_stop(self, text: str) -> bool:
+        stripped = text.rstrip()
+        stripped = re.sub(r"[\"'”’)\]]+$", "", stripped).rstrip()
+        return stripped.endswith(".")
 
     def _looks_like_structural_markdown(self, text: str) -> bool:
         first_line = text.strip().splitlines()[0] if text.strip() else ""

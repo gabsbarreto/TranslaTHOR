@@ -150,6 +150,38 @@ doi: 10.1234/example.2024.55
     assert "This page starts with a normal paragraph" in cleaned
 
 
+def test_clean_page_furniture_removes_markdown_author_list_heading_on_later_pages() -> None:
+    metadata = {
+        "title": "Transexualidad adolescencia y educacion",
+        "short_title": "",
+        "authors": [
+            "Bergero Miguel T.",
+            "Cano Oncala G.",
+            "Esteva de Antonio I.",
+            "Giraldo F.",
+            "Gornemann Schaffer I.",
+            "Álvarez Ortega P.",
+        ],
+        "first_author": "Bergero",
+        "journal": "",
+        "doi": "",
+        "publisher": "",
+        "year": "",
+        "copyright_or_licence": "",
+    }
+    markdown = """## Bergero Miguel T., Cano Oncala G., Esteva de Antonio I., Giraldo F., Gornemann Schaffer I., Álvarez Ortega P.
+
+Es probable que de este modo,
+
+puedan ir determinándose diferentes tipos dentro del trastorno.
+"""
+
+    cleaned = clean_page_furniture(markdown, metadata, 3, PageFurnitureCleanupConfig())
+
+    assert "Bergero Miguel" not in cleaned
+    assert "Es probable que de este modo" in cleaned
+
+
 def test_clean_page_furniture_preserves_first_page_title_and_authors() -> None:
     metadata = {
         "title": "Understanding OCR Errors in Multi Column Papers",

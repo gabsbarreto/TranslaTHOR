@@ -288,11 +288,14 @@ def _should_remove_line(
         return False
     if preserve_first_page_metadata and page_number <= 1 and zone == "top":
         return False
+    metadata_match = is_metadata_like_line(plain, patterns, threshold=threshold)
+    if metadata_match and (_is_isolated_or_metadata_like(plain) or _looks_like_author_list_line(plain) or zone == "bottom"):
+        return True
     if _looks_like_body_paragraph(plain):
         return False
     if not (_is_isolated_or_metadata_like(plain) or zone == "bottom"):
         return False
-    return is_metadata_like_line(plain, patterns, threshold=threshold)
+    return metadata_match
 
 
 def _meaningful_lines(text: str) -> list[str]:
@@ -429,6 +432,18 @@ def _looks_like_body_paragraph(line: str) -> bool:
     if len(words) >= 12 and re.search(r"[.!?;:]$", line.strip()):
         return True
     return False
+
+
+def _looks_like_author_list_line(line: str) -> bool:
+    if line.count(",") < 2:
+        return False
+    name_like_parts = [
+        part
+        for part in re.split(r"\s*,\s*", line)
+        if re.search(r"\b[A-ZÀ-ÖØ-Þ][A-Za-zÀ-ÖØ-öø-ÿ'’-]+\b", part)
+        and re.search(r"\b[A-Z]\.?\b", part)
+    ]
+    return len(name_like_parts) >= 2
 
 
 def _is_isolated_or_metadata_like(line: str) -> bool:
