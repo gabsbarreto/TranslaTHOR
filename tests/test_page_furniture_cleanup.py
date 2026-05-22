@@ -182,6 +182,70 @@ puedan ir determinándose diferentes tipos dentro del trastorno.
     assert "Es probable que de este modo" in cleaned
 
 
+def test_clean_page_furniture_removes_truncated_author_list_header_with_ocr_variation() -> None:
+    metadata = {
+        "title": "Evaluación Endocrinológica y Tratamiento Hormonal de la Transexualidad",
+        "short_title": "",
+        "authors": [
+            "Esteva de Antonio I.",
+            "Giraldo F.",
+            "Bergero de Miguel T.",
+            "Cano Oncala G.",
+            "Crespillo Gómez G.",
+            "Ruiz de Adana S.",
+            "Rojo Martínez G.",
+            "Soriguer Escofet F.",
+        ],
+        "first_author": "Esteva de Antonio I.",
+        "journal": "Cirugía Plástica Ibero-Latinoamericana",
+        "doi": "10.64869/PCRL8019",
+        "publisher": "",
+        "year": "2001",
+        "copyright_or_licence": "",
+    }
+    markdown = """# Esteva de Antonio I., Giraldo F., Bergero de Miguel T., Cano Oncala G., Crespillo Gómez C., Ruiz de Adana S., ...
+
+El seguimiento endocrinológico debe realizarse de forma individualizada.
+"""
+
+    cleaned = clean_page_furniture(markdown, metadata, 6, PageFurnitureCleanupConfig())
+
+    assert "Esteva de Antonio" not in cleaned
+    assert "El seguimiento endocrinológico" in cleaned
+
+
+def test_clean_page_furniture_removes_truncated_author_list_bullet_header() -> None:
+    metadata = {
+        "title": "Evaluación Endocrinológica y Tratamiento Hormonal de la Transexualidad",
+        "short_title": "",
+        "authors": [
+            "Esteva de Antonio I.",
+            "Giraldo F.",
+            "Bergero de Miguel T.",
+            "Cano Oncala G.",
+            "Crespillo Gómez G.",
+            "Ruiz de Adana S.",
+            "Rojo Martínez G.",
+            "Soriguer Escofet F.",
+        ],
+        "first_author": "Esteva de Antonio I.",
+        "journal": "Cirugía Plástica Ibero-Latinoamericana",
+        "doi": "10.64869/PCRL8019",
+        "publisher": "",
+        "year": "2001",
+        "copyright_or_licence": "",
+    }
+    markdown = """*   **Esteva de Antonio I., Giraldo F., Bergero de Miguel T., Cano Oncala G., Crespillo Gómez C., Ruiz de Adana S., ...**
+
+Las determinaciones hormonales se ajustaron durante el seguimiento.
+"""
+
+    cleaned = clean_page_furniture(markdown, metadata, 4, PageFurnitureCleanupConfig())
+
+    assert "Esteva de Antonio" not in cleaned
+    assert "Las determinaciones hormonales" in cleaned
+
+
 def test_clean_page_furniture_preserves_first_page_title_and_authors() -> None:
     metadata = {
         "title": "Understanding OCR Errors in Multi Column Papers",

@@ -132,6 +132,10 @@ def build_metadata_patterns(metadata: dict[str, Any]) -> list[str]:
     authors = [str(author).strip() for author in metadata.get("authors", []) if str(author).strip()]
     if authors:
         add(", ".join(authors))
+        # Running headers often truncate long author lists with an ellipsis. Prefix
+        # patterns let those headers match without requiring the full first-page list.
+        for author_count in range(2, min(len(authors), 6) + 1):
+            add(", ".join(authors[:author_count]))
     for author in authors:
         add(author)
 
