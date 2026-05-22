@@ -441,7 +441,11 @@ class MlxTranslator:
         if first is None:
             return
 
-        first.text = chunk.translated_text.strip()
+        first.text = (
+            self._clean_translated_list_text(chunk.translated_text)
+            if first.block_type == BlockType.LIST
+            else chunk.translated_text.strip()
+        )
         first.metadata["translated_from_block_ids"] = chunk.block_ids
         for block_id in chunk.block_ids[1:]:
             block = block_by_id.get(block_id)
@@ -500,6 +504,9 @@ class MlxTranslator:
             return [translated_text.strip()]
         return source_parts
 
+    def _clean_translated_list_text(self, text: str) -> str:
+        return re.sub(r"^\s*[-*+]\s+", "", text.strip())
+
     def _split_to_token_budget(self, text: str) -> list[str]:
         token_budget = max(128, int(self.settings.chunk_size or DEFAULT_CHUNK_SIZE))
         token_budget = min(token_budget, self.PROSE_CHUNK_TOKEN_CAP)
@@ -531,7 +538,7 @@ class MlxTranslator:
         return parts or [text]
 
     def _is_batchable_block_type(self, block_type: BlockType | None) -> bool:
-        return block_type in {BlockType.PARAGRAPH, BlockType.LIST}
+        return block_type == BlockType.PARAGRAPH
 
     def _merge_adjacent_translation_chunks(
         self,

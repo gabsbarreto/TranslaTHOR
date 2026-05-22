@@ -2,6 +2,7 @@ import sys
 from types import ModuleType
 
 from app.models.schema import Block, BlockType, BoundingBox, DocumentMetadata, DocumentModel, PageMetadata, SourceType
+from app.services.markdown_builder import MarkdownBuilder
 
 if "langdetect" not in sys.modules:
     langdetect_stub = ModuleType("langdetect")
@@ -56,6 +57,11 @@ def _block(block_id: str, text: str, y0: float, y1: float, x0: float = 50.0) -> 
         source_type=SourceType.EMBEDDED,
         style_hints={"font_size": 10},
     )
+
+
+def _list_block(block_id: str, text: str, y0: float) -> Block:
+    block = _block(block_id, text, y0, y0 + 10)
+    return block.model_copy(update={"block_type": BlockType.LIST})
 
 
 def test_translation_chunks_follow_paragraph_boundaries() -> None:
@@ -354,6 +360,67 @@ def test_separator_only_blocks_do_not_call_llm() -> None:
 
     assert calls == []
     assert translated_doc.blocks[0].text == "---"
+
+
+def test_list_items_are_not_merged_so_markdown_bullets_are_preserved() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            _list_block("a", "Criterio A: texto uno.", 100),
+            _list_block("b", "Criterio B: texto dos.", 140),
+            _list_block("c", "Criterio C: texto tres.", 180),
+            _list_block("d", "Criterio D: texto cuatro.", 220),
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    translator._translate_chunk_with_validation = (  # type: ignore[method-assign]
+        lambda text, context, source_language, block_type: text.replace("Criterio", "Criterion")
+    )
+
+    translated_doc, _ = translator.translate_document(document, "")
+    translated_markdown = MarkdownBuilder().build(translated_doc)
+
+    assert len(translator.build_chunks(document)) == 4
+    assert translated_markdown.count("- Criterion") == 4
+
+
+def test_translated_list_text_strips_accidental_markdown_marker_before_rendering() -> None:
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[_list_block("a", "Criterio A: texto uno.", 100)],
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    translator._translate_chunk_with_validation = lambda *args: "- Criterion A: text one."  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+    translated_markdown = MarkdownBuilder().build(translated_doc)
+
+    assert "- Criterion A: text one." in translated_markdown
+    assert "- - Criterion" not in translated_markdown
 
 
 def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
