@@ -33,14 +33,18 @@ from app.config import (
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
     DEFAULT_QWEN_OCR_TOP_P,
-    DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS,
-    DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS,
-    DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
+    DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA,
+    DEFAULT_EXTRACT_DOCUMENT_METADATA,
+    DEFAULT_METADATA_CLEANUP_BOTTOM_LINES,
+    DEFAULT_METADATA_CLEANUP_TOP_LINES,
+    DEFAULT_METADATA_SIMILARITY_THRESHOLD,
+    DEFAULT_PRESERVE_FIRST_PAGE_METADATA,
 )
 from app.models.schema import Block
 from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
 from app.services.markdown_builder import MarkdownBuilder as AppMarkdownBuilder
 from app.services.pdf_extraction.models import ExtractionChunk, PDFExtractionResult
+from app.services.pdf_extraction.page_furniture import PageFurnitureCleanupConfig, clean_pages_with_metadata
 from app.services.pdf_inspector import PdfInspector
 from app.services.profiler import PipelineProfiler
 from app.services.renderer import PageRenderer
@@ -113,6 +117,11 @@ class QwenFullPageOCRFallback:
             on_process_finished=on_process_finished,
             on_ocr_progress=on_ocr_progress,
         )
+        cleaned_page_metadata = self._clean_ocr_page_furniture(
+            markdown_dir=markdown_dir,
+            output_names=output_names,
+            settings=settings,
+        )
 
         document, _marker_md = self.markdown_parser.build_document_from_markdown_dir(
             inspection=inspection,
@@ -181,18 +190,8 @@ class QwenFullPageOCRFallback:
                 "qwen_ocr_dpi": dpi,
                 "qwen_ocr_image_mode": "rendered_page_png",
                 "qwen_ocr_batch_size": int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)),
-                "use_previous_page_context_for_header_detection": bool(
-                    settings.get(
-                        "use_previous_page_context_for_header_detection",
-                        DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
-                    )
-                ),
-                "previous_context_paragraphs": int(
-                    settings.get("previous_context_paragraphs", DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS)
-                ),
-                "max_previous_context_chars": int(
-                    settings.get("max_previous_context_chars", DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS)
-                ),
+                "ocr_document_metadata": cleaned_page_metadata["metadata"],
+                "page_furniture_cleanup": cleaned_page_metadata["cleanup"],
                 "qwen_ocr_image_metadata": image_metadata,
                 "qwen_ocr_output_dir": str(qwen_dir),
                 "marker_first_pass": marker_metadata,
@@ -209,6 +208,55 @@ class QwenFullPageOCRFallback:
             warnings=warnings,
             document=document,
         )
+
+    def _clean_ocr_page_furniture(
+        self,
+        *,
+        markdown_dir: Path,
+        output_names: list[str],
+        settings: dict,
+    ) -> dict:
+        config = PageFurnitureCleanupConfig(
+            extract_document_metadata=bool(settings.get("extract_document_metadata", DEFAULT_EXTRACT_DOCUMENT_METADATA)),
+            clean_page_furniture_with_metadata=bool(
+                settings.get("clean_page_furniture_with_metadata", DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA)
+            ),
+            top_lines=int(settings.get("metadata_cleanup_top_lines", DEFAULT_METADATA_CLEANUP_TOP_LINES)),
+            bottom_lines=int(settings.get("metadata_cleanup_bottom_lines", DEFAULT_METADATA_CLEANUP_BOTTOM_LINES)),
+            similarity_threshold=float(
+                settings.get("metadata_similarity_threshold", DEFAULT_METADATA_SIMILARITY_THRESHOLD)
+            ),
+            preserve_first_page_metadata=bool(
+                settings.get("preserve_first_page_metadata", DEFAULT_PRESERVE_FIRST_PAGE_METADATA)
+            ),
+        )
+        pages: list[tuple[int, str]] = []
+        page_paths: list[Path] = []
+        for index, output_name in enumerate(output_names, start=1):
+            path = markdown_dir / f"{output_name}.md"
+            if path.exists():
+                pages.append((index, path.read_text(encoding="utf-8")))
+                page_paths.append(path)
+
+        cleaned_pages, metadata = clean_pages_with_metadata(pages, config)
+        changed_pages: list[int] = []
+        for (page_number, original), (_cleaned_page_number, cleaned), path in zip(pages, cleaned_pages, page_paths):
+            if cleaned != original:
+                path.write_text(cleaned, encoding="utf-8")
+                changed_pages.append(page_number)
+
+        return {
+            "metadata": metadata,
+            "cleanup": {
+                "extract_document_metadata": config.extract_document_metadata,
+                "clean_page_furniture_with_metadata": config.clean_page_furniture_with_metadata,
+                "metadata_cleanup_top_lines": config.top_lines,
+                "metadata_cleanup_bottom_lines": config.bottom_lines,
+                "metadata_similarity_threshold": config.similarity_threshold,
+                "preserve_first_page_metadata": config.preserve_first_page_metadata,
+                "changed_pages": changed_pages,
+            },
+        }
 
     def _run_qwen_ocr(
         self,
@@ -282,19 +330,6 @@ class QwenFullPageOCRFallback:
             "false",
             "--verbose",
             "true",
-            "--use-previous-page-context",
-            "true"
-            if bool(
-                settings.get(
-                    "use_previous_page_context_for_header_detection",
-                    DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION,
-                )
-            )
-            else "false",
-            "--previous-context-paragraphs",
-            str(int(settings.get("previous_context_paragraphs", DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS))),
-            "--max-previous-context-chars",
-            str(int(settings.get("max_previous_context_chars", DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS))),
             "--names-json",
             json.dumps(output_names),
         ]

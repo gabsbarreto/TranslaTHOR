@@ -20,42 +20,20 @@ DEFAULT_QWEN_OCR_PROMPT = os.getenv(
     (
         """You are an OCR-to-Markdown transcription engine.
 
-Convert the document image into clean, logical Markdown.
+Convert the document image into clean Markdown.
 
-Core task:
-- Transcribe the visible document text faithfully.
-- Preserve the original reading order.
-- Return only Markdown.
-- Use [illegible] for unreadable text.
-
-Paragraph rules:
-- Output paragraphs as continuous text blocks.
-- Join visual line wraps into the same paragraph.
-- Start a new paragraph only when the document shows a real paragraph break.
-- Reconstruct words split by line-break hyphenation.
-  Example: "forma-\nción" → "formación".
-
-Heading rules:
-- Merge multi-line headings into one Markdown heading.
-- Use a single heading marker for the complete heading.
-- Preserve the heading level logically with #, ##, or ###.
-
-Page header/footer rules:
-- Detect running page headers and footers near the top or bottom margin. These are usually seen above lines such as 'Title\n ________'
-- Keep body headings, article titles, table titles, and figure captions in the main Markdown body.
-- When uncertain, treat the text as body content.
-
-Table rules:
+Rules:
+- Transcribe only visible text from the current image.
+- Preserve visual reading order: left column top-to-bottom, then right column.
+- Join wrapped lines into paragraphs.
+- Reconstruct hyphenated line-breaks, e.g. "forma-\\nción" → "formación".
+- Use Markdown headings for real headings.
 - Convert tables into valid Markdown tables.
-- Preserve columns, rows, cell text, and order.
-- Use [illegible] inside unreadable cells.
-
-Layout rules:
-- Read multi-column pages column by column, top to bottom.
-- Keep captions close to their figures or tables.
-- Preserve symbols, units, punctuation, superscripts, and subscripts as accurately as possible.
-
-Now convert the image into clean logical Markdown."""
+- Keep captions near their figures/tables.
+- Exclude page furniture: running headers, footers, page numbers, margin metadata.
+- Keep real content: body headings, article titles, captions, tables, footnotes.
+- If a page ends in a hyphenated line break, do not try to guess and finish the word. It should continue on the next page.
+- Return only Markdown."""
     ),
 )
 DEFAULT_QWEN_OCR_DPI = int(os.getenv("QWEN_OCR_DPI", str(DEFAULT_DPI)))
@@ -68,12 +46,16 @@ DEFAULT_QWEN_OCR_IMAGE_SIZE = int(os.getenv("QWEN_OCR_IMAGE_SIZE", "768"))
 DEFAULT_QWEN_OCR_SKIP_REPEAT = os.getenv("QWEN_OCR_SKIP_REPEAT", "true").lower() in {"1", "true", "yes"}
 DEFAULT_QWEN_OCR_NGRAM_SIZE = int(os.getenv("QWEN_OCR_NGRAM_SIZE", "20"))
 DEFAULT_QWEN_OCR_NGRAM_WINDOW = int(os.getenv("QWEN_OCR_NGRAM_WINDOW", "90"))
-DEFAULT_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION = (
-    os.getenv("QWEN_OCR_USE_PREVIOUS_PAGE_CONTEXT_FOR_HEADER_DETECTION", "true").lower()
-    in {"1", "true", "yes"}
+DEFAULT_EXTRACT_DOCUMENT_METADATA = os.getenv("EXTRACT_DOCUMENT_METADATA", "true").lower() in {"1", "true", "yes"}
+DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA = (
+    os.getenv("CLEAN_PAGE_FURNITURE_WITH_METADATA", "true").lower() in {"1", "true", "yes"}
 )
-DEFAULT_PREVIOUS_CONTEXT_PARAGRAPHS = int(os.getenv("QWEN_OCR_PREVIOUS_CONTEXT_PARAGRAPHS", "2"))
-DEFAULT_MAX_PREVIOUS_CONTEXT_CHARS = int(os.getenv("QWEN_OCR_MAX_PREVIOUS_CONTEXT_CHARS", "1600"))
+DEFAULT_METADATA_CLEANUP_TOP_LINES = int(os.getenv("METADATA_CLEANUP_TOP_LINES", "5"))
+DEFAULT_METADATA_CLEANUP_BOTTOM_LINES = int(os.getenv("METADATA_CLEANUP_BOTTOM_LINES", "5"))
+DEFAULT_METADATA_SIMILARITY_THRESHOLD = float(os.getenv("METADATA_SIMILARITY_THRESHOLD", "0.85"))
+DEFAULT_PRESERVE_FIRST_PAGE_METADATA = (
+    os.getenv("PRESERVE_FIRST_PAGE_METADATA", "true").lower() in {"1", "true", "yes"}
+)
 DEFAULT_LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 DEFAULT_LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.7"))
 DEFAULT_LLM_TOP_K = int(os.getenv("LLM_TOP_K", "10"))
@@ -81,13 +63,13 @@ DEFAULT_LLM_MIN_P = float(os.getenv("LLM_MIN_P", "0.0"))
 DEFAULT_LLM_PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "1.5"))
 DEFAULT_LLM_REPETITION_PENALTY = float(os.getenv("LLM_REPETITION_PENALTY", "1.0"))
 DEFAULT_QWEN_OCR_TEMPERATURE = float(
-    os.getenv("QWEN_OCR_TEMPERATURE", "0.1")
+    os.getenv("QWEN_OCR_TEMPERATURE", "0.0")
 )
 DEFAULT_QWEN_OCR_TOP_P = float(os.getenv("QWEN_OCR_TOP_P", "0.8"))
 DEFAULT_QWEN_OCR_TOP_K = int(os.getenv("QWEN_OCR_TOP_K", "20"))
 DEFAULT_QWEN_OCR_MIN_P = float(os.getenv("QWEN_OCR_MIN_P", str(DEFAULT_LLM_MIN_P)))
 DEFAULT_QWEN_OCR_PRESENCE_PENALTY = float(
-    os.getenv("QWEN_OCR_PRESENCE_PENALTY", "1.0")
+    os.getenv("QWEN_OCR_PRESENCE_PENALTY", "0")
 )
 DEFAULT_QWEN_OCR_REPETITION_PENALTY = float(
     os.getenv("QWEN_OCR_REPETITION_PENALTY", "1.0")
