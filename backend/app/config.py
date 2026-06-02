@@ -30,7 +30,6 @@ Rules:
 - Use Markdown headings for real headings.
 - Convert tables into valid Markdown tables.
 - Keep captions near their figures/tables.
-- Exclude page furniture: running headers, footers, page numbers, margin metadata.
 - Keep real content: body headings, article titles, captions, tables, footnotes.
 - If a page ends in a hyphenated line break, do not try to guess and finish the word. It should continue on the next page.
 - Return only Markdown."""
