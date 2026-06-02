@@ -10,40 +10,7 @@ if "langdetect" not in sys.modules:
     sys.modules["langdetect"] = langdetect_stub
 
 from app.services.translator_mlx import MlxTranslator, TranslationSettings
-from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
-
-
-def test_ocr_page_continuation_merges_after_non_period_boundary_punctuation() -> None:
-    pipeline = DeepSeekOcrPipeline()
-
-    merged, merge_count = pipeline._merge_page_continuations(
-        [
-            (2, "Es probable que de este modo,"),
-            (
-                3,
-                'puedan ir determinándose diferentes "tipos" dentro del trastorno en la actual denominación genérica.',
-            ),
-        ]
-    )
-
-    assert merge_count == 1
-    assert (
-        'Es probable que de este modo, puedan ir determinándose diferentes "tipos"'
-        in merged[0][1]
-    )
-    assert merged[1][1] == ""
-
-
-def test_ocr_page_continuation_does_not_merge_after_full_stop() -> None:
-    pipeline = DeepSeekOcrPipeline()
-
-    merged, merge_count = pipeline._merge_page_continuations(
-        [(1, "This paragraph is complete."), (2, "This starts a new paragraph.")]
-    )
-
-    assert merge_count == 0
-    assert merged[0][1] == "This paragraph is complete."
-    assert merged[1][1] == "This starts a new paragraph."
+from app.services.qwen_markdown_parser import QwenMarkdownParser
 
 
 def _block(block_id: str, text: str, y0: float, y1: float, x0: float = 50.0) -> Block:
@@ -463,16 +430,27 @@ def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
     assert translated_doc.blocks[1].text == ""
 
 
-def test_qwen_markdown_page_header_comments_are_suppressed_from_translation() -> None:
-    blocks = DeepSeekOcrPipeline()._blocks_from_markdown(
-        "**Repeated Article Title**\n\nBody text.\n\n<!-- page-header: Repeated Article Title -->",
+def test_qwen_markdown_parser_preserves_header_and_footer_text() -> None:
+    blocks = QwenMarkdownParser()._blocks_from_markdown(
+        "Repeated Article Title\n\nBody text.\n\nPage 2",
         page_number=2,
         start_order=0,
     )
 
-    assert blocks[0].block_type == BlockType.HEADER
-    assert blocks[0].metadata["running_header_footer_suppressed"] is True
     assert blocks[0].text == "Repeated Article Title"
-    assert blocks[1].block_type == BlockType.PARAGRAPH
-    assert blocks[2].block_type == BlockType.HEADER
-    assert blocks[2].metadata["ocr_markdown_comment_type"] == "page-header"
+    assert blocks[1].text == "Body text."
+    assert blocks[2].text == "Page 2"
+
+
+def test_translator_includes_header_and_footer_blocks() -> None:
+    header = _block("header", "Repeated Article Title", 20, 30).model_copy(update={"block_type": BlockType.HEADER})
+    footer = _block("footer", "Page 2", 760, 770).model_copy(update={"block_type": BlockType.FOOTER})
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1),
+        pages=[],
+        blocks=[header, footer],
+    )
+
+    chunks = MlxTranslator(TranslationSettings()).build_chunks(document)
+
+    assert [chunk.source_text for chunk in chunks] == ["Repeated Article Title", "Page 2"]

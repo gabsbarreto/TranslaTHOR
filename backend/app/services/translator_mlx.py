@@ -287,7 +287,7 @@ class MlxTranslator:
         for block in document.blocks:
             if self._is_marker_table_cell_block(block):
                 continue
-            if block.block_type in {BlockType.HEADER, BlockType.FOOTER} or not block.text.strip():
+            if not block.text.strip():
                 continue
 
             if block.block_type == BlockType.HEADING:

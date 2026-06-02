@@ -13,7 +13,7 @@ brew install cairo pango gdk-pixbuf libffi
 
 python3 -m venv .venv
 .venv/bin/python -m pip install -U pip
-.venv/bin/python -m pip install -e ".[mlx,deepseek_ocr,dev]"
+.venv/bin/python -m pip install -e ".[mlx,qwen_ocr,dev]"
 
 touch .env.local
 

@@ -13,7 +13,6 @@ from typing import Callable
 from app.models.schema import SourceType
 from app.config import BASE_DIR
 from app.services.markdown_builder import MarkdownBuilder as AppMarkdownBuilder
-from app.services.pdf_extraction.deepseek_fallback import DeepSeekFallbackOCR
 from app.services.pdf_extraction.local_vlm_service import LocalVLMRepairService
 from app.services.pdf_extraction.markdown_builder import MarkerDocumentBuilder
 from app.services.pdf_extraction.models import (
@@ -41,19 +40,16 @@ class PDFExtractor:
         detector: PDFTypeDetector | None = None,
         document_builder: MarkerDocumentBuilder | None = None,
         local_vlm_service: LocalVLMRepairService | None = None,
-        deepseek_fallback: DeepSeekFallbackOCR | None = None,
     ) -> None:
         self.detector = detector or PDFTypeDetector()
         self.document_builder = document_builder or MarkerDocumentBuilder()
         self.local_vlm_service = local_vlm_service or LocalVLMRepairService()
-        self.deepseek_fallback = deepseek_fallback or DeepSeekFallbackOCR()
 
     def extract(
         self,
         pdf_path: Path,
         mode: str = "auto",
         use_local_vlm_repair: bool = False,
-        use_deepseek_fallback: bool = False,
         keep_debug_artifacts: bool = False,
         job_dir: Path | None = None,
         timeout: int | None = None,
@@ -169,19 +165,11 @@ class PDFExtractor:
             else:
                 logger.info("Local VLM repair enabled: false")
 
-            deepseek_used = False
-            if use_deepseek_fallback or mode == "deepseek_fallback":
-                fallback_result = self.deepseek_fallback.repair_selected_blocks(document)
-                deepseek_used = fallback_result.used
-                warnings.extend(fallback_result.warnings)
-
             elapsed = time.perf_counter() - started
             logger.info("OCR used: %s", used_ocr)
             logger.info("Force OCR used: %s", used_force_ocr)
             logger.info("Existing OCR stripped: %s", stripped_existing_ocr)
             logger.info("Local VLM repair used: %s", repaired_count > 0)
-            logger.info("DeepSeek fallback enabled: %s", use_deepseek_fallback or mode == "deepseek_fallback")
-            logger.info("DeepSeek fallback used: %s", deepseek_used)
             logger.info("Pages processed: %s", len(document.pages))
             logger.info("Blocks extracted: %s", len(document.blocks))
             logger.info("Chunks created: %s", len(chunks))
@@ -203,7 +191,6 @@ class PDFExtractor:
                 used_force_ocr=used_force_ocr,
                 stripped_existing_ocr=stripped_existing_ocr,
                 used_local_vlm_repair=repaired_count > 0,
-                used_deepseek_fallback=deepseek_used,
                 warnings=warnings,
                 document=document,
             )
@@ -212,7 +199,7 @@ class PDFExtractor:
                 temp_context.cleanup()
 
     def _normalize_mode(self, mode: str) -> ExtractionMode:
-        allowed = {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair", "deepseek_fallback"}
+        allowed = {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair"}
         return mode if mode in allowed else "auto"  # type: ignore[return-value]
 
     def _select_marker_mode(self, mode: ExtractionMode, classification: str) -> MarkerMode:
@@ -222,7 +209,7 @@ class PDFExtractor:
             return "text_only"
         if mode == "scanned":
             return "force_ocr"
-        if mode in {"strip_and_force_ocr", "deepseek_fallback"}:
+        if mode == "strip_and_force_ocr":
             return "strip_existing_ocr_force_ocr"
         if classification == "digital_good_text":
             return "normal"

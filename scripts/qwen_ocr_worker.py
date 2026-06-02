@@ -112,8 +112,6 @@ class NoRepeatNGramLogitsProcessor:
 
 def normalise_prompt_for_chat_template(prompt_text: str) -> str:
     text = str(prompt_text).strip()
-    text = re.sub(r"^\s*<image>\s*", "", text)
-    text = text.replace("<|grounding|>", "")
     text = re.sub(r"\n{3,}", "\n\n", text)
     text = re.sub(r"[ \t]+", " ", text)
     return text.strip()
@@ -129,26 +127,14 @@ def build_ocr_chat_messages(system_prompt: str) -> list[dict[str, str]]:
 def clean_generated_text(text: str, prompt: str) -> str:
     text = str(text).strip()
     text = re.sub(r"(?is)<think>.*?</think>\s*", "", text)
-    text = re.sub(r"<\|ref\|>.*?<\|/ref\|>", "", text, flags=re.DOTALL)
-    text = re.sub(r"<\|det\|>.*?<\|/det\|>", "", text, flags=re.DOTALL)
     text = re.sub(r"<\|[^>]+?\|>", "", text)
 
-    lines = text.splitlines()
-    if lines and lines[0].strip() == "<image>":
-        lines = lines[1:]
-    if lines and _looks_like_echoed_prompt(lines[0]):
-        lines = lines[1:]
-        while lines and not lines[0].strip():
-            lines = lines[1:]
-    text = "\n".join(lines).strip()
-
     cleaned_prompt = normalise_prompt_for_chat_template(prompt)
-    return text.replace(prompt, "").replace(cleaned_prompt, "").strip()
-
-
-def _looks_like_echoed_prompt(line: str) -> bool:
-    lowered = line.lower()
-    return "convert" in lowered and ("markdown" in lowered or "document" in lowered)
+    for candidate in (prompt.strip(), cleaned_prompt):
+        if candidate and text.startswith(candidate):
+            text = text[len(candidate) :].lstrip()
+            break
+    return text.strip()
 
 
 def build_generation_prompt(

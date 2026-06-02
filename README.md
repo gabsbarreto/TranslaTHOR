@@ -1,72 +1,69 @@
 # Local PDF Translation App
 
-## 1) What The App Does
+## What It Does
 
-This app translates PDFs locally through a browser UI.
+This browser-based app translates PDFs locally.
 
-Pipeline summary:
-1. User uploads a PDF.
-2. The backend classifies the document (`digital_good_text`, `scanned_no_text`, `bad_hidden_ocr`, `mixed`, `unknown`).
-3. Marker is used as the default extractor/parser with the selected OCR mode.
-4. If extraction quality is poor (based on current rules), the Qwen full-page OCR fallback can be used.
-5. Extracted content is normalized into structured blocks/chunks and Markdown.
-6. Translation runs with the local MLX Qwen model.
-7. Outputs are saved as artifacts (`source.md`, `translated.md`, `structured.json`) and readable/faithful PDFs.
+1. The user uploads one or more PDFs.
+2. The backend classifies each document as `digital_good_text`, `scanned_no_text`, `bad_hidden_ocr`, `mixed`, or `unknown`.
+3. Marker extracts documents with usable embedded text.
+4. Qwen full-page OCR reads rendered page images when embedded text is poor or Marker extraction needs an OCR fallback.
+5. Extracted text is normalized into a shared structured document model.
+6. A local MLX Qwen model translates the document into English.
+7. Markdown, JSON, and readable or faithful PDF artifacts are available for download.
 
-## 2) Structure
+The OCR path preserves the text emitted by Qwen. It does not remove running headers, footers, page numbers, or margin metadata.
+
+## Structure
 
 ```text
 backend/
   app/
-    main.py                  # FastAPI routes and artifact endpoints
-    config.py                # Runtime settings/env wiring
-    models/                  # Pydantic schema models
+    main.py                         # FastAPI upload, queue, and artifact routes
+    config.py                       # Runtime settings and environment variables
+    models/schema.py                # Shared structured document model
     services/
-      pipeline.py            # Job pipeline orchestration
-      markdown_builder.py    # Structured document -> markdown
-      translator_mlx.py      # MLX Qwen translation logic
-      translation_worker.py  # Isolated translation subprocess worker
-      reconstructor.py       # Markdown -> HTML -> PDF
+      pipeline.py                   # Extraction and translation orchestration
+      translator_mlx.py             # MLX Qwen translation logic
+      translation_worker.py         # Isolated translation process
+      qwen_markdown_parser.py        # Qwen Markdown -> structured document
+      reconstructor.py              # Markdown -> HTML -> PDF
       pdf_extraction/
-        marker_extractor.py
-        pdf_type_detector.py
-        qwen_ocr_fallback.py
-        markdown_builder.py
-        local_vlm_service.py
-        deepseek_fallback.py
-        models.py
+        pdf_type_detector.py         # Embedded-text quality classification
+        marker_extractor.py          # Marker integration
+        markdown_builder.py          # Marker output -> structured document
+        qwen_ocr_fallback.py         # Full-page Qwen OCR integration
+scripts/
+  run_dev.sh
+  setup_local_runtime.sh
+  qwen_ocr_worker.py
 frontend/
   index.html
   app.js
   styles.css
-scripts/
-  setup_local_runtime.sh
-  run_dev.sh
-  qwen_ocr_worker.py
 tests/
-workspace/jobs/             # Per-job inputs/artifacts/log state
+workspace/jobs/                     # Per-job inputs and generated artifacts
 ```
 
-## 3) How To Run
+## Requirements
 
-Prerequisites:
 - Python 3.10+
-- Apple Silicon (for MLX runtime)
+- Apple Silicon for the MLX runtime
+- Homebrew packages installed by `scripts/setup_local_runtime.sh`
 
-Install:
+## Install
 
 ```bash
 bash scripts/setup_local_runtime.sh
-pip install -r requirements.txt
 ```
 
-For editable development installs, use:
+For an editable development install:
 
 ```bash
-pip install -e ".[mlx,deepseek_ocr,dev]"
+pip install -e ".[mlx,qwen_ocr,dev]"
 ```
 
-Install Marker in its own venv (recommended because of dependency differences):
+Install Marker in its own virtual environment:
 
 ```bash
 python -m venv .venv-marker
@@ -74,12 +71,19 @@ python -m venv .venv-marker
 .venv-marker/bin/python -m pip install "marker-pdf==1.10.2" "transformers<5" "regex<2025"
 ```
 
-Run app:
+## Run
 
 ```bash
 bash scripts/run_dev.sh
 ```
 
-Open:
-- `http://127.0.0.1:8000`
+Open `http://127.0.0.1:8000`.
 
+## Optional Environment Variables
+
+- `QWEN_OCR_PYTHON`: Python executable containing `mlx-vlm`.
+- `QWEN_OCR_MODEL`: Qwen OCR model identifier.
+- `QWEN_OCR_PROMPT`: OCR transcription prompt.
+- `MARKER_BIN`: Marker executable path.
+- `ENABLE_QWEN_OCR_FALLBACK`: Enable full-page Qwen OCR fallback.
+- `ENABLE_LOCAL_VLM_REPAIR`: Enable Marker block repair through the optional local VLM endpoint.

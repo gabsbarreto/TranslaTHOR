@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
 
 import pytest
@@ -11,7 +10,6 @@ from app.services.pdf_extraction.local_vlm_service import LocalVLMConfig, LocalV
 from app.services.pdf_extraction.markdown_builder import MarkerDocumentBuilder
 from app.services.pdf_extraction.marker_extractor import PDFExtractor
 from app.services.pdf_extraction.models import PDFTypeDetectionResult, PageTextStats
-from app.services.pdf_extraction.page_furniture import PageFurnitureCleanupConfig
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
 
@@ -131,7 +129,7 @@ if "--force_ocr" in sys.argv and os.environ.get("TORCH_DEVICE") != "cpu":
     assert any("retrying the same Marker OCR mode on CPU" in warning for warning in result.warnings)
 
 
-def test_marker_builder_suppresses_running_author_headers_misclassified_as_section_headers() -> None:
+def test_marker_builder_preserves_running_author_headers_misclassified_as_section_headers() -> None:
     detection = PDFTypeDetectionResult(
         classification="digital_good_text",
         page_count=3,
@@ -191,11 +189,9 @@ def test_marker_builder_suppresses_running_author_headers_misclassified_as_secti
     )
 
     running_header = next(block for block in document.blocks if "Rojas Contreras" in block.text)
-    assert running_header.block_type.value == "header"
-    assert running_header.metadata["running_header_footer_suppressed"] is True
-    assert "## 3 Rojas Contreras G, et al" not in markdown
-    assert "Rojas Contreras G, et al" not in markdown
-    assert all("Rojas Contreras" not in chunk.original_text for chunk in chunks)
+    assert running_header.block_type.value == "heading"
+    assert "## 3 Rojas Contreras G, et al" in markdown
+    assert any("Rojas Contreras" in chunk.original_text for chunk in chunks)
     assert "## INTRODUCCIÓN" in markdown
 
 
@@ -520,7 +516,6 @@ def test_qwen_fallback_uses_rendered_png_metadata_for_ocr_input(tmp_path: Path) 
     assert metadata["ocr_image_mode"] == "rendered_page_png"
     assert metadata["ocr_image_width"] == 400
     assert metadata["ocr_image_height"] == 200
-    assert metadata["ocr_raw_page_scale"] == 1.0
 
 
 def test_qwen_fallback_preserves_full_page_margins_before_ocr(tmp_path: Path) -> None:
@@ -544,48 +539,6 @@ def test_qwen_fallback_preserves_full_page_margins_before_ocr(tmp_path: Path) ->
         assert image.getpixel((0, 50))[0] < 60
         assert image.getpixel((99, 50))[0] < 60
     assert metadata["ocr_image_mode"] == "rendered_page_png"
-    assert metadata["ocr_margin_mask_enabled"] is False
-    assert "ocr_margin_mask" not in metadata
-
-
-def test_qwen_fallback_ignores_missing_legacy_python_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    fallback = QwenFullPageOCRFallback()
-    monkeypatch.delenv("QWEN_OCR_PYTHON", raising=False)
-    monkeypatch.setenv("DEEPSEEK_OCR_PYTHON", ".venv-deepseek-ocr/bin/python")
-
-    resolved = fallback._resolve_worker_python_executable()
-
-    assert resolved == sys.executable
-
-
-def test_qwen_fallback_uses_llm_metadata_with_heuristic_fallback(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fallback = QwenFullPageOCRFallback()
-
-    def fake_llm_metadata(*, text: str, markdown_dir: Path, settings: dict) -> dict:
-        assert "Journal of Testing Studies" in text
-        return {"title": "LLM Title", "authors": ["Jane Smith"], "doi": ""}
-
-    monkeypatch.setattr(fallback, "_run_metadata_extraction_worker", fake_llm_metadata)
-    metadata, source = fallback._extract_page_furniture_metadata(
-        pages=[
-            (
-                1,
-                "Journal of Testing Studies\n\nHeuristic Paper Title\n\nJane Smith\n\ndoi: 10.1234/example.2024",
-            )
-        ],
-        markdown_dir=tmp_path,
-        settings={"extract_document_metadata_with_llm": True},
-        config=PageFurnitureCleanupConfig(),
-    )
-
-    assert source == "llm"
-    assert metadata["title"] == "LLM Title"
-    assert metadata["first_author"] == "Smith"
-    assert metadata["journal"] == "Journal of Testing Studies"
-    assert metadata["doi"] == "10.1234/example.2024"
 
 
 def _page_stats(page_number: int) -> PageTextStats:
