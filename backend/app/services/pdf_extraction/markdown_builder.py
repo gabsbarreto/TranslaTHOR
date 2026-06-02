@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict
 from html.parser import HTMLParser
 from typing import Any
 
@@ -113,11 +112,6 @@ class MarkerDocumentBuilder:
         if not blocks and isinstance(marker_payload, str):
             blocks, chunks = self._fallback_blocks_from_markdown(marker_payload, detection, source_type)
         else:
-            suppressed_running_headers = self._suppress_running_headers_and_footers(blocks, detection)
-            if suppressed_running_headers:
-                warnings.append(
-                    f"Suppressed {suppressed_running_headers} running header/footer block(s) detected in page margins."
-                )
             chunks = self._chunks_from_blocks(blocks)
 
         pages = [
@@ -172,8 +166,6 @@ class MarkerDocumentBuilder:
     def _chunks_from_blocks(self, blocks: list[Block]) -> list[ExtractionChunk]:
         chunks: list[ExtractionChunk] = []
         for block in blocks:
-            if self._is_suppressed_running_marginalia(block):
-                continue
             if not block.text.strip():
                 continue
             chunks.append(
@@ -188,67 +180,6 @@ class MarkerDocumentBuilder:
                 )
             )
         return chunks
-
-    def _suppress_running_headers_and_footers(
-        self,
-        blocks: list[Block],
-        detection: PDFTypeDetectionResult,
-    ) -> int:
-        page_height_by_number = {page.page_number: page.height for page in detection.pages if page.height}
-        suppressed = 0
-        for block in blocks:
-            if not self._looks_like_running_header_footer(block, page_height_by_number):
-                continue
-            marker_type = str(block.metadata.get("marker_block_type", ""))
-            block.metadata["original_block_type"] = block.block_type.value
-            block.metadata["running_header_footer_suppressed"] = True
-            block.metadata["running_header_footer_reason"] = (
-                f"Marker emitted marginal {marker_type or 'block'} as content."
-            )
-            block.block_type = BlockType.HEADER if self._is_top_margin_block(block, page_height_by_number) else BlockType.FOOTER
-            suppressed += 1
-        return suppressed
-
-    def _looks_like_running_header_footer(self, block: Block, page_height_by_number: dict[int, float]) -> bool:
-        if block.page_number <= 1 or block.bbox is None:
-            return False
-        text = " ".join(block.text.split())
-        if not text:
-            return False
-        marker_type = str(block.metadata.get("marker_block_type", "")).lower()
-        if marker_type not in {"sectionheader", "pageheader", "pagefooter", "text"}:
-            return False
-        if not (self._is_top_margin_block(block, page_height_by_number) or self._is_bottom_margin_block(block, page_height_by_number)):
-            return False
-        if marker_type in {"pageheader", "pagefooter"}:
-            return True
-        return self._matches_running_header_text(text)
-
-    def _is_top_margin_block(self, block: Block, page_height_by_number: dict[int, float]) -> bool:
-        if block.bbox is None:
-            return False
-        page_height = page_height_by_number.get(block.page_number) or 0
-        return bool(page_height and block.bbox.y0 <= page_height * 0.07 and block.bbox.y1 <= page_height * 0.11)
-
-    def _is_bottom_margin_block(self, block: Block, page_height_by_number: dict[int, float]) -> bool:
-        if block.bbox is None:
-            return False
-        page_height = page_height_by_number.get(block.page_number) or 0
-        return bool(page_height and block.bbox.y1 >= page_height * 0.93)
-
-    def _matches_running_header_text(self, text: str) -> bool:
-        if len(text) > 140:
-            return False
-        if re.match(r"^\d+\s+\S.+\bet\s+al\.?$", text, flags=re.IGNORECASE):
-            return True
-        if re.match(r"^\d+\s+.+,\s*et\s+al\.?$", text, flags=re.IGNORECASE):
-            return True
-        if re.match(r"^\d+\s+[A-ZÁÉÍÓÚÑ][\wÁÉÍÓÚÜÑáéíóúüñ .'-]{2,80}$", text):
-            return True
-        return bool(re.search(r"\bdoi\s*:", text, flags=re.IGNORECASE) and re.search(r"\d{4};\s*\d+", text))
-
-    def _is_suppressed_running_marginalia(self, block: Block) -> bool:
-        return bool(block.metadata.get("running_header_footer_suppressed"))
 
     def _page_payloads(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
@@ -530,7 +461,3 @@ class _TableExtractor(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self.current_cell is not None:
             self.current_cell.append(data)
-
-
-def extraction_chunks_as_dicts(chunks: list[ExtractionChunk]) -> list[dict[str, Any]]:
-    return [asdict(chunk) for chunk in chunks]

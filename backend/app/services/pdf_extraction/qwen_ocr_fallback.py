@@ -33,43 +33,24 @@ from app.config import (
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
     DEFAULT_QWEN_OCR_TOP_P,
-    DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA,
-    DEFAULT_EXTRACT_DOCUMENT_METADATA,
-    DEFAULT_EXTRACT_DOCUMENT_METADATA_WITH_LLM,
-    DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS,
-    DEFAULT_METADATA_EXTRACTION_MAX_TOKENS,
-    DEFAULT_METADATA_EXTRACTION_MODEL,
-    DEFAULT_METADATA_EXTRACTION_TIMEOUT_SECONDS,
-    DEFAULT_METADATA_CLEANUP_BOTTOM_LINES,
-    DEFAULT_METADATA_CLEANUP_TOP_LINES,
-    DEFAULT_METADATA_SIMILARITY_THRESHOLD,
-    DEFAULT_PRESERVE_FIRST_PAGE_METADATA,
 )
 from app.models.schema import Block
-from app.services.deepseek_ocr_pipeline import DeepSeekOcrPipeline
-from app.services.markdown_builder import MarkdownBuilder as AppMarkdownBuilder
 from app.services.pdf_extraction.models import ExtractionChunk, PDFExtractionResult
-from app.services.pdf_extraction.page_furniture import (
-    PageFurnitureCleanupConfig,
-    clean_pages_with_metadata,
-    extract_document_metadata,
-    merge_document_metadata,
-)
 from app.services.pdf_inspector import PdfInspector
 from app.services.profiler import PipelineProfiler
+from app.services.qwen_markdown_parser import QwenMarkdownParser
 from app.services.renderer import PageRenderer
 
 logger = logging.getLogger(__name__)
 
 
 class QwenFullPageOCRFallback:
-    """Full-page Qwen VLM OCR fallback using the qwen-ocr branch image profile."""
+    """Render full PDF pages and preserve the Markdown emitted by Qwen OCR."""
 
     def __init__(self) -> None:
         self.inspector = PdfInspector()
         self.renderer = PageRenderer()
-        self.markdown_parser = DeepSeekOcrPipeline()
-        self.markdown_builder = AppMarkdownBuilder()
+        self.markdown_parser = QwenMarkdownParser()
 
     def extract(
         self,
@@ -91,18 +72,22 @@ class QwenFullPageOCRFallback:
         qwen_dir = job_dir / "qwen_ocr"
         render_dir = qwen_dir / "rendered_pages"
         markdown_dir = qwen_dir / "markdown"
-        for path in (render_dir, markdown_dir):
-            path.mkdir(parents=True, exist_ok=True)
+        render_dir.mkdir(parents=True, exist_ok=True)
+        markdown_dir.mkdir(parents=True, exist_ok=True)
 
         dpi = int(settings.get("qwen_ocr_dpi", DEFAULT_QWEN_OCR_DPI))
-
         image_paths: list[Path] = []
         output_names: list[str] = []
         image_metadata: list[dict] = []
         for page in inspection.pages:
             if cancel_requested is not None and cancel_requested():
                 raise RuntimeError("Cancelled by user")
-            with profiler.step("qwen_page_rendering", page=page.page_number) if profiler is not None else _nullcontext():
+            context = (
+                profiler.step("qwen_page_rendering", page=page.page_number)
+                if profiler is not None
+                else _nullcontext()
+            )
+            with context:
                 rendered = self.renderer.render_page(
                     pdf_path,
                     page.page_number,
@@ -113,8 +98,8 @@ class QwenFullPageOCRFallback:
                 )
             metadata = self._rendered_page_metadata(rendered)
             metadata.update({"page_number": page.page_number, "render_dpi": dpi})
-            image_metadata.append(metadata)
             image_paths.append(rendered)
+            image_metadata.append(metadata)
             output_names.append(f"page_{page.page_number:04d}")
 
         self._run_qwen_ocr(
@@ -127,49 +112,22 @@ class QwenFullPageOCRFallback:
             on_process_finished=on_process_finished,
             on_ocr_progress=on_ocr_progress,
         )
-        cleaned_page_metadata = self._clean_ocr_page_furniture(
-            markdown_dir=markdown_dir,
-            output_names=output_names,
-            settings=settings,
-        )
-
-        document, _marker_md = self.markdown_parser.build_document_from_markdown_dir(
+        document, markdown = self.markdown_parser.build_document_from_markdown_dir(
             inspection=inspection,
             markdown_dir=markdown_dir,
             profiler=profiler,
-            strict_page_files=False,
-            warning_message=(
-                "Parsed with Qwen 3.5 4B MLX-VLM full-page OCR fallback. "
-                "Page images were sent as raw rendered PNG pages."
-            ),
-            include_page_markers=False,
-            sanitize_ocr_markdown=True,
-            merge_page_continuations=True,
+            strict_page_files=True,
         )
-        document.metadata.translation.update(
-            {
-                "suppress_page_markers": True,
-                "ocr_markdown_sanitized": True,
-                "page_continuation_merge": True,
-            }
-        )
-        for block in document.blocks:
-            block.metadata.setdefault("parser", "qwen_full_page_ocr")
-        markdown = self.markdown_builder.build(document)
         chunks = self._chunks_from_blocks(document.blocks)
-        elapsed = time.perf_counter() - started
         marker_skipped = bool(marker_metadata.get("marker_skipped"))
         qwen_reason = (
             "PDF text-quality detection classified the document as poor text; Marker was skipped and Qwen full-page OCR was used."
             if marker_skipped
             else "Marker first pass did not classify the document as good digital text; Qwen full-page OCR fallback was used."
         )
-        warnings = [
-            *marker_warnings,
-            qwen_reason,
-            *document.warnings,
-        ]
+        warnings = [*marker_warnings, qwen_reason, *document.warnings]
         document.warnings = warnings
+        elapsed = time.perf_counter() - started
 
         return PDFExtractionResult(
             markdown=markdown,
@@ -185,9 +143,8 @@ class QwenFullPageOCRFallback:
                 "force_ocr": False,
                 "strip_existing_ocr": False,
                 "qwen_ocr_model": str(settings.get("qwen_ocr_model", DEFAULT_QWEN_OCR_MODEL)),
-                "qwen_ocr_temperature": float(
-                    settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE)
-                ),
+                "qwen_ocr_max_tokens": int(settings.get("qwen_ocr_max_tokens", DEFAULT_QWEN_OCR_MAX_TOKENS)),
+                "qwen_ocr_temperature": float(settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE)),
                 "qwen_ocr_top_p": float(settings.get("qwen_ocr_top_p", DEFAULT_QWEN_OCR_TOP_P)),
                 "qwen_ocr_top_k": int(settings.get("qwen_ocr_top_k", DEFAULT_QWEN_OCR_TOP_K)),
                 "qwen_ocr_min_p": float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P)),
@@ -197,11 +154,18 @@ class QwenFullPageOCRFallback:
                 "qwen_ocr_repetition_penalty": float(
                     settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY)
                 ),
+                "qwen_ocr_prompt": str(settings.get("qwen_ocr_prompt", DEFAULT_QWEN_OCR_PROMPT)),
                 "qwen_ocr_dpi": dpi,
-                "qwen_ocr_image_mode": "rendered_page_png",
                 "qwen_ocr_batch_size": int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)),
-                "ocr_document_metadata": cleaned_page_metadata["metadata"],
-                "page_furniture_cleanup": cleaned_page_metadata["cleanup"],
+                "qwen_ocr_crop_mode": bool(settings.get("qwen_ocr_crop_mode", DEFAULT_QWEN_OCR_CROP_MODE)),
+                "qwen_ocr_min_crops": int(settings.get("qwen_ocr_min_crops", DEFAULT_QWEN_OCR_MIN_CROPS)),
+                "qwen_ocr_max_crops": int(settings.get("qwen_ocr_max_crops", DEFAULT_QWEN_OCR_MAX_CROPS)),
+                "qwen_ocr_base_size": int(settings.get("qwen_ocr_base_size", DEFAULT_QWEN_OCR_BASE_SIZE)),
+                "qwen_ocr_image_size": int(settings.get("qwen_ocr_image_size", DEFAULT_QWEN_OCR_IMAGE_SIZE)),
+                "qwen_ocr_skip_repeat": bool(settings.get("qwen_ocr_skip_repeat", DEFAULT_QWEN_OCR_SKIP_REPEAT)),
+                "qwen_ocr_ngram_size": int(settings.get("qwen_ocr_ngram_size", DEFAULT_QWEN_OCR_NGRAM_SIZE)),
+                "qwen_ocr_ngram_window": int(settings.get("qwen_ocr_ngram_window", DEFAULT_QWEN_OCR_NGRAM_WINDOW)),
+                "qwen_ocr_image_mode": "rendered_page_png",
                 "qwen_ocr_image_metadata": image_metadata,
                 "qwen_ocr_output_dir": str(qwen_dir),
                 "marker_first_pass": marker_metadata,
@@ -214,143 +178,9 @@ class QwenFullPageOCRFallback:
             used_force_ocr=False,
             stripped_existing_ocr=False,
             used_local_vlm_repair=False,
-            used_deepseek_fallback=False,
             warnings=warnings,
             document=document,
         )
-
-    def _clean_ocr_page_furniture(
-        self,
-        *,
-        markdown_dir: Path,
-        output_names: list[str],
-        settings: dict,
-    ) -> dict:
-        config = PageFurnitureCleanupConfig(
-            extract_document_metadata=bool(settings.get("extract_document_metadata", DEFAULT_EXTRACT_DOCUMENT_METADATA)),
-            clean_page_furniture_with_metadata=bool(
-                settings.get("clean_page_furniture_with_metadata", DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA)
-            ),
-            top_lines=int(settings.get("metadata_cleanup_top_lines", DEFAULT_METADATA_CLEANUP_TOP_LINES)),
-            bottom_lines=int(settings.get("metadata_cleanup_bottom_lines", DEFAULT_METADATA_CLEANUP_BOTTOM_LINES)),
-            similarity_threshold=float(
-                settings.get("metadata_similarity_threshold", DEFAULT_METADATA_SIMILARITY_THRESHOLD)
-            ),
-            preserve_first_page_metadata=bool(
-                settings.get("preserve_first_page_metadata", DEFAULT_PRESERVE_FIRST_PAGE_METADATA)
-            ),
-        )
-        pages: list[tuple[int, str]] = []
-        page_paths: list[Path] = []
-        for index, output_name in enumerate(output_names, start=1):
-            path = markdown_dir / f"{output_name}.md"
-            if path.exists():
-                pages.append((index, path.read_text(encoding="utf-8")))
-                page_paths.append(path)
-
-        metadata, metadata_source = self._extract_page_furniture_metadata(
-            pages=pages,
-            markdown_dir=markdown_dir,
-            settings=settings,
-            config=config,
-        )
-        cleaned_pages, metadata = clean_pages_with_metadata(pages, config, metadata=metadata)
-        changed_pages: list[int] = []
-        for (page_number, original), (_cleaned_page_number, cleaned), path in zip(pages, cleaned_pages, page_paths):
-            if cleaned != original:
-                path.write_text(cleaned, encoding="utf-8")
-                changed_pages.append(page_number)
-
-        return {
-            "metadata": metadata,
-            "cleanup": {
-                "extract_document_metadata": config.extract_document_metadata,
-                "clean_page_furniture_with_metadata": config.clean_page_furniture_with_metadata,
-                "metadata_cleanup_top_lines": config.top_lines,
-                "metadata_cleanup_bottom_lines": config.bottom_lines,
-                "metadata_similarity_threshold": config.similarity_threshold,
-                "preserve_first_page_metadata": config.preserve_first_page_metadata,
-                "metadata_source": metadata_source,
-                "metadata_extraction_model": str(
-                    settings.get("metadata_extraction_model", DEFAULT_METADATA_EXTRACTION_MODEL)
-                )
-                if metadata_source == "llm"
-                else "",
-                "changed_pages": changed_pages,
-            },
-        }
-
-    def _extract_page_furniture_metadata(
-        self,
-        *,
-        pages: list[tuple[int, str]],
-        markdown_dir: Path,
-        settings: dict,
-        config: PageFurnitureCleanupConfig,
-    ) -> tuple[dict, str]:
-        if not config.extract_document_metadata:
-            return {}, "disabled"
-
-        text = self._metadata_source_text(pages)
-        heuristic_metadata = extract_document_metadata(text)
-        if not bool(settings.get("extract_document_metadata_with_llm", DEFAULT_EXTRACT_DOCUMENT_METADATA_WITH_LLM)):
-            return heuristic_metadata, "heuristic"
-
-        llm_metadata = self._run_metadata_extraction_worker(text=text, markdown_dir=markdown_dir, settings=settings)
-        if llm_metadata is None:
-            return heuristic_metadata, "heuristic_fallback"
-        return merge_document_metadata(llm_metadata, heuristic_metadata), "llm"
-
-    def _metadata_source_text(self, pages: list[tuple[int, str]]) -> str:
-        combined_text = "\n\n".join(markdown for _page_number, markdown in pages)
-        first_page_text = pages[0][1] if pages else ""
-        return f"{first_page_text}\n\n{combined_text}" if first_page_text else combined_text
-
-    def _run_metadata_extraction_worker(self, *, text: str, markdown_dir: Path, settings: dict) -> dict | None:
-        input_path = markdown_dir.parent / "metadata_extraction_input.txt"
-        output_path = markdown_dir.parent / "metadata_extraction.json"
-        input_text = text[: int(settings.get("metadata_extraction_max_input_chars", DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS))]
-        input_path.write_text(input_text, encoding="utf-8")
-        worker = Path(os.getenv("METADATA_EXTRACTION_WORKER", str(BASE_DIR / "scripts" / "extract_metadata_worker.py")))
-        cmd = [
-            self._resolve_text_worker_python_executable(),
-            str(worker),
-            "--model",
-            str(settings.get("metadata_extraction_model", DEFAULT_METADATA_EXTRACTION_MODEL)),
-            "--input",
-            str(input_path),
-            "--output",
-            str(output_path),
-            "--max-input-chars",
-            str(int(settings.get("metadata_extraction_max_input_chars", DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS))),
-            "--max-tokens",
-            str(int(settings.get("metadata_extraction_max_tokens", DEFAULT_METADATA_EXTRACTION_MAX_TOKENS))),
-        ]
-        try:
-            process = subprocess.run(
-                cmd,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=int(
-                    settings.get(
-                        "metadata_extraction_timeout_seconds",
-                        DEFAULT_METADATA_EXTRACTION_TIMEOUT_SECONDS,
-                    )
-                ),
-                check=False,
-            )
-        except Exception as exc:
-            logger.warning("LLM metadata extraction could not start; using heuristic metadata: %s", exc)
-            return None
-        if process.returncode != 0:
-            logger.warning("LLM metadata extraction failed; using heuristic metadata: %s", process.stderr[-1200:])
-            return None
-        try:
-            return json.loads(output_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            logger.warning("LLM metadata extraction produced invalid JSON; using heuristic metadata: %s", exc)
-            return None
 
     def _run_qwen_ocr(
         self,
@@ -364,10 +194,9 @@ class QwenFullPageOCRFallback:
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         on_ocr_progress: Callable[[dict], None] | None,
     ) -> None:
-        python_executable = self._resolve_worker_python_executable()
         worker = Path(os.getenv("QWEN_OCR_WORKER", str(BASE_DIR / "scripts" / "qwen_ocr_worker.py")))
         cmd = [
-            python_executable,
+            self._resolve_worker_python_executable(),
             str(worker),
             "--model",
             str(settings.get("qwen_ocr_model", DEFAULT_QWEN_OCR_MODEL)),
@@ -386,20 +215,9 @@ class QwenFullPageOCRFallback:
             "--min-p",
             str(float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P))),
             "--presence-penalty",
-            str(
-                float(
-                    settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY)
-                )
-            ),
+            str(float(settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY))),
             "--repetition-penalty",
-            str(
-                float(
-                    settings.get(
-                        "qwen_ocr_repetition_penalty",
-                        DEFAULT_QWEN_OCR_REPETITION_PENALTY,
-                    )
-                )
-            ),
+            str(float(settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY))),
             "--prompt",
             str(settings.get("qwen_ocr_prompt", DEFAULT_QWEN_OCR_PROMPT)),
             "--crop-mode",
@@ -427,7 +245,6 @@ class QwenFullPageOCRFallback:
             "--names-json",
             json.dumps(output_names),
         ]
-
         try:
             process = subprocess.Popen(
                 cmd,
@@ -437,9 +254,7 @@ class QwenFullPageOCRFallback:
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
-            raise RuntimeError(
-                "Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON."
-            ) from exc
+            raise RuntimeError("Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON.") from exc
 
         if on_process_started is not None:
             on_process_started(process)
@@ -456,61 +271,38 @@ class QwenFullPageOCRFallback:
             raise RuntimeError(f"Qwen OCR failed: {(stderr or stdout)[-2000:]}")
 
     def _resolve_worker_python_executable(self) -> str:
-        qwen_python = os.getenv("QWEN_OCR_PYTHON")
-        if qwen_python:
-            qwen_path = Path(qwen_python).expanduser()
-            if qwen_path.exists():
-                return str(qwen_path)
-            logger.warning("Ignoring QWEN_OCR_PYTHON because it does not exist: %s", qwen_python)
-
-        # Backward-compatible fallback for older environments that still define this variable.
-        legacy_python = os.getenv("DEEPSEEK_OCR_PYTHON")
-        if legacy_python:
-            legacy_path = Path(legacy_python).expanduser()
-            if legacy_path.exists():
-                return str(legacy_path)
-            logger.warning(
-                "Ignoring DEEPSEEK_OCR_PYTHON because it does not exist: %s",
-                legacy_python,
-            )
-
+        configured = os.getenv("QWEN_OCR_PYTHON")
+        if not configured:
+            return sys.executable
+        path = Path(configured).expanduser()
+        if path.exists():
+            return str(path)
+        logger.warning("Ignoring QWEN_OCR_PYTHON because it does not exist: %s", configured)
         return sys.executable
 
-    def _resolve_text_worker_python_executable(self) -> str:
-        metadata_python = os.getenv("METADATA_EXTRACTION_PYTHON")
-        if metadata_python:
-            metadata_path = Path(metadata_python).expanduser()
-            if metadata_path.exists():
-                return str(metadata_path)
-            logger.warning("Ignoring METADATA_EXTRACTION_PYTHON because it does not exist: %s", metadata_python)
-        return sys.executable
-
-    def _ocr_worker_line_handler(self, on_ocr_progress: Callable[[dict], None] | None) -> Callable[[str], None]:
+    def _ocr_worker_line_handler(self, callback: Callable[[dict], None] | None) -> Callable[[str], None]:
         def handle(line: str) -> None:
             stripped = line.strip()
             if not stripped:
                 return
-            if '"event"' not in line:
-                logger.info("Qwen OCR worker: %s", stripped)
+            logger.info("Qwen OCR worker: %s", stripped)
+            if callback is None or '"event"' not in line:
                 return
             try:
-                event = json.loads(line)
+                callback(json.loads(line))
             except json.JSONDecodeError:
-                logger.info("Qwen OCR worker: %s", stripped)
                 return
-            logger.info("Qwen OCR worker: %s", stripped)
-            if on_ocr_progress is not None:
-                on_ocr_progress(event)
 
         return handle
 
     def _communicate_with_cancel(
         self,
         process: subprocess.Popen,
+        *,
         cancel_requested: Callable[[], bool] | None,
         on_stdout_line: Callable[[str], None],
     ) -> tuple[str, str]:
-        result: dict[str, str] = {"stdout": "", "stderr": ""}
+        result = {"stdout": "", "stderr": ""}
 
         def target() -> None:
             stdout_chunks: list[str] = []
@@ -518,10 +310,9 @@ class QwenFullPageOCRFallback:
             for line in process.stdout:
                 stdout_chunks.append(line)
                 on_stdout_line(line)
-            stderr = process.stderr.read() if process.stderr is not None else ""
+            result["stderr"] = process.stderr.read() if process.stderr is not None else ""
             process.wait()
             result["stdout"] = "".join(stdout_chunks)
-            result["stderr"] = stderr
 
         thread = threading.Thread(target=target, daemon=True)
         thread.start()
@@ -542,15 +333,12 @@ class QwenFullPageOCRFallback:
                 "original_height": image.height,
                 "ocr_image_width": image.width,
                 "ocr_image_height": image.height,
-                "ocr_raw_page_scale": 1.0,
-                "ocr_margin_mask_enabled": False,
             }
 
     def _chunks_from_blocks(self, blocks: list[Block]) -> list[ExtractionChunk]:
         chunks: list[ExtractionChunk] = []
         for index, block in enumerate(blocks, start=1):
-            text = block.text.strip()
-            if not text:
+            if not block.text.strip():
                 continue
             chunks.append(
                 ExtractionChunk(
@@ -560,7 +348,7 @@ class QwenFullPageOCRFallback:
                     block_type=block.block_type.value,
                     bbox=block.bbox.model_dump() if block.bbox else None,
                     polygon=None,
-                    original_text=text,
+                    original_text=block.text.strip(),
                 )
             )
         return chunks

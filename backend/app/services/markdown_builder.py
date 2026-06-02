@@ -14,23 +14,19 @@ class MarkdownBuilder:
 
         lines: list[str] = []
         page = 0
-        suppress_page_markers = bool(document.metadata.translation.get("suppress_page_markers"))
         tables_by_page: dict[int, list] = {}
         for table in document.tables:
             for page_number in table.page_numbers:
                 tables_by_page.setdefault(page_number, []).append(table)
         rendered_tables: set[str] = set()
         for block in document.blocks:
-            if self._is_suppressed_running_marginalia(block):
-                continue
             if self._is_marker_table_cell(block):
                 continue
             if block.block_type != BlockType.TABLE and not block.text.strip():
                 continue
             if block.page_number != page:
                 page = block.page_number
-                if not suppress_page_markers:
-                    lines.append(f"\n<!-- page: {page} -->\n")
+                lines.append(f"\n<!-- page: {page} -->\n")
 
             if block.block_type == BlockType.HEADING:
                 lines.append(f"## {block.text}\n")
@@ -121,15 +117,6 @@ class MarkdownBuilder:
     def _is_marker_table_cell(self, block) -> bool:
         metadata = getattr(block, "metadata", {}) or {}
         return str(metadata.get("marker_block_type", "")).lower() == "tablecell"
-
-    def _is_suppressed_running_marginalia(self, block) -> bool:
-        metadata = getattr(block, "metadata", {}) or {}
-        return bool(metadata.get("running_header_footer_suppressed"))
-
-    def _table_block_markdown(self, text: str) -> str:
-        # Marker table blocks can arrive as plain cell text; keep them visually separate even when
-        # the full row/column geometry is unavailable.
-        return f"\n<div class=\"table-block\">\n\n{text}\n\n</div>\n"
 
     def _escape_table_cell(self, text: str) -> str:
         return str(text).replace("\n", "<br>").replace("|", "\\|").strip()

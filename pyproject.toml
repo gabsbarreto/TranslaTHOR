@@ -1,7 +1,7 @@
 [project]
 name = "local-pdf-translator"
 version = "0.1.0"
-description = "Local browser-based PDF translation app with DeepSeek OCR and MLX translation"
+description = "Local browser-based PDF translation app with Qwen OCR and MLX translation"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -23,7 +23,7 @@ dependencies = [
 mlx = [
   "mlx-lm>=0.31.0",
 ]
-deepseek_ocr = [
+qwen_ocr = [
   "mlx-vlm>=0.4.4",
 ]
 marker = [

@@ -47,12 +47,7 @@
       <section class="panel marker-progress-panel">
         <div class="queue-head">
           <h2>Automated Extraction / Translation</h2>
-          <div class="queue-actions">
-            <button id="parseTranslateBtn" type="button" hidden>Start</button>
-            <button id="clearStagedBtn" class="secondary-button" type="button" hidden>Clear Staged</button>
-          </div>
         </div>
-        <div id="stagedQueue" hidden></div>
         <ol id="workflowSteps" class="workflow-steps">
           <li data-step="upload">Upload</li>
           <li data-step="select">Detect PDF type</li>
@@ -60,34 +55,7 @@
           <li data-step="translate">Translate</li>
           <li data-step="export">Export</li>
         </ol>
-        <p id="regionStatus" class="sub">No active document.</p>
-      </section>
-
-      <section class="panel region-panel legacy-panel" hidden>
-        <div class="queue-head">
-          <h2>Legacy Manual OCR Pipeline</h2>
-        </div>
-        <div class="region-toolbar">
-          <button id="prevPageBtn" class="secondary-button" type="button">Previous Page</button>
-          <button id="nextPageBtn" class="secondary-button" type="button">Next Page</button>
-          <button id="saveBoxesBtn" class="secondary-button" type="button">Save boxes</button>
-          <button id="reloadSavedBoxesBtn" class="secondary-button" type="button" hidden>Reload saved boxes</button>
-          <button id="useFullPageBtn" class="secondary-button" type="button">Use full page</button>
-          <button id="addBoxBtn" type="button">Add region</button>
-          <button id="drawRegionModeBtn" class="secondary-button" type="button">Draw region: Off</button>
-        </div>
-        <div class="workflow-actions">
-          <button id="startSelectedModeBtn" type="button" hidden>Translate now</button>
-        </div>
-        <div class="region-layout">
-          <div class="canvas-wrap">
-            <div id="regionCanvas"></div>
-          </div>
-          <aside class="region-sidebar">
-            <h3>OCR Regions</h3>
-            <div id="boxList" class="box-list"></div>
-          </aside>
-        </div>
+        <p id="workflowStatus" class="sub">No active document.</p>
       </section>
 
       <section class="panel queue-panel">
@@ -103,7 +71,6 @@
       </section>
     </main>
 
-    <script src="https://unpkg.com/konva@9.3.15/konva.min.js"></script>
-    <script src="/app.js?v=20260505-marker-auto" defer></script>
+    <script src="/app.js?v=20260602-lean" defer></script>
   </body>
 </html>

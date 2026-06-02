@@ -25,10 +25,10 @@ def test_qwen_worker_strips_thinking_and_prompt_echo() -> None:
     assert cleaned == "# Result"
 
 
-def test_qwen_worker_normalises_deepseek_image_prompt_tokens() -> None:
+def test_qwen_worker_normalises_prompt_whitespace() -> None:
     worker = _load_worker_module()
 
-    prompt = worker.normalise_prompt_for_chat_template("<image>\n<|grounding|>Convert the document to markdown.")
+    prompt = worker.normalise_prompt_for_chat_template("  Convert   the document to markdown.  ")
 
     assert prompt == "Convert the document to markdown."
 
@@ -45,7 +45,7 @@ def test_qwen_worker_uses_ocr_prompt_as_system_message() -> None:
     formatted = worker.build_generation_prompt(
         processor=object(),
         config={"model_type": "qwen3_5"},
-        system_prompt="<image>\n<|grounding|>Convert the document to markdown.",
+        system_prompt="Convert the document to markdown.",
         apply_chat_template=fake_apply_chat_template,
         enable_thinking=False,
     )

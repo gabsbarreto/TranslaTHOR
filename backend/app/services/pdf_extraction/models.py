@@ -20,7 +20,6 @@ ExtractionMode = Literal[
     "scanned",
     "strip_and_force_ocr",
     "auto_repair",
-    "deepseek_fallback",
 ]
 
 MarkerMode = Literal["normal", "text_only", "force_ocr", "strip_existing_ocr_force_ocr"]
@@ -89,6 +88,5 @@ class PDFExtractionResult:
     used_force_ocr: bool
     stripped_existing_ocr: bool
     used_local_vlm_repair: bool
-    used_deepseek_fallback: bool
     warnings: list[str] = field(default_factory=list)
     document: DocumentModel | None = None

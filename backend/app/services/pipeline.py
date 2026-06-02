@@ -26,11 +26,9 @@ from app.config import (
 from app.models.schema import DocumentModel
 from app.models.schema import JobStage
 from app.services.job_store import JobStore
-from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction import PDFExtractor
 from app.services.pdf_extraction.models import PDFTypeDetectionResult
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
-from app.services.pdf_inspector import PdfInspector
 from app.services.profiler import PipelineProfiler
 from app.services.translation_debug import write_translation_comparison_report
 from app.services.translation_subprocess import run_translation_subprocess
@@ -41,10 +39,8 @@ logger = logging.getLogger(__name__)
 class TranslationPipeline:
     def __init__(self, job_store: JobStore) -> None:
         self.job_store = job_store
-        self.inspector = PdfInspector()
         self.pdf_extractor = PDFExtractor()
         self.qwen_ocr_fallback = QwenFullPageOCRFallback()
-        self.md_builder = MarkdownBuilder()
         self._lock = threading.RLock()
         self._cancelled_jobs: set[str] = set()
         self._active_processes: dict[str, list[subprocess.Popen]] = {}
@@ -67,9 +63,9 @@ class TranslationPipeline:
             logger.info("Cancelled job %s disappeared before status update", job_id)
 
     def run(self, job_id: str, pdf_path: Path, settings: dict) -> None:
-        self._run_marker_pipeline(job_id, pdf_path, settings)
+        self._run_pipeline(job_id, pdf_path, settings)
 
-    def _run_marker_pipeline(self, job_id: str, pdf_path: Path, settings: dict) -> None:
+    def _run_pipeline(self, job_id: str, pdf_path: Path, settings: dict) -> None:
         profile_enabled = bool(settings.get("profile_pipeline", False))
         profiler = PipelineProfiler(enabled=profile_enabled)
         job_dir = self.job_store.get_job_dir(job_id)
@@ -175,7 +171,6 @@ class TranslationPipeline:
                         pdf_path=pdf_path,
                         mode=extraction_mode,
                         use_local_vlm_repair=bool(settings.get("use_local_vlm_repair", ENABLE_LOCAL_VLM_REPAIR)),
-                        use_deepseek_fallback=False,
                         keep_debug_artifacts=keep_debug_artifacts,
                         job_dir=job_dir,
                         timeout=int(settings.get("marker_timeout_seconds", MARKER_TIMEOUT_SECONDS)),
@@ -285,7 +280,6 @@ class TranslationPipeline:
                     "used_force_ocr": result.used_force_ocr,
                     "stripped_existing_ocr": result.stripped_existing_ocr,
                     "used_local_vlm_repair": result.used_local_vlm_repair,
-                    "used_deepseek_fallback": result.used_deepseek_fallback,
                     "warnings": result.warnings,
                 }
                 extraction_json_path.write_text(json.dumps(extraction_payload, indent=2), encoding="utf-8")
@@ -317,7 +311,6 @@ class TranslationPipeline:
                     "force_ocr": result.used_force_ocr,
                     "strip_existing_ocr": result.stripped_existing_ocr,
                     "local_vlm_repair_used": result.used_local_vlm_repair,
-                    "deepseek_fallback_used": result.used_deepseek_fallback,
                     "extraction_time_seconds": result.metadata.get("extraction_time_seconds"),
                     "warnings": result.warnings,
                 },
@@ -415,7 +408,6 @@ class TranslationPipeline:
                     "force_ocr": result.used_force_ocr,
                     "strip_existing_ocr": result.stripped_existing_ocr,
                     "local_vlm_repair_used": result.used_local_vlm_repair,
-                    "deepseek_fallback_used": result.used_deepseek_fallback,
                     "extraction_time_seconds": result.metadata.get("extraction_time_seconds"),
                     "warnings": result.warnings,
                 },
@@ -495,13 +487,6 @@ class TranslationPipeline:
         except FileNotFoundError:
             logger.info("Job %s no longer exists; stopping background work", job_id)
             return False
-
-    def _write_decision_debug(self, job_id: str, reasons: dict[int, str]) -> None:
-        job_dir = self.job_store.get_job_dir(job_id)
-        debug_path = job_dir / "artifacts" / "extraction_decisions.json"
-        debug_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {str(page): reason for page, reason in sorted(reasons.items())}
-        debug_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def _register_process(self, job_id: str, process: subprocess.Popen) -> None:
         with self._lock:

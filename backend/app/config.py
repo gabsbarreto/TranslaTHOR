@@ -11,9 +11,8 @@ FRONTEND_DIR = BASE_DIR / "frontend"
 DEFAULT_DPI = 300
 DEFAULT_CHUNK_SIZE = 1800
 DEFAULT_TRANSLATION_CHUNK_GROUP_SIZE = int(os.getenv("TRANSLATION_CHUNK_GROUP_SIZE", "5"))
-DEFAULT_RENDER_STRATEGY = "pre_render_all"
 DEFAULT_OUTPUT_MODE = "readable"
-DEFAULT_QWEN_OCR_MODEL = os.getenv("QWEN_OCR_MODEL", "mlx-community/Qwen3.5-2B-8bit")
+DEFAULT_QWEN_OCR_MODEL = os.getenv("QWEN_OCR_MODEL", "mlx-community/Qwen3.5-4B-4bit")
 DEFAULT_QWEN_OCR_MAX_TOKENS = int(os.getenv("QWEN_OCR_MAX_TOKENS", "4096"))
 DEFAULT_QWEN_OCR_PROMPT = os.getenv(
     "QWEN_OCR_PROMPT",
@@ -27,11 +26,8 @@ Rules:
 - Preserve visual reading order: left column top-to-bottom, then right column.
 - Join wrapped lines into paragraphs.
 - Reconstruct hyphenated line-breaks, e.g. "forma-\\nción" → "formación".
-- Use Markdown headings for real headings.
 - Convert tables into valid Markdown tables.
 - Keep captions near their figures/tables.
-- Exclude page furniture: running headers, footers, page numbers, margin metadata.
-- Keep real content: body headings, article titles, captions, tables, footnotes.
 - If a page ends in a hyphenated line break, do not try to guess and finish the word. It should continue on the next page.
 - Return only Markdown."""
     ),
@@ -46,23 +42,6 @@ DEFAULT_QWEN_OCR_IMAGE_SIZE = int(os.getenv("QWEN_OCR_IMAGE_SIZE", "768"))
 DEFAULT_QWEN_OCR_SKIP_REPEAT = os.getenv("QWEN_OCR_SKIP_REPEAT", "true").lower() in {"1", "true", "yes"}
 DEFAULT_QWEN_OCR_NGRAM_SIZE = int(os.getenv("QWEN_OCR_NGRAM_SIZE", "20"))
 DEFAULT_QWEN_OCR_NGRAM_WINDOW = int(os.getenv("QWEN_OCR_NGRAM_WINDOW", "90"))
-DEFAULT_EXTRACT_DOCUMENT_METADATA = os.getenv("EXTRACT_DOCUMENT_METADATA", "true").lower() in {"1", "true", "yes"}
-DEFAULT_EXTRACT_DOCUMENT_METADATA_WITH_LLM = (
-    os.getenv("EXTRACT_DOCUMENT_METADATA_WITH_LLM", "true").lower() in {"1", "true", "yes"}
-)
-DEFAULT_METADATA_EXTRACTION_MODEL = os.getenv("METADATA_EXTRACTION_MODEL", "mlx-community/Qwen3.5-9B-MLX-4bit")
-DEFAULT_METADATA_EXTRACTION_MAX_INPUT_CHARS = int(os.getenv("METADATA_EXTRACTION_MAX_INPUT_CHARS", "12000"))
-DEFAULT_METADATA_EXTRACTION_MAX_TOKENS = int(os.getenv("METADATA_EXTRACTION_MAX_TOKENS", "700"))
-DEFAULT_METADATA_EXTRACTION_TIMEOUT_SECONDS = int(os.getenv("METADATA_EXTRACTION_TIMEOUT_SECONDS", "240"))
-DEFAULT_CLEAN_PAGE_FURNITURE_WITH_METADATA = (
-    os.getenv("CLEAN_PAGE_FURNITURE_WITH_METADATA", "true").lower() in {"1", "true", "yes"}
-)
-DEFAULT_METADATA_CLEANUP_TOP_LINES = int(os.getenv("METADATA_CLEANUP_TOP_LINES", "5"))
-DEFAULT_METADATA_CLEANUP_BOTTOM_LINES = int(os.getenv("METADATA_CLEANUP_BOTTOM_LINES", "5"))
-DEFAULT_METADATA_SIMILARITY_THRESHOLD = float(os.getenv("METADATA_SIMILARITY_THRESHOLD", "0.85"))
-DEFAULT_PRESERVE_FIRST_PAGE_METADATA = (
-    os.getenv("PRESERVE_FIRST_PAGE_METADATA", "true").lower() in {"1", "true", "yes"}
-)
 DEFAULT_LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.4"))
 DEFAULT_LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.7"))
 DEFAULT_LLM_TOP_K = int(os.getenv("LLM_TOP_K", "10"))
@@ -86,8 +65,6 @@ AVAILABLE_TRANSLATION_MODELS = [
     DEFAULT_TRANSLATION_MODEL,
 ]
 
-ENABLE_MARKER_PIPELINE = os.getenv("ENABLE_MARKER_PIPELINE", "true").lower() in {"1", "true", "yes"}
-ENABLE_LEGACY_VISUAL_OCR = os.getenv("ENABLE_LEGACY_VISUAL_OCR", "false").lower() in {"1", "true", "yes"}
 ENABLE_LOCAL_VLM_REPAIR = os.getenv("ENABLE_LOCAL_VLM_REPAIR", "false").lower() in {"1", "true", "yes"}
 ENABLE_QWEN_OCR_FALLBACK = os.getenv("ENABLE_QWEN_OCR_FALLBACK", "true").lower() in {"1", "true", "yes"}
 KEEP_EXTRACTION_DEBUG_ARTIFACTS = os.getenv("KEEP_EXTRACTION_DEBUG_ARTIFACTS", "false").lower() in {"1", "true", "yes"}

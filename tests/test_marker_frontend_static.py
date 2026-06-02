@@ -9,11 +9,9 @@ INDEX_HTML = (ROOT / "frontend" / "index.html").read_text(encoding="utf-8")
 
 
 def test_upload_defaults_to_automatic_marker_submission() -> None:
-    upload_body = APP_JS.split("async function handleUploadedFiles", 1)[1].split("function stageFiles", 1)[0]
+    upload_body = APP_JS.split("async function handleUploadedFiles", 1)[1].split("async function submitUploadBatch", 1)[0]
 
-    assert "submitUploadBatch(uploadItems)" in upload_body
-    assert "openRegionFromFile(pdfFiles[0])" not in upload_body
-    assert "automatic Marker extraction" in upload_body
+    assert "submitUploadBatch(pdfFiles)" in upload_body
 
 
 def test_marker_extraction_controls_are_available() -> None:
@@ -21,7 +19,8 @@ def test_marker_extraction_controls_are_available() -> None:
     assert 'value="strip_and_force_ocr"' in INDEX_HTML
     assert 'id="useLocalVlmRepair"' in INDEX_HTML
     assert 'id="keepDebugArtifacts"' in INDEX_HTML
-    assert 'class="panel region-panel legacy-panel" hidden' in INDEX_HTML
+    assert "Legacy Manual OCR Pipeline" not in INDEX_HTML
+    assert "Konva" not in INDEX_HTML
 
 
 def test_marker_settings_are_sent_to_backend() -> None:
