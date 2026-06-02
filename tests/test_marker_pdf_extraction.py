@@ -541,6 +541,102 @@ def test_qwen_fallback_preserves_full_page_margins_before_ocr(tmp_path: Path) ->
     assert metadata["ocr_image_mode"] == "rendered_page_png"
 
 
+def test_qwen_fallback_uses_surya_boxed_full_pages_for_bad_scans(tmp_path: Path) -> None:
+    from PIL import Image
+
+    rendered = tmp_path / "rendered.png"
+    boxed = tmp_path / "boxed.png"
+    Image.new("RGB", (400, 200), "white").save(rendered)
+    Image.new("RGB", (400, 200), "white").save(boxed)
+    fallback = QwenFullPageOCRFallback()
+    manifest = {
+        "pages": [
+            {
+                "boxed_page_path": str(boxed),
+                "regions": [{"id": "r1"}, {"id": "r2"}],
+                "reconciled_regions": [{"index": 1}],
+            }
+        ]
+    }
+
+    paths = fallback._surya_boxed_page_paths(manifest, expected_pages=1)
+    metadata = fallback._surya_page_metadata(
+        [fallback._rendered_page_metadata(rendered)],
+        manifest,
+        paths,
+    )
+
+    assert fallback._should_use_surya_layout("scanned_no_text") is True
+    assert fallback._should_use_surya_layout("bad_hidden_ocr") is True
+    assert fallback._should_use_surya_layout("mixed") is False
+    assert paths == [boxed]
+    assert metadata[0]["input_path"] == str(rendered)
+    assert metadata[0]["ocr_image_path"] == str(boxed)
+    assert metadata[0]["ocr_image_mode"] == "surya_boxed_page_png"
+    assert metadata[0]["surya_region_count"] == 2
+    assert metadata[0]["surya_reconciled_region_count"] == 1
+
+
+def test_qwen_fallback_surya_prompt_requests_numbered_region_wrappers() -> None:
+    prompt = QwenFullPageOCRFallback()._surya_overlay_prompt("Base OCR rules.")
+
+    assert prompt.startswith("Base OCR rules.")
+    assert 'SURYA <number>: <type>' in prompt
+    assert '<region index="<number>" type="<type>">' in prompt
+    assert "page headers, and page footers" in prompt
+
+
+def test_qwen_fallback_runs_surya_worker_with_marker_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    output_dir = tmp_path / "layout"
+    output_dir.mkdir()
+    manifest = {"pages": [], "region_count": 0}
+    (output_dir / "layout.json").write_text(json.dumps(manifest), encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    class _FakeProcess:
+        returncode = 0
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return _FakeProcess()
+
+    fallback = QwenFullPageOCRFallback()
+    monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
+    monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
+    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(fallback, "_communicate_with_cancel", lambda *_args, **_kwargs: ("", ""))
+
+    result = fallback._run_surya_layout(
+        render_dir=tmp_path / "rendered",
+        output_dir=output_dir,
+        settings={"surya_layout_padding": 24, "surya_layout_batch_size": 2},
+        cancel_requested=None,
+        on_process_started=None,
+        on_process_finished=None,
+        on_ocr_progress=None,
+    )
+
+    assert result == manifest
+    assert captured["cmd"] == [
+        sys.executable,
+        str(tmp_path / "worker.py"),
+        "--input-dir",
+        str(tmp_path / "rendered"),
+        "--output-dir",
+        str(output_dir),
+        "--padding",
+        "24",
+        "--batch-size",
+        "2",
+    ]
+
+
 def _page_stats(page_number: int) -> PageTextStats:
     return PageTextStats(
         page_number=page_number,

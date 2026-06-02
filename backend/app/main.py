@@ -211,6 +211,7 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
         "profile_summary": "text/plain",
         "extraction_result": "application/json",
         "marker_detection": "application/json",
+        "logical_translation_chunks": "application/json",
     }.get(artifact_type, "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=path.name)
 

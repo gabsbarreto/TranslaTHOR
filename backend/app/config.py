@@ -22,13 +22,11 @@ DEFAULT_QWEN_OCR_PROMPT = os.getenv(
 Convert the document image into clean Markdown.
 
 Rules:
-- Transcribe only visible text from the current image.
 - Preserve visual reading order: left column top-to-bottom, then right column.
 - Join wrapped lines into paragraphs.
 - Reconstruct hyphenated line-breaks, e.g. "forma-\\nción" → "formación".
 - Convert tables into valid Markdown tables.
 - Keep captions near their figures/tables.
-- Keep real content: body headings, article titles, captions, tables, footnotes.
 - If a page ends in a hyphenated line break, do not try to guess and finish the word. It should continue on the next page.
 - Return only Markdown."""
     ),
@@ -52,8 +50,8 @@ DEFAULT_LLM_REPETITION_PENALTY = float(os.getenv("LLM_REPETITION_PENALTY", "1.0"
 DEFAULT_QWEN_OCR_TEMPERATURE = float(
     os.getenv("QWEN_OCR_TEMPERATURE", "0.0")
 )
-DEFAULT_QWEN_OCR_TOP_P = float(os.getenv("QWEN_OCR_TOP_P", "0.8"))
-DEFAULT_QWEN_OCR_TOP_K = int(os.getenv("QWEN_OCR_TOP_K", "20"))
+DEFAULT_QWEN_OCR_TOP_P = float(os.getenv("QWEN_OCR_TOP_P", "0.9"))
+DEFAULT_QWEN_OCR_TOP_K = int(os.getenv("QWEN_OCR_TOP_K", "5"))
 DEFAULT_QWEN_OCR_MIN_P = float(os.getenv("QWEN_OCR_MIN_P", str(DEFAULT_LLM_MIN_P)))
 DEFAULT_QWEN_OCR_PRESENCE_PENALTY = float(
     os.getenv("QWEN_OCR_PRESENCE_PENALTY", "0")

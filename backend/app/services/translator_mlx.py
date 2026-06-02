@@ -166,10 +166,13 @@ class MlxTranslator:
         return load(model_name)
 
     def build_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
+        self._document_language = self._normalize_lang_code(document.metadata.detected_language)
+        if document.metadata.translation.get("ocr_logical_chunks_prepared"):
+            return self._prepared_logical_chunks(document.translation_chunks)
+
         units = self._build_translation_units(document)
         chunks: list[TranslationChunk] = []
         chunk_block_types: dict[str, BlockType] = {}
-        self._document_language = self._normalize_lang_code(document.metadata.detected_language)
         for unit in units:
             if unit.block_ids and (
                 unit.block_ids[0].startswith(self.TABLE_HEADER_PREFIX) or unit.block_ids[0].startswith(self.TABLE_ROW_PREFIX)
@@ -193,6 +196,48 @@ class MlxTranslator:
                 chunks.append(chunk)
                 chunk_block_types[chunk.id] = unit.block_type
         return self._merge_adjacent_translation_chunks(chunks, chunk_block_types)
+
+    def _prepared_logical_chunks(self, chunks: list[TranslationChunk]) -> list[TranslationChunk]:
+        prepared: list[TranslationChunk] = []
+        for chunk in chunks:
+            if chunk.status != "ready_for_translation":
+                continue
+            block_type = self._logical_chunk_block_type(chunk.chunk_type)
+            if block_type == BlockType.TABLE and self._is_table_heavy_markup(chunk.source_text):
+                text_parts = [chunk.source_text]
+            else:
+                text_parts = self._split_to_token_budget(chunk.source_text)
+            for part_index, text_part in enumerate(text_parts, start=1):
+                if block_type != BlockType.TABLE and not self._has_translatable_content(text_part):
+                    continue
+                prepared.append(
+                    chunk.model_copy(
+                        update={
+                            "id": (
+                                chunk.id
+                                if len(text_parts) == 1
+                                else f"{chunk.id}-part{part_index:02d}"
+                            ),
+                            "source_text": text_part,
+                            "source_language": self._chunk_source_language(text_part, block_type),
+                            "source_token_count": self._token_count(text_part),
+                        }
+                    )
+                )
+        return prepared
+
+    def _logical_chunk_block_type(self, chunk_type: str) -> BlockType:
+        return {
+            "caption": BlockType.CAPTION,
+            "equation": BlockType.EQUATION,
+            "figure": BlockType.FIGURE,
+            "footnote": BlockType.FOOTNOTE,
+            "heading": BlockType.HEADING,
+            "keywords": BlockType.PARAGRAPH,
+            "list_item": BlockType.LIST,
+            "reference": BlockType.REFERENCE,
+            "table": BlockType.TABLE,
+        }.get(chunk_type, BlockType.PARAGRAPH)
 
     def translate_document(
         self,
@@ -440,6 +485,21 @@ class MlxTranslator:
         first = block_by_id.get(chunk.block_ids[0])
         if first is None:
             return
+
+        if chunk.chunk_type == "keywords" and len(chunk.block_ids) >= 2:
+            body = block_by_id.get(chunk.block_ids[1])
+            heading_text, separator, body_text = chunk.translated_text.strip().partition("\n")
+            if separator and body is not None:
+                first.text = heading_text.strip()
+                body.text = body_text.strip()
+                first.metadata["translated_from_block_ids"] = chunk.block_ids
+                body.metadata["translated_from_block_ids"] = chunk.block_ids
+                for block_id in chunk.block_ids[2:]:
+                    block = block_by_id.get(block_id)
+                    if block is not None:
+                        block.text = ""
+                        block.metadata["merged_into_block_id"] = body.id
+                return
 
         first.text = (
             self._clean_translated_list_text(chunk.translated_text)
@@ -1206,6 +1266,8 @@ class MlxTranslator:
         return cleaned or text
 
     def _chunk_block_type(self, chunk: TranslationChunk, block_by_id: dict[str, Block]) -> BlockType | None:
+        if chunk.chunk_type == "keywords":
+            return BlockType.PARAGRAPH
         if not chunk.block_ids:
             return None
         target_id = chunk.block_ids[0]

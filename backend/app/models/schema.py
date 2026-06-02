@@ -99,6 +99,20 @@ class TranslationChunk(BaseModel):
     context: str = ""
     source_language: str | None = None
     source_token_count: int | None = None
+    chunk_type: str = "paragraph"
+    document_id: str | None = None
+    page_start: int | None = None
+    page_end: int | None = None
+    source_region_ids: list[str] = Field(default_factory=list)
+    source_region_indexes: list[int] = Field(default_factory=list)
+    source_region_types: list[str] = Field(default_factory=list)
+    section_path: list[str] = Field(default_factory=list)
+    source_text_before_cleaning: str | None = None
+    status: str = "ready_for_translation"
+    reason: str | None = None
+    warnings: list[str] = Field(default_factory=list)
+    continues_from_previous_page: bool = False
+    continues_to_next_page: bool = False
 
 
 class DocumentMetadata(BaseModel):

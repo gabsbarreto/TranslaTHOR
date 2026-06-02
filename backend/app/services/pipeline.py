@@ -116,13 +116,13 @@ class TranslationPipeline:
                     progress=0.18,
                     message=(
                         f"PDF classified as {detection.classification}; "
-                        "skipping Marker and loading Qwen full-page OCR"
+                        "skipping Marker and running Surya layout before Qwen full-page OCR"
                     ),
                     translation={
                         **translation_metadata,
                         "pdf_classification": detection.classification,
-                        "marker_mode": "skipped_for_qwen_full_page_ocr",
-                        "fallback_engine": "qwen_full_page_ocr",
+                        "marker_mode": "skipped_for_surya_qwen_full_page_ocr",
+                        "fallback_engine": "surya_layout_qwen_full_page_ocr",
                         "ocr_used": True,
                         "force_ocr": False,
                         "strip_existing_ocr": False,
@@ -143,7 +143,7 @@ class TranslationPipeline:
                         message=message,
                     )
 
-                with profiler.step("qwen_full_page_ocr_direct"):
+                with profiler.step("surya_qwen_full_page_ocr_direct"):
                     result = self.qwen_ocr_fallback.extract(
                         pdf_path=pdf_path,
                         job_dir=job_dir,
@@ -152,10 +152,10 @@ class TranslationPipeline:
                         marker_metadata={
                             "pdf_classification": detection.classification,
                             "extraction_mode": extraction_mode,
-                            "marker_mode": "skipped_for_qwen_full_page_ocr",
+                            "marker_mode": "skipped_for_surya_qwen_full_page_ocr",
                             "marker_skipped": True,
                             "marker_skip_reason": "poor_text_quality",
-                            "fallback_engine": "qwen_full_page_ocr",
+                            "fallback_engine": "surya_layout_qwen_full_page_ocr",
                             "detection": self._detection_metadata(detection),
                         },
                         settings=settings,
@@ -293,6 +293,7 @@ class TranslationPipeline:
                 "pdf_faithful": str(pdf_faithful),
                 "extraction_result": str(extraction_json_path),
                 "marker_detection": str(marker_detection_path),
+                "logical_translation_chunks": str(result.metadata.get("ocr_logical_chunks_path", "")),
             }
             self._update_status(
                 job_id,
@@ -460,8 +461,15 @@ class TranslationPipeline:
 
     def _qwen_ocr_progress_from_event(self, event: dict) -> tuple[float, str] | None:
         kind = str(event.get("event", ""))
+        if kind == "layout_detection_started":
+            pages = int(event.get("pages") or 0)
+            return 0.2, f"Detecting Surya layout for {pages} page image(s)"
+        if kind == "layout_detection_complete":
+            pages = int(event.get("pages") or 0)
+            regions = int(event.get("reconciled_regions") or event.get("regions") or 0)
+            return 0.24, f"Surya layout detected {regions} region(s) across {pages} page(s)"
         if kind == "model_loading":
-            return 0.25, "Loading Qwen OCR model"
+            return 0.26, "Loading Qwen OCR model"
         if kind == "model_loaded":
             pages = int(event.get("pages") or 0)
             return 0.3, f"Qwen OCR model loaded; processing {pages} full page image(s)"

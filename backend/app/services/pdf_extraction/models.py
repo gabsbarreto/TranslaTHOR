@@ -73,6 +73,14 @@ class ExtractionChunk:
     polygon: list[list[float]] | None
     original_text: str
     translated_text: str = ""
+    page_end: int | None = None
+    source_region_ids: list[str] = field(default_factory=list)
+    source_region_indexes: list[int] = field(default_factory=list)
+    source_region_types: list[str] = field(default_factory=list)
+    section_path: list[str] = field(default_factory=list)
+    source_text_before_cleaning: str | None = None
+    status: str = "ready_for_translation"
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
