@@ -151,6 +151,7 @@ class JobStatus(BaseModel):
     filename: str
     source_filename: str | None = None
     attempt: int = 0
+    created_at: str | None = None
     stage: JobStage
     progress: float = 0.0
     message: str = ""

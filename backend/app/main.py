@@ -265,9 +265,7 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
     artifacts_dir = job_store.get_job_dir(job_id) / "artifacts"
     markdown_path = Path(status.artifacts.get("markdown", artifacts_dir / "translated.md"))
     json_path = Path(status.artifacts.get("json", artifacts_dir / "structured.json"))
-    pdf_path = Path(status.artifacts.get(key, artifacts_dir / f"translated_{mode}.pdf"))
-    if pdf_path.exists():
-        return pdf_path
+    pdf_path = _translated_pdf_path(status, artifacts_dir, mode)
 
     started = time.perf_counter()
     if json_path.exists():
@@ -282,6 +280,8 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
     markdown_loaded = time.perf_counter()
     html = reconstructor.markdown_to_html(markdown_text, title=status.filename, output_mode=mode)
     html_built = time.perf_counter()
+    if pdf_path.exists():
+        pdf_path.unlink()
     reconstructor.html_to_pdf(html, pdf_path)
     completed = time.perf_counter()
 
@@ -305,6 +305,18 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
         artifacts["pdf"] = str(pdf_path)
     job_store.update_status(job_id, artifacts=artifacts)
     return pdf_path
+
+
+def _translated_pdf_path(status, artifacts_dir: Path, mode: str) -> Path:
+    return artifacts_dir / _translated_pdf_filename(status, mode)
+
+
+def _translated_pdf_filename(status, mode: str) -> str:
+    original = Path(status.source_filename or status.filename)
+    stem = original.stem or "translated"
+    if mode == "readable":
+        return f"{stem}_translated.pdf"
+    return f"{stem}_translated_{mode}.pdf"
 
 
 def _source_markdown_path(job_id: str) -> Path:

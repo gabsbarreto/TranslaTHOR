@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from app.config import JOBS_DIR
@@ -24,6 +25,7 @@ class JobStore:
             filename=display_filename,
             source_filename=source_filename,
             attempt=attempt,
+            created_at=self._utc_now(),
             stage=JobStage.UPLOADED,
             progress=0.0,
         )
@@ -49,13 +51,14 @@ class JobStore:
         return updated
 
     def list_jobs(self) -> list[JobStatus]:
-        items: list[JobStatus] = []
+        items: list[tuple[float, str, JobStatus]] = []
         for status_file in JOBS_DIR.glob("*/status.json"):
             try:
-                items.append(JobStatus.model_validate_json(status_file.read_text(encoding="utf-8")))
+                status = JobStatus.model_validate_json(status_file.read_text(encoding="utf-8"))
             except json.JSONDecodeError:
                 continue
-        return sorted(items, key=lambda x: x.job_id, reverse=True)
+            items.append((self._created_sort_key(status, status_file), status.job_id, status))
+        return [status for _created_at, _job_id, status in sorted(items)]
 
     def clear_jobs(self) -> int:
         removed = 0
@@ -108,3 +111,18 @@ class JobStore:
         suffix = path.suffix
         stem = path.stem
         return f"{stem} ({attempt}){suffix}"
+
+    def _utc_now(self) -> str:
+        return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _created_sort_key(self, status: JobStatus, status_file: Path) -> float:
+        if status.created_at:
+            try:
+                return datetime.fromisoformat(status.created_at.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+        job_dir = status_file.parent
+        try:
+            return float(getattr(job_dir.stat(), "st_birthtime", status_file.stat().st_mtime))
+        except OSError:
+            return 0.0
