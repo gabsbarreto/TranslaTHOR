@@ -171,9 +171,17 @@ class MlxTranslator:
             return self._prepared_logical_chunks(document.translation_chunks)
 
         units = self._build_translation_units(document)
+        block_by_id = {block.id: block for block in document.blocks}
         chunks: list[TranslationChunk] = []
         chunk_block_types: dict[str, BlockType] = {}
         for unit in units:
+            unit_pages = sorted(
+                {
+                    block_by_id[block_id].page_number
+                    for block_id in unit.block_ids
+                    if block_id in block_by_id
+                }
+            )
             if unit.block_ids and (
                 unit.block_ids[0].startswith(self.TABLE_HEADER_PREFIX) or unit.block_ids[0].startswith(self.TABLE_ROW_PREFIX)
             ):
@@ -192,10 +200,16 @@ class MlxTranslator:
                     context=unit.context,
                     source_language=self._chunk_source_language(text_part, unit.block_type),
                     source_token_count=self._token_count(text_part),
+                    page_start=unit_pages[0] if unit_pages else None,
+                    page_end=unit_pages[-1] if unit_pages else None,
                 )
                 chunks.append(chunk)
                 chunk_block_types[chunk.id] = unit.block_type
-        return self._merge_adjacent_translation_chunks(chunks, chunk_block_types)
+        return self._merge_adjacent_translation_chunks(
+            chunks,
+            chunk_block_types,
+            document=document,
+        )
 
     def _prepared_logical_chunks(self, chunks: list[TranslationChunk]) -> list[TranslationChunk]:
         prepared: list[TranslationChunk] = []
@@ -615,6 +629,8 @@ class MlxTranslator:
         self,
         chunks: list[TranslationChunk],
         chunk_block_types: dict[str, BlockType] | None = None,
+        *,
+        document: DocumentModel | None = None,
     ) -> list[TranslationChunk]:
         group_size = max(1, int(self.settings.chunk_group_size or 1))
         if group_size <= 1:
@@ -642,6 +658,7 @@ class MlxTranslator:
                     not self._can_merge_translation_chunk(candidate, candidate_type)
                     or candidate.context != chunk.context
                     or candidate.source_language != chunk.source_language
+                    or not self._chunks_share_safe_layout_region(group[-1], candidate, document)
                     or (group_token_count + candidate_tokens) > max_group_tokens
                 ):
                     break
@@ -661,9 +678,49 @@ class MlxTranslator:
                     context=group[0].context,
                     source_language=group[0].source_language,
                     source_token_count=group_token_count,
+                    page_start=group[0].page_start,
+                    page_end=group[0].page_end,
                 )
             )
         return merged
+
+    def _chunks_share_safe_layout_region(
+        self,
+        previous: TranslationChunk,
+        current: TranslationChunk,
+        document: DocumentModel | None,
+    ) -> bool:
+        if (
+            previous.page_start is None
+            or previous.page_end is None
+            or current.page_start is None
+            or current.page_end is None
+        ):
+            return False
+        if not (
+            previous.page_start == previous.page_end == current.page_start == current.page_end
+        ):
+            return False
+        if previous.block_ids == current.block_ids:
+            # Token-budget fragments from the same source region remain safe to
+            # coalesce into one translation request.
+            return True
+        if document is None:
+            return True
+
+        positions = {block.id: index for index, block in enumerate(document.blocks)}
+        previous_positions = [positions[block_id] for block_id in previous.block_ids if block_id in positions]
+        current_positions = [positions[block_id] for block_id in current.block_ids if block_id in positions]
+        if not previous_positions or not current_positions:
+            return False
+        previous_end = max(previous_positions)
+        current_start = min(current_positions)
+        if current_start <= previous_end:
+            return False
+        return not any(
+            block.block_type in {BlockType.FIGURE, BlockType.EQUATION}
+            for block in document.blocks[previous_end + 1 : current_start]
+        )
 
     def _unique_block_ids(self, block_ids: list[str]) -> list[str]:
         seen: set[str] = set()

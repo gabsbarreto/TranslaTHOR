@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 import sys
 import time
@@ -293,6 +294,29 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
         if not source_pdf.exists():
             raise HTTPException(status_code=404, detail="Original uploaded PDF is missing.")
         document = DocumentModel.model_validate_json(json_path.read_text(encoding="utf-8"))
+        if _figure_assets_need_refresh(document):
+            extraction_metadata: dict = {}
+            extraction_result_path = Path(
+                status.artifacts.get(
+                    "extraction_result",
+                    artifacts_dir / "extraction_result.json",
+                )
+            )
+            if extraction_result_path.exists():
+                try:
+                    extraction_payload = json.loads(
+                        extraction_result_path.read_text(encoding="utf-8")
+                    )
+                    extraction_metadata = dict(extraction_payload.get("metadata") or {})
+                except (OSError, ValueError, TypeError):
+                    extraction_metadata = {}
+            document = pipeline.figure_extractor.extract(
+                pdf_path=source_pdf,
+                document=document,
+                artifact_dir=artifacts_dir / "figures",
+                extraction_metadata=extraction_metadata,
+            )
+            json_path.write_text(document.model_dump_json(indent=2), encoding="utf-8")
         report_path = artifacts_dir / "reconstruction_report_original_layout.json"
         report = original_layout_reconstructor.reconstruct(
             source_pdf_path=source_pdf,
@@ -360,6 +384,25 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
         artifacts["pdf"] = str(pdf_path)
     job_store.update_status(job_id, artifacts=artifacts)
     return pdf_path
+
+
+def _figure_assets_need_refresh(document) -> bool:
+    has_figure_candidates = bool(document.figures) or any(
+        block.block_type.value == "figure" for block in document.blocks
+    )
+    if not has_figure_candidates:
+        return False
+    summary = document.metadata.translation.get("figure_extraction")
+    if not isinstance(summary, dict):
+        return True
+    for figure in document.figures:
+        if figure.bbox is None:
+            continue
+        if not figure.source_block_ids or not figure.image_path:
+            return True
+        if not Path(figure.image_path).exists():
+            return True
+    return False
 
 
 def _translated_pdf_path(status, artifacts_dir: Path, mode: str) -> Path:

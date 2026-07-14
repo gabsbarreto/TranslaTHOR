@@ -14,6 +14,7 @@ from app.models.schema import (
     FigureAsset,
     PageMetadata,
     SourceType,
+    TranslationChunk,
 )
 from app.services.original_layout_reconstructor import OriginalLayoutReconstructor
 
@@ -315,3 +316,306 @@ def test_scanned_page_is_retained_with_safe_warning(tmp_path: Path) -> None:
     assert report["regions_replaced"] == 0
     assert any(warning["code"] == "page_not_safely_replaceable" for warning in report["warnings"])
     assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_cross_page_translation_batch_is_recovered_per_source_block(tmp_path: Path) -> None:
+    source = tmp_path / "cross-page-source.pdf"
+    pdf = fitz.open()
+    for text in ("SOURCE PAGE ONE", "SOURCE PAGE TWO"):
+        page = pdf.new_page(width=300, height=200)
+        page.insert_textbox(fitz.Rect(30, 40, 270, 75), text, fontsize=10)
+    pdf.save(source)
+    pdf.close()
+
+    first = Block(
+        id="page-one",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text="Translated page one\n\nTranslated page two",
+        bbox=BoundingBox(x0=30, y0=40, x1=270, y1=75),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        style_hints={"font_size": 10},
+        metadata={
+            "source_text": "SOURCE PAGE ONE",
+            "translated_from_block_ids": ["page-one", "page-two"],
+        },
+    )
+    second = Block(
+        id="page-two",
+        page_number=2,
+        block_type=BlockType.PARAGRAPH,
+        text="",
+        bbox=BoundingBox(x0=30, y0=40, x1=270, y1=75),
+        reading_order_index=1,
+        source_type=SourceType.EMBEDDED,
+        style_hints={"font_size": 10},
+        metadata={
+            "source_text": "SOURCE PAGE TWO",
+            "merged_into_block_id": "page-one",
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=2),
+        pages=[
+            PageMetadata(
+                page_number=page_number,
+                width=300,
+                height=200,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+            for page_number in (1, 2)
+        ],
+        blocks=[first, second],
+        translation_chunks=[
+            TranslationChunk(
+                id="chunk-cross-page",
+                block_ids=["page-one", "page-two"],
+                source_text="SOURCE PAGE ONE\n\nSOURCE PAGE TWO",
+                translated_text="Translated page one\n\nTranslated page two",
+            )
+        ],
+    )
+
+    output = tmp_path / "cross-page-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "cross-page-report.json",
+    )
+
+    with fitz.open(output) as translated:
+        assert "Translated page one" in translated[0].get_text("text")
+        assert "Translated page two" in translated[1].get_text("text")
+        assert "SOURCE PAGE" not in "".join(page.get_text("text") for page in translated)
+    assert report["pages_successfully_reconstructed"] == 2
+    assert report["pages_using_fallback_behavior"] == 0
+
+
+def test_canonical_figure_asset_prevents_group_bbox_from_locking_caption(tmp_path: Path) -> None:
+    source = tmp_path / "nested-figure-source.pdf"
+    output = tmp_path / "nested-figure-output.pdf"
+    _create_original_layout_source(source)
+    document = _original_layout_document()
+    group = Block(
+        id="figure-group",
+        page_number=1,
+        block_type=BlockType.FIGURE,
+        text="",
+        bbox=BoundingBox(x0=60, y0=100, x1=340, y1=325),
+        reading_order_index=1,
+        source_type=SourceType.EMBEDDED,
+    )
+    document.blocks.insert(1, group)
+    document.figures[0].source_block_ids = ["figure-group", "figure"]
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "nested-figure-report.json",
+    )
+
+    with fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Translated external caption" in text
+        assert "QUELLBESCHRIFTUNG" not in text
+        assert "ACHSE QUELLE" in text
+    assert not any(
+        region.get("reason") == "overlaps_figure_graph_or_equation"
+        and region.get("block_ids") == ["caption"]
+        for region in report["regions"]
+    )
+
+
+def test_source_pdf_font_size_allows_tight_two_line_replacement(tmp_path: Path) -> None:
+    source = tmp_path / "source-font-size.pdf"
+    source_text = (
+        "Variable situation professionnelle en étudiant pour collège, lycée et études "
+        "supérieures, emploi et autre situation"
+    )
+    translated_text = (
+        "Employment status as student for middle school, high school and higher education, "
+        "employment and other status"
+    )
+    pdf = fitz.open()
+    page = pdf.new_page(width=425, height=150)
+    page.insert_text(
+        (45, 47),
+        "Variable situation professionnelle en étudiant pour collège, lycée et études",
+        fontsize=7,
+    )
+    page.insert_text(
+        (45, 55),
+        "supérieures, emploi et autre situation",
+        fontsize=7,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    block = Block(
+        id="tight",
+        page_number=1,
+        block_type=BlockType.LIST,
+        text=translated_text,
+        bbox=BoundingBox(x0=45, y0=40, x1=379, y1=58),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_text,
+            "translated_from_block_ids": ["tight"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=425,
+                height=150,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+    output = tmp_path / "source-font-size-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "source-font-size-report.json",
+    )
+
+    assert report["text_boxes_did_not_fit"] == 0
+    assert report["regions_replaced"] == 1
+    with fitz.open(output) as translated:
+        assert "Employment status" in translated[0].get_text("text")
+
+
+def test_vector_grid_table_is_reconstructed_cell_by_cell(tmp_path: Path) -> None:
+    source = tmp_path / "table-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=180)
+    cells = [
+        (fitz.Rect(30, 40, 200, 70), "Diagnostic", True),
+        (fitz.Rect(200, 40, 270, 70), "N", True),
+        (fitz.Rect(30, 70, 200, 100), "Dépression", False),
+        (fitz.Rect(200, 70, 270, 100), "15", False),
+    ]
+    for rectangle, text, _bold in cells:
+        page.draw_rect(rectangle, color=(0, 0, 0), width=0.5)
+        page.insert_textbox(rectangle, text, fontsize=8, align=fitz.TEXT_ALIGN_CENTER)
+    pdf.save(source)
+    pdf.close()
+
+    source_table = (
+        "<table><tr><th>Diagnostic</th><th>N</th></tr>"
+        "<tr><td>Dépression</td><td>15</td></tr></table>"
+    )
+    translated_table = (
+        "<table><tr><th>Diagnosis</th><th>N</th></tr>"
+        "<tr><td>Depression</td><td>15</td></tr></table>"
+    )
+    block = Block(
+        id="table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_table,
+        bbox=BoundingBox(x0=30, y0=40, x1=270, y1=100),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_table,
+            "translated_from_block_ids": ["table"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=180,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+    output = tmp_path / "table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "table-report.json",
+    )
+
+    with fitz.open(source) as source_pdf, fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Diagnosis" in text
+        assert "Depression" in text
+        assert "Dépression" not in text
+        assert len(translated[0].get_drawings()) == len(source_pdf[0].get_drawings())
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 2
+
+
+def test_unreliable_table_structure_is_retained_with_warning(tmp_path: Path) -> None:
+    source = tmp_path / "bad-table-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=150)
+    rectangle = fitz.Rect(30, 40, 270, 80)
+    page.draw_rect(rectangle, color=(0, 0, 0), width=0.5)
+    page.insert_textbox(rectangle, "SOURCE TABLE", fontsize=8)
+    pdf.save(source)
+    pdf.close()
+
+    repeated = "duplicated table content " * 30
+    block = Block(
+        id="bad-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=f"<table><tr><td>{repeated}</td><td>Translated</td></tr></table>",
+        bbox=BoundingBox(x0=30, y0=40, x1=270, y1=80),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": f"<table><tr><td>{repeated}</td><td>Source</td></tr></table>",
+            "translated_from_block_ids": ["bad-table"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=150,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+    output = tmp_path / "bad-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "bad-table-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert any(
+        region.get("reason") == "table_translation_structure_unreliable"
+        for region in report["regions"]
+    )
+    with fitz.open(output) as translated:
+        assert "SOURCE TABLE" in translated[0].get_text("text")

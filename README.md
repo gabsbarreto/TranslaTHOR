@@ -63,10 +63,12 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
 - **Faithful PDF** keeps the existing compact, two-column reconstructed output.
 - **Original layout PDF** starts from a separate output copy of the uploaded PDF. On reliable
   digital-text pages it removes source text while preserving overlapping raster images and vector
-  graphics, then inserts translated text into the corresponding boxes. Figures, graphs, equations,
-  logos, colours, lines, page sizes, crop boxes, rotation, and decorations come from the original
-  pages. A JSON reconstruction report records every replacement, skip, fallback page, text scale,
-  overflow, raster figure fallback, and low-confidence association.
+  graphics, then inserts translated text into the corresponding boxes using source-PDF font metrics
+  when available. Translation batches are kept page-local and do not cross figure or equation
+  regions. Reliable vector-grid tables are reconstructed cell-by-cell without removing their lines.
+  Figures, graphs, equations, logos, colours, lines, page sizes, crop boxes, rotation, and
+  decorations come from the original pages. A JSON reconstruction report records every replacement,
+  skip, fallback page, text scale, overflow, raster figure fallback, and low-confidence association.
 
 In this first figure-handling level, a graph or figure is preserved as one unchanged visual. Only
 its external caption is translated. Axis labels, legends, abbreviations, annotations, and all other
@@ -143,10 +145,14 @@ to test source-page reconstruction. If the original-layout warning is shown, dow
   visible source text cannot be proven removable.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
-- Missing, invalid, or low-confidence bounding boxes and cross-page merged translation regions are
-  skipped and reported rather than guessed.
-- Complex table replacement is skipped in original-layout mode when preserving its geometry cannot
-  be guaranteed. Tables remain available in the readable PDF.
+- Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.
+  Legacy cross-page translation batches are recovered only when their preserved source and
+  translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
+  unchanged.
+- Digital tables are translated cell-by-cell only when the translated HTML structure can be matched
+  to a complete vector cell grid and the source cell text validates that mapping. Malformed,
+  duplicated, merged-cell, image-based, or otherwise ambiguous tables remain unchanged and are
+  reported. Tables remain translated in the readable PDF.
 - Translated text that cannot fit at the minimum 60% scale is reported and the source region is
   retained instead of silently deleting text or shrinking it to an unreadable size.
 - Figure detection follows Marker/Surya structured regions. False-positive visual regions or missed

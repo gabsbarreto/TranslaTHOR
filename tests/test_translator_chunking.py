@@ -274,6 +274,71 @@ def test_adjacent_prose_chunks_are_merged_before_translation() -> None:
     assert "Terceiro paragrafo para manter continuidade." in chunks[0].source_text
 
 
+def test_adjacent_prose_chunks_do_not_merge_across_pages() -> None:
+    first = _block("page-1", "Primeiro paragrafo.", 100, 110)
+    second = _block("page-2", "Segundo paragrafo.", 100, 110).model_copy(
+        update={"page_number": 2}
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=2, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=page_number,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+            for page_number in (1, 2)
+        ],
+        blocks=[first, second],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
+
+    chunks = translator.build_chunks(document)
+
+    assert [chunk.block_ids for chunk in chunks] == [["page-1"], ["page-2"]]
+    assert [(chunk.page_start, chunk.page_end) for chunk in chunks] == [(1, 1), (2, 2)]
+
+
+def test_adjacent_prose_chunks_do_not_merge_across_figure() -> None:
+    figure = Block(
+        id="figure",
+        page_number=1,
+        block_type=BlockType.FIGURE,
+        text="",
+        bbox=BoundingBox(x0=50, y0=120, x1=280, y1=260),
+        reading_order_index=120,
+        source_type=SourceType.EMBEDDED,
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[
+            _block("before", "Texto antes da figura.", 90, 100),
+            figure,
+            _block("after", "Texto depois da figura.", 280, 290),
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
+
+    chunks = translator.build_chunks(document)
+
+    assert [chunk.block_ids for chunk in chunks] == [["before"], ["after"]]
+
+
 def test_separator_only_blocks_are_not_sent_to_translation() -> None:
     document = DocumentModel(
         metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
