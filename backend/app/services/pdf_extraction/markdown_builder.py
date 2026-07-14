@@ -44,6 +44,11 @@ class MarkerDocumentBuilder:
 
         for fallback_index, page_payload in enumerate(pages_payload, start=1):
             page_number = self._page_number(page_payload, fallback_index)
+            page_width, page_height = self._marker_page_dimensions(
+                page_payload,
+                detection,
+                page_number,
+            )
             for node in self._iter_content_blocks(page_payload):
                 block_type = self._map_block_type(str(node.get("block_type", "")))
                 text = self._node_text(node)
@@ -61,6 +66,13 @@ class MarkerDocumentBuilder:
                     "marker_block_type": node.get("block_type"),
                     "marker_id": node.get("id"),
                     "section_hierarchy": node.get("section_hierarchy") or {},
+                    "marker_page_width": page_width,
+                    "marker_page_height": page_height,
+                    "coordinate_space": {
+                        "name": "marker_page_coordinates",
+                        "width": page_width,
+                        "height": page_height,
+                    },
                 }
                 if polygon:
                     metadata["polygon"] = polygon
@@ -92,6 +104,17 @@ class MarkerDocumentBuilder:
                             bbox=bbox,
                             caption_block_id=None,
                             image_path=None,
+                            detection_confidence=block.confidence,
+                            source_block_ids=[block.id],
+                            source_region_ids=[
+                                str(value)
+                                for value in block.metadata.get("source_region_ids", [])
+                            ],
+                            extraction_metadata={
+                                "marker_block_type": node.get("block_type"),
+                                "marker_id": node.get("id"),
+                                "reading_order_index": reading_order,
+                            },
                         )
                     )
 
@@ -162,6 +185,21 @@ class MarkerDocumentBuilder:
         )
         markdown = AppMarkdownBuilder().build(doc)
         return doc, markdown, chunks
+
+    def _marker_page_dimensions(
+        self,
+        page_payload: dict[str, Any],
+        detection: PDFTypeDetectionResult,
+        page_number: int,
+    ) -> tuple[float, float]:
+        polygon = self._polygon(page_payload)
+        bbox = self._bbox_from_polygon(polygon)
+        if bbox is not None and bbox.x1 > bbox.x0 and bbox.y1 > bbox.y0:
+            return bbox.x1 - min(0.0, bbox.x0), bbox.y1 - min(0.0, bbox.y0)
+        for page in detection.pages:
+            if page.page_number == page_number:
+                return float(page.width), float(page.height)
+        return 0.0, 0.0
 
     def _chunks_from_blocks(self, blocks: list[Block]) -> list[ExtractionChunk]:
         chunks: list[ExtractionChunk] = []

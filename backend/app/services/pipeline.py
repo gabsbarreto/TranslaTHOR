@@ -25,7 +25,9 @@ from app.config import (
 )
 from app.models.schema import DocumentModel
 from app.models.schema import JobStage
+from app.services.figure_extractor import FigureExtractionService
 from app.services.job_store import JobStore
+from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction import PDFExtractor
 from app.services.pdf_extraction.models import PDFTypeDetectionResult
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
@@ -41,6 +43,7 @@ class TranslationPipeline:
         self.job_store = job_store
         self.pdf_extractor = PDFExtractor()
         self.qwen_ocr_fallback = QwenFullPageOCRFallback()
+        self.figure_extractor = FigureExtractionService()
         self._lock = threading.RLock()
         self._cancelled_jobs: set[str] = set()
         self._active_processes: dict[str, list[subprocess.Popen]] = {}
@@ -262,6 +265,18 @@ class TranslationPipeline:
                 ),
             ):
                 return
+
+            with profiler.step("figure_extraction"):
+                result.document = self.figure_extractor.extract(
+                    pdf_path=pdf_path,
+                    document=result.document,
+                    artifact_dir=artifacts_dir / "figures",
+                    extraction_metadata=result.metadata,
+                )
+                result.markdown = MarkdownBuilder().build(result.document)
+                result.pages = [page.model_dump() for page in result.document.pages]
+                result.blocks = [block.model_dump() for block in result.document.blocks]
+                result.warnings = list(result.document.warnings)
 
             with profiler.step("marker_artifact_write"):
                 json_path.write_text(result.document.model_dump_json(indent=2), encoding="utf-8")

@@ -53,6 +53,7 @@ from app.models.schema import JobStage
 from app.services.job_queue import JobQueue
 from app.services.job_store import JobStore
 from app.services.markdown_builder import MarkdownBuilder
+from app.services.original_layout_reconstructor import OriginalLayoutReconstructor
 from app.services.pipeline import TranslationPipeline
 from app.services.reconstructor import Reconstructor
 from app.utils.logging import configure_logging
@@ -89,6 +90,7 @@ pipeline = TranslationPipeline(job_store)
 job_queue = JobQueue(job_store, pipeline)
 reconstructor = Reconstructor()
 markdown_builder = MarkdownBuilder()
+original_layout_reconstructor = OriginalLayoutReconstructor()
 
 
 @app.get("/api/health")
@@ -190,7 +192,7 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="Job not found") from exc
 
-    if artifact_type in {"pdf", "pdf_readable", "pdf_faithful"}:
+    if artifact_type in {"pdf", "pdf_readable", "pdf_faithful", "pdf_original_layout"}:
         path = _ensure_pdf_artifact(job_id, artifact_type)
         return FileResponse(path, media_type="application/pdf", filename=path.name)
     if artifact_type == "source_markdown":
@@ -212,15 +214,17 @@ def get_artifact(job_id: str, artifact_type: str) -> FileResponse:
         "extraction_result": "application/json",
         "marker_detection": "application/json",
         "logical_translation_chunks": "application/json",
+        "reconstruction_report": "application/json",
     }.get(artifact_type, "application/octet-stream")
     return FileResponse(path, media_type=media_type, filename=path.name)
 
 
 @app.get("/api/jobs/{job_id}/pdf/{mode}")
 def get_pdf(job_id: str, mode: str) -> FileResponse:
-    if mode not in {"readable", "faithful"}:
+    normalized_mode = mode.replace("-", "_")
+    if normalized_mode not in {"readable", "faithful", "original_layout"}:
         raise HTTPException(status_code=400, detail="Unsupported PDF mode")
-    path = _ensure_pdf_artifact(job_id, f"pdf_{mode}")
+    path = _ensure_pdf_artifact(job_id, f"pdf_{normalized_mode}")
     return FileResponse(path, media_type="application/pdf", filename=path.name)
 
 
@@ -260,12 +264,63 @@ def _mark_interrupted_processing_jobs_cancelled() -> int:
 
 def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
     status = job_store.load_status(job_id)
-    mode = "faithful" if artifact_type == "pdf_faithful" else "readable"
+    if status.stage != JobStage.COMPLETE:
+        raise HTTPException(
+            status_code=409,
+            detail="Translated PDFs are available only after translation is complete.",
+        )
+    if artifact_type == "pdf_original_layout":
+        mode = "original_layout"
+    elif artifact_type == "pdf_faithful":
+        mode = "faithful"
+    else:
+        mode = "readable"
     key = f"pdf_{mode}"
     artifacts_dir = job_store.get_job_dir(job_id) / "artifacts"
     markdown_path = Path(status.artifacts.get("markdown", artifacts_dir / "translated.md"))
     json_path = Path(status.artifacts.get("json", artifacts_dir / "structured.json"))
     pdf_path = _translated_pdf_path(status, artifacts_dir, mode)
+
+    if mode == "original_layout":
+        from app.models.schema import DocumentModel
+
+        if not json_path.exists():
+            raise HTTPException(
+                status_code=404,
+                detail="Translated structured JSON is required for original-layout reconstruction.",
+            )
+        source_pdf = job_store.get_job_dir(job_id) / "input.pdf"
+        if not source_pdf.exists():
+            raise HTTPException(status_code=404, detail="Original uploaded PDF is missing.")
+        document = DocumentModel.model_validate_json(json_path.read_text(encoding="utf-8"))
+        report_path = artifacts_dir / "reconstruction_report_original_layout.json"
+        report = original_layout_reconstructor.reconstruct(
+            source_pdf_path=source_pdf,
+            output_pdf_path=pdf_path,
+            document=document,
+            report_path=report_path,
+        )
+        artifacts = dict(status.artifacts)
+        artifacts[key] = str(pdf_path)
+        artifacts["reconstruction_report"] = str(report_path)
+        translation = dict(status.translation)
+        translation["original_layout_reconstruction"] = {
+            "status": report["status"],
+            "pages_successfully_reconstructed": report["pages_successfully_reconstructed"],
+            "pages_using_fallback_behavior": report["pages_using_fallback_behavior"],
+            "warning_count": len(report["warnings"]),
+        }
+        warnings = list(translation.get("warnings") or [])
+        if report["status"] != "complete":
+            warning = (
+                "Original-layout reconstruction is partial; unchanged pages and skipped regions are "
+                "listed in the reconstruction report. Use the readable PDF as the safe fallback."
+            )
+            if warning not in warnings:
+                warnings.append(warning)
+        translation["warnings"] = warnings
+        job_store.update_status(job_id, artifacts=artifacts, translation=translation)
+        return pdf_path
 
     started = time.perf_counter()
     if json_path.exists():
@@ -316,6 +371,8 @@ def _translated_pdf_filename(status, mode: str) -> str:
     stem = original.stem or "translated"
     if mode == "readable":
         return f"{stem}_translated.pdf"
+    if mode == "original_layout":
+        return f"{stem}_translated_original_layout.pdf"
     return f"{stem}_translated_{mode}.pdf"
 
 

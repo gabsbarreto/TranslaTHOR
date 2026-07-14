@@ -131,6 +131,7 @@ function renderQueue() {
       <div class="stage">${stageLabel(job.stage)} - ${escapeHtml(job.message || "")}</div>
       ${translationInfoLine(job)}
       ${translationWarningLine(job)}
+      ${originalLayoutWarningLine(job)}
       ${job.error ? `<div class="error">${escapeHtml(job.error)}</div>` : ""}
       <div class="downloads">
         ${cancelQueuedButton(job)}
@@ -138,6 +139,8 @@ function renderQueue() {
         ${sourcePdfDownloadLink(job, "readable", "OCR PDF")}
         ${pdfDownloadLink(job, "readable", "Readable PDF")}
         ${pdfDownloadLink(job, "faithful", "Faithful PDF")}
+        ${pdfDownloadLink(job, "original-layout", "Original layout PDF")}
+        ${downloadLink(job, "reconstruction_report", "Reconstruction Report")}
         ${downloadLink(job, "markdown", "Markdown")}
         ${downloadLink(job, "json", "JSON")}
         ${downloadLink(job, "extraction_result", "Extraction JSON")}
@@ -213,7 +216,7 @@ function downloadLink(job, type, label) {
 }
 
 function pdfDownloadLink(job, mode, label) {
-  const canGenerate = job.stage === "complete" || Boolean(job.artifacts && job.artifacts.markdown);
+  const canGenerate = job.stage === "complete";
   return canGenerate ? `<a href="/api/jobs/${job.job_id}/pdf/${mode}" target="_blank"><button>${label}</button></a>` : "";
 }
 
@@ -257,6 +260,16 @@ function translationInfoLine(job) {
 function translationWarningLine(job) {
   const warnings = Array.isArray(job.translation?.warnings) ? job.translation.warnings.filter(Boolean) : [];
   return warnings.length ? `<div class="warning-line">${escapeHtml(warnings.slice(0, 3).join(" | "))}</div>` : "";
+}
+
+function originalLayoutWarningLine(job) {
+  if (job.stage !== "complete") return "";
+  const result = job.translation?.original_layout_reconstruction;
+  if (result?.status === "complete") return "";
+  const detail = result?.status === "partial"
+    ? ` Partial result: ${result.pages_using_fallback_behavior || 0} page(s) retained or skipped; see the report.`
+    : " Scanned, hidden-OCR, rotated, or unreliable pages may remain unchanged.";
+  return `<div class="original-layout-warning">Original layout PDF is conservative.${escapeHtml(detail)} Use Readable PDF as the safe fallback.</div>`;
 }
 
 function numericLabel(value, digits) {

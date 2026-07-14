@@ -42,8 +42,25 @@ class Reconstructor:
     th,td {{ border: 1px solid #777; padding: 4px 6px; vertical-align: top; }}
     th {{ background: #f0f0f0; }}
     .table-block {{ column-span: all; border: 1px solid #777; padding: 6px 8px; margin: .8em 0; font-size: 9.5pt; white-space: pre-wrap; break-inside: avoid; }}
-    img {{ max-width: 100%; page-break-inside: avoid; break-inside: avoid; }}
+    img {{ max-width: 100%; height: auto; page-break-inside: avoid; break-inside: avoid; }}
     figure, blockquote, pre {{ break-inside: avoid; }}
+    figure.document-figure {{
+      column-span: all;
+      margin: .9em auto 1.1em;
+      max-width: 100%;
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }}
+    figure.document-figure img {{ display: block; margin: 0 auto; max-height: 225mm; object-fit: contain; }}
+    figure.document-figure figcaption {{
+      font-size: 9.5pt;
+      line-height: 1.3;
+      margin: .45em auto 0;
+      max-width: 95%;
+      text-align: left;
+      page-break-before: avoid;
+      break-before: avoid;
+    }}
     em {{ color: #2d2d2d; }}
     small {{ color: #666; font-size: 9pt; }}
     .page-marker {{ column-span: all; break-before: page; height: 0; overflow: hidden; }}

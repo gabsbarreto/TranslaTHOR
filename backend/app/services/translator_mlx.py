@@ -203,6 +203,8 @@ class MlxTranslator:
             if chunk.status != "ready_for_translation":
                 continue
             block_type = self._logical_chunk_block_type(chunk.chunk_type)
+            if block_type == BlockType.FIGURE:
+                continue
             if block_type == BlockType.TABLE and self._is_table_heavy_markup(chunk.source_text):
                 text_parts = [chunk.source_text]
             else:
@@ -331,6 +333,10 @@ class MlxTranslator:
 
         for block in document.blocks:
             if self._is_marker_table_cell_block(block):
+                continue
+            if block.block_type == BlockType.FIGURE:
+                block.metadata["excluded_from_translation"] = True
+                block.metadata["translation_exclusion_reason"] = "figure_internal_text_preserved"
                 continue
             if not block.text.strip():
                 continue
@@ -486,10 +492,13 @@ class MlxTranslator:
         if first is None:
             return
 
+        first.metadata.setdefault("source_text", first.text)
+
         if chunk.chunk_type == "keywords" and len(chunk.block_ids) >= 2:
             body = block_by_id.get(chunk.block_ids[1])
             heading_text, separator, body_text = chunk.translated_text.strip().partition("\n")
             if separator and body is not None:
+                body.metadata.setdefault("source_text", body.text)
                 first.text = heading_text.strip()
                 body.text = body_text.strip()
                 first.metadata["translated_from_block_ids"] = chunk.block_ids
@@ -497,6 +506,7 @@ class MlxTranslator:
                 for block_id in chunk.block_ids[2:]:
                     block = block_by_id.get(block_id)
                     if block is not None:
+                        block.metadata.setdefault("source_text", block.text)
                         block.text = ""
                         block.metadata["merged_into_block_id"] = body.id
                 return
@@ -510,6 +520,7 @@ class MlxTranslator:
         for block_id in chunk.block_ids[1:]:
             block = block_by_id.get(block_id)
             if block is not None:
+                block.metadata.setdefault("source_text", block.text)
                 block.text = ""
                 block.metadata["merged_into_block_id"] = first.id
 

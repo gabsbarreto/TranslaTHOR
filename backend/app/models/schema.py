@@ -29,6 +29,13 @@ class BlockType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class FigureAssetType(str, Enum):
+    RASTER = "raster"
+    VECTOR = "vector"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
 class BoundingBox(BaseModel):
     x0: float
     y0: float
@@ -65,6 +72,16 @@ class FigureAsset(BaseModel):
     bbox: BoundingBox | None = None
     caption_block_id: str | None = None
     image_path: str | None = None
+    original_width: float | None = None
+    original_height: float | None = None
+    aspect_ratio: float | None = None
+    asset_type: FigureAssetType = FigureAssetType.UNKNOWN
+    vector_path: str | None = None
+    detection_confidence: float | None = None
+    has_internal_text: bool = False
+    source_block_ids: list[str] = Field(default_factory=list)
+    source_region_ids: list[str] = Field(default_factory=list)
+    extraction_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TableModel(BaseModel):

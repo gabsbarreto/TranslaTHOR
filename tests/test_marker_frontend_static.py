@@ -27,3 +27,10 @@ def test_marker_settings_are_sent_to_backend() -> None:
     assert 'form.append("extraction_mode", getInputValue("extractionMode", "auto"));' in APP_JS
     assert 'form.append("use_local_vlm_repair", checkboxValue("useLocalVlmRepair"));' in APP_JS
     assert 'form.append("keep_debug_artifacts", checkboxValue("keepDebugArtifacts"));' in APP_JS
+
+
+def test_original_layout_download_is_complete_only_and_warns_about_fallback() -> None:
+    assert 'pdfDownloadLink(job, "original-layout", "Original layout PDF")' in APP_JS
+    assert 'downloadLink(job, "reconstruction_report", "Reconstruction Report")' in APP_JS
+    assert 'const canGenerate = job.stage === "complete";' in APP_JS
+    assert "Use Readable PDF as the safe fallback." in APP_JS

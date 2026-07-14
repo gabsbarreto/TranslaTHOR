@@ -199,6 +199,15 @@ button:disabled {
   margin-top: 4px;
 }
 
+.original-layout-warning {
+  background: #fff5df;
+  border-left: 3px solid #b36b00;
+  color: #6f4300;
+  font-size: 12px;
+  margin-top: 6px;
+  padding: 6px 8px;
+}
+
 .error { color: var(--warn); font-size: 13px; }
 
 .downloads {
