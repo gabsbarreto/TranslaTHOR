@@ -22,6 +22,7 @@ from app.services.pdf_extraction.models import (
     PDFTypeDetectionResult,
 )
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
+from app.services.pdf_extraction.table_repair import MarkerTableRepairService
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,12 @@ class PDFExtractor:
         detector: PDFTypeDetector | None = None,
         document_builder: MarkerDocumentBuilder | None = None,
         local_vlm_service: LocalVLMRepairService | None = None,
+        table_repair_service: MarkerTableRepairService | None = None,
     ) -> None:
         self.detector = detector or PDFTypeDetector()
         self.document_builder = document_builder or MarkerDocumentBuilder()
         self.local_vlm_service = local_vlm_service or LocalVLMRepairService()
+        self.table_repair_service = table_repair_service or MarkerTableRepairService()
 
     def extract(
         self,
@@ -140,6 +143,15 @@ class PDFExtractor:
                 parser_metadata=parser_metadata,
                 warnings=warnings,
             )
+
+            table_repair = self.table_repair_service.repair(pdf_path, document)
+            warnings.extend(table_repair.warnings)
+            parser_metadata["table_repair"] = table_repair.as_metadata()
+            document.metadata.translation["table_repair"] = table_repair.as_metadata()
+            document.warnings = list(warnings)
+            if table_repair.repaired_count:
+                markdown = AppMarkdownBuilder().build(document)
+                chunks = self.document_builder.chunks_from_blocks(document.blocks)
 
             repaired_count = 0
             if use_local_vlm_repair:

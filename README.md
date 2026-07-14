@@ -11,10 +11,12 @@ This browser-based app translates PDFs locally.
 5. Qwen full-page OCR reads rendered page images directly when Marker needs an uncertain-document OCR fallback.
 6. Surya OCR regions are cleaned and merged into traceable logical translation chunks.
 7. Extracted text is normalized into a shared structured document model.
-8. Figure regions are deduplicated, validated, associated with captions, and captured as
+8. Structurally collapsed Marker tables are checked against the source PDF. Ruled digital tables
+   are repaired from the exact clipped PyMuPDF table grid only when the source text strongly agrees.
+9. Figure regions are deduplicated, validated, associated with captions, and captured as
    high-resolution PNG previews plus clipped vector SVG assets when the source supports them.
-9. A local MLX Qwen model translates the document into English.
-10. Markdown, JSON, readable/faithful PDFs, and a conservative original-layout PDF are available
+10. A local MLX Qwen model translates the document into English.
+11. Markdown, JSON, readable/faithful PDFs, and a conservative original-layout PDF are available
     for download after translation completes.
 
 The OCR path preserves the text emitted by Qwen. It does not remove running headers, footers, page numbers, or margin metadata.
@@ -40,6 +42,7 @@ backend/
         pdf_type_detector.py         # Embedded-text quality classification
         marker_extractor.py          # Marker integration
         markdown_builder.py          # Marker output -> structured document
+        table_repair.py              # Validated PyMuPDF repair for collapsed Marker tables
         qwen_ocr_fallback.py         # Full-page Qwen OCR integration
 scripts/
   run_dev.sh
@@ -150,9 +153,11 @@ to test source-page reconstruction. If the original-layout warning is shown, dow
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.
 - Digital tables are translated cell-by-cell only when the translated HTML structure can be matched
-  to a complete vector cell grid and the source cell text validates that mapping. Malformed,
-  duplicated, merged-cell, image-based, or otherwise ambiguous tables remain unchanged and are
-  reported. Tables remain translated in the readable PDF.
+  to a complete vector cell grid and the source cell text validates that mapping. When Marker
+  collapses a ruled digital table into one oversized cell, the extraction stage attempts a clipped
+  PyMuPDF repair and accepts it only with at least 88% source/candidate token agreement. Malformed,
+  duplicated, merged-cell, image-based, borderless, or otherwise ambiguous tables that cannot pass
+  this validation remain unchanged and are reported. Tables remain translated in the readable PDF.
 - Translated text that cannot fit at the minimum 60% scale is reported and the source region is
   retained instead of silently deleting text or shrinking it to an unreadable size.
 - Figure detection follows Marker/Surya structured regions. False-positive visual regions or missed

@@ -219,6 +219,11 @@ class MarkerDocumentBuilder:
             )
         return chunks
 
+    def chunks_from_blocks(self, blocks: list[Block]) -> list[ExtractionChunk]:
+        """Rebuild extraction chunks after a source-backed structural repair."""
+
+        return self._chunks_from_blocks(blocks)
+
     def _page_payloads(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, dict):
             if str(payload.get("block_type", "")).lower() == "document":
