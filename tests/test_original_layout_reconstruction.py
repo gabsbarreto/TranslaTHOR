@@ -566,6 +566,451 @@ def test_vector_grid_table_is_reconstructed_cell_by_cell(tmp_path: Path) -> None
     assert report["regions_replaced"] == 2
 
 
+def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Path) -> None:
+    page_width, page_height = 320, 240
+    scan_path = tmp_path / "table-scan.png"
+    scan = Image.new("RGB", (page_width, page_height), "white")
+    drawing = ImageDraw.Draw(scan)
+    xs = [30, 150, 290]
+    ys = [35, 65, 95]
+    for x in xs:
+        drawing.line((x, ys[0], x, ys[-1]), fill="black", width=2)
+    for y in ys:
+        drawing.line((xs[0], y, xs[-1], y), fill="black", width=2)
+    visible_cells = [
+        ((42, 44), "Diagnostico"),
+        ((205, 44), "N"),
+        ((42, 74), "Depresion"),
+        ((205, 74), "15"),
+    ]
+    for position, text in visible_cells:
+        drawing.text(position, text, fill="black")
+    drawing.text((30, 105), "TABLA I. Resultados", fill="black")
+    drawing.rectangle((220, 155, 295, 225), fill=(30, 90, 180), outline="black", width=2)
+    scan.save(scan_path)
+
+    source = tmp_path / "hidden-ocr-table.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=page_width, height=page_height)
+    page.insert_image(page.rect, filename=str(scan_path))
+    for x in xs:
+        page.draw_line((x, ys[0]), (x, ys[-1]), color=(0, 0, 0), width=0.5)
+    for y in ys:
+        page.draw_line((xs[0], y), (xs[-1], y), color=(0, 0, 0), width=0.5)
+    hidden_cells = [
+        (fitz.Rect(32, 37, 148, 63), "Diagnostico"),
+        (fitz.Rect(152, 37, 288, 63), "N"),
+        (fitz.Rect(32, 67, 148, 93), "Depresion"),
+        (fitz.Rect(152, 67, 288, 93), "15"),
+    ]
+    for rectangle, text in hidden_cells:
+        page.insert_textbox(
+            rectangle,
+            text,
+            fontsize=9,
+            align=fitz.TEXT_ALIGN_CENTER,
+            render_mode=3,
+        )
+    page.insert_textbox(
+        fitz.Rect(30, 101, 250, 120),
+        "TABLA I. Resultados",
+        fontsize=8,
+        render_mode=3,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    source_table = (
+        "| Diagnostico | N |\n"
+        "|---|---|\n"
+        "| Depresion | 15 |"
+    )
+    translated_table = (
+        "| Diagnosis | N | "
+        "|---|---| "
+        "| Depression | 15 |"
+    )
+    table = Block(
+        id="ocr-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_table,
+        bbox=BoundingBox(x0=30, y0=35, x1=290, y1=95),
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": source_table.replace("\n", " "),
+            "source_text_before_cleaning": source_table,
+            "translated_from_block_ids": ["ocr-table"],
+        },
+    )
+    caption = Block(
+        id="ocr-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Table I. Results",
+        bbox=BoundingBox(x0=30, y0=101, x1=250, y1=120),
+        reading_order_index=1,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": "TABLA I. Resultados",
+            "translated_from_block_ids": ["ocr-caption"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=page_width,
+                height=page_height,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[table, caption],
+        figures=[
+            FigureAsset(
+                id="figure",
+                page_number=1,
+                bbox=BoundingBox(x0=220, y0=155, x1=295, y1=225),
+            )
+        ],
+    )
+
+    output = tmp_path / "hidden-ocr-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "hidden-ocr-table-report.json",
+    )
+
+    with fitz.open(output) as translated:
+        output_text = translated[0].get_text("text")
+        assert "Diagnosis" in output_text
+        assert "Depression" in output_text
+        assert "Table I. Results" in output_text
+        assert "Diagnostico" not in output_text
+        assert "Depresion" not in output_text
+    assert report["raster_tables_reconstructed"] == 1
+    assert report["scan_overlay_pages"] == 1
+    # Only changed text cells plus the caption are masked. Unchanged numeric
+    # and symbol cells stay pixel-identical so arrows and annotations survive.
+    assert report["scan_text_masks"] == 3
+    assert report["pages"][0]["reconstruction_strategy"] == "ocr_table_overlay"
+
+    source_image = _render_rgb(source, scale=2)
+    output_image = _render_rgb(output, scale=2)
+    figure_box = (440, 310, 590, 450)
+    assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
+    for coordinate in ((60, 70), (300, 70), (580, 70), (60, 130), (60, 190)):
+        assert source_image.getpixel(coordinate) == output_image.getpixel(coordinate)
+
+    approved = Image.new("L", source_image.size, 0)
+    approved_draw = ImageDraw.Draw(approved)
+    for region in report["regions"]:
+        assert region["source_text_masks"]
+        for box in [region["bbox"], *region["source_text_masks"]]:
+            approved_draw.rectangle(
+                (
+                    round(box["x0"] * 2) - 2,
+                    round(box["y0"] * 2) - 2,
+                    round(box["x1"] * 2) + 2,
+                    round(box["y1"] * 2) + 2,
+                ),
+                fill=255,
+            )
+    difference = ImageChops.difference(source_image, output_image)
+    outside_difference = Image.composite(
+        Image.new("RGB", difference.size, "black"),
+        difference,
+        approved,
+    )
+    assert outside_difference.getbbox() is None
+
+
+def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -> None:
+    source = tmp_path / "empty-cell-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=150)
+    xs = [30, 150, 270]
+    ys = [30, 60, 90]
+    for x in xs:
+        page.draw_line((x, ys[0]), (x, ys[-1]), color=(0, 0, 0), width=0.6)
+    for y in ys:
+        page.draw_line((xs[0], y), (xs[-1], y), color=(0, 0, 0), width=0.6)
+    page.insert_textbox(
+        fitz.Rect(34, 34, 146, 56),
+        "Source header words",
+        fontsize=7,
+        align=fitz.TEXT_ALIGN_CENTER,
+    )
+    page.draw_line((175, 45), (240, 45), color=(0.1, 0.2, 0.8), width=1.2)
+    page.draw_polyline(
+        [(240, 45), (234, 41), (234, 49)],
+        color=(0.1, 0.2, 0.8),
+        width=1.2,
+    )
+    page.insert_textbox(
+        fitz.Rect(34, 64, 146, 86),
+        "Second source label",
+        fontsize=7,
+        align=fitz.TEXT_ALIGN_CENTER,
+    )
+    page.insert_textbox(
+        fitz.Rect(154, 64, 266, 86),
+        "value here",
+        fontsize=7,
+        align=fitz.TEXT_ALIGN_CENTER,
+    )
+    page.insert_text((40, 115), "UNRELATED BODY TEXT", fontsize=8)
+    pdf.save(source)
+    pdf.close()
+
+    source_table = (
+        "| Source header words | |\n"
+        "|---|---|\n"
+        "| Second source label | value here |"
+    )
+    translated_table = (
+        "| Source header words | Invented text |\n"
+        "|---|---|\n"
+        "| Second source label | value here |"
+    )
+    table = Block(
+        id="unsafe-empty-cell",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_table,
+        bbox=BoundingBox(x0=30, y0=30, x1=270, y1=90),
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": source_table,
+            "source_text_before_cleaning": source_table,
+            "translated_from_block_ids": ["unsafe-empty-cell"],
+        },
+    )
+    drifted_caption = Block(
+        id="drifted-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Table I. Translated caption",
+        bbox=BoundingBox(x0=30, y0=100, x1=270, y1=125),
+        reading_order_index=1,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": "TABLA I. Leyenda original",
+            "translated_from_block_ids": ["drifted-caption"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=150,
+                has_embedded_text=True,
+                embedded_text_quality=0.1,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[table, drifted_caption],
+    )
+    output = tmp_path / "empty-cell-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "empty-cell-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert report["raster_tables_reconstructed"] == 0
+    assert any(
+        region.get("reason") == "table_translation_added_content_to_empty_source_cell"
+        for region in report["regions"]
+    )
+    assert any(
+        region.get("reason") == "caption_hidden_ocr_text_mismatch"
+        for region in report["regions"]
+    )
+    assert ImageChops.difference(
+        _render_rgb(source, scale=2),
+        _render_rgb(output, scale=2),
+    ).getbbox() is None
+
+
+def test_scan_background_sampling_preserves_light_cell_colour(tmp_path: Path) -> None:
+    source = tmp_path / "coloured-cell.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=220, height=120)
+    page.draw_rect(
+        fitz.Rect(20, 20, 200, 100),
+        color=None,
+        fill=(0.92, 0.96, 1.0),
+    )
+    page.insert_text((60, 62), "SOURCE LABEL", fontsize=9)
+    pdf.save(source)
+    pdf.close()
+
+    with fitz.open(source) as opened:
+        fill, metadata = OriginalLayoutReconstructor()._scan_background_fill(
+            opened[0],
+            BoundingBox(x0=20, y0=20, x1=200, y1=100),
+        )
+
+    assert fill is not None
+    assert fill[2] > fill[1] > fill[0]
+    assert metadata["background_uniform_ratio"] > 0.8
+    assert metadata["sampled_background_rgb"][2] >= 250
+
+
+def test_scan_background_sampling_rejects_mixed_cell_background(tmp_path: Path) -> None:
+    source = tmp_path / "mixed-cell.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=220, height=120)
+    page.draw_rect(fitz.Rect(20, 20, 110, 100), color=None, fill=(1.0, 1.0, 1.0))
+    page.draw_rect(fitz.Rect(110, 20, 200, 100), color=None, fill=(0.86, 0.94, 1.0))
+    pdf.save(source)
+    pdf.close()
+
+    with fitz.open(source) as opened:
+        fill, metadata = OriginalLayoutReconstructor()._scan_background_fill(
+            opened[0],
+            BoundingBox(x0=20, y0=20, x1=200, y1=100),
+        )
+
+    assert fill is None
+    assert metadata["reason"] == "background_not_uniform_or_light"
+    assert metadata["background_uniform_ratio"] < 0.8
+
+
+def test_table_overflow_is_atomic_across_all_cells(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    source = tmp_path / "atomic-table-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=150)
+    xs = [30, 150, 270]
+    ys = [30, 60, 90]
+    for x in xs:
+        page.draw_line((x, ys[0]), (x, ys[-1]), color=(0, 0, 0), width=0.6)
+    for y in ys:
+        page.draw_line((xs[0], y), (xs[-1], y), color=(0, 0, 0), width=0.6)
+    for rectangle, text in (
+        (fitz.Rect(34, 34, 146, 56), "Uno"),
+        (fitz.Rect(154, 34, 266, 56), "Dos"),
+        (fitz.Rect(34, 64, 146, 86), "Tres"),
+        (fitz.Rect(154, 64, 266, 86), "Cuatro"),
+    ):
+        page.insert_textbox(rectangle, text, fontsize=8, align=fitz.TEXT_ALIGN_CENTER)
+    pdf.save(source)
+    pdf.close()
+
+    source_table = "| Uno | Dos |\n|---|---|\n| Tres | Cuatro |"
+    translated_table = "| One | Two |\n|---|---|\n| Three | Four |"
+    table = Block(
+        id="atomic-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_table,
+        bbox=BoundingBox(x0=30, y0=30, x1=270, y1=90),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_table,
+            "source_text_before_cleaning": source_table,
+            "translated_from_block_ids": ["atomic-table"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=150,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[table],
+    )
+    reconstructor = OriginalLayoutReconstructor()
+    preflight_calls = 0
+
+    def fail_second_preflight(**_kwargs) -> tuple[float, float]:
+        nonlocal preflight_calls
+        preflight_calls += 1
+        return (-1.0, 0.5) if preflight_calls == 2 else (1.0, 1.0)
+
+    reconstructor._preflight = fail_second_preflight  # type: ignore[method-assign]
+    output = tmp_path / "atomic-table-output.pdf"
+    report = reconstructor.reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "atomic-table-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert report["text_boxes_did_not_fit"] == 1
+    assert any(
+        region.get("reason") == "table_atomic_reconstruction_overflow"
+        for region in report["regions"]
+    )
+    assert ImageChops.difference(
+        _render_rgb(source, scale=2),
+        _render_rgb(output, scale=2),
+    ).getbbox() is None
+
+    postflight_reconstructor = OriginalLayoutReconstructor()
+    postflight_reconstructor._preflight = (  # type: ignore[method-assign]
+        lambda **_kwargs: (1.0, 1.0)
+    )
+    original_insert_htmlbox = fitz.Page.insert_htmlbox
+    insert_calls = 0
+
+    def fail_second_real_insert(page, *args, **kwargs):
+        nonlocal insert_calls
+        insert_calls += 1
+        if insert_calls == 2:
+            return -1.0, 0.5
+        return original_insert_htmlbox(page, *args, **kwargs)
+
+    monkeypatch.setattr(fitz.Page, "insert_htmlbox", fail_second_real_insert)
+    postflight_output = tmp_path / "atomic-postflight-output.pdf"
+    postflight_report = postflight_reconstructor.reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=postflight_output,
+        document=document,
+        report_path=tmp_path / "atomic-postflight-report.json",
+    )
+
+    assert postflight_report["regions_replaced"] == 0
+    assert postflight_report["regions_skipped"] == 4
+    assert postflight_report["pages"][0]["status"] == "fallback_original_page"
+    assert postflight_report["raster_tables_reconstructed"] == 0
+    assert any(
+        warning["code"] == "page_reconstruction_rolled_back"
+        for warning in postflight_report["warnings"]
+    )
+    assert all(
+        entry["status"] == "rolled_back"
+        for entry in postflight_report["scaling_applied"]
+    )
+    assert ImageChops.difference(
+        _render_rgb(source, scale=2),
+        _render_rgb(postflight_output, scale=2),
+    ).getbbox() is None
+
+
 def test_unreliable_table_structure_is_retained_with_warning(tmp_path: Path) -> None:
     source = tmp_path / "bad-table-source.pdf"
     pdf = fitz.open()

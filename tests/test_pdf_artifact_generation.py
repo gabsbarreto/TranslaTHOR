@@ -8,9 +8,14 @@ from fastapi import HTTPException
 import app.main as main
 import app.services.job_store as job_store_module
 from app.models.schema import (
+    Block,
+    BlockType,
     DocumentMetadata,
     DocumentModel,
     JobStage,
+    PageMetadata,
+    SourceType,
+    TableModel,
 )
 from app.services.job_store import JobStore
 
@@ -79,6 +84,83 @@ def test_translated_pdf_is_rejected_until_translation_is_complete(
         main._ensure_pdf_artifact(job_id, "pdf_readable")
 
     assert error.value.status_code == 409
+
+
+def test_readable_artifact_uses_translated_table_block_from_structured_json(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(job_store_module, "JOBS_DIR", jobs_dir)
+    store = JobStore()
+    fake_reconstructor = _FakeReconstructor()
+    monkeypatch.setattr(main, "job_store", store)
+    monkeypatch.setattr(main, "reconstructor", fake_reconstructor)
+
+    job_id, job_dir = store.create_job("Scanned Table.pdf")
+    structured_path = job_dir / "artifacts" / "structured.json"
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="Scanned Table.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=0.1,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            Block(
+                id="table-block",
+                page_number=1,
+                block_type=BlockType.TABLE,
+                text="| English header |\n|---|\n| English cell |",
+                reading_order_index=0,
+                source_type=SourceType.OCR,
+                metadata={
+                    "source_text_before_cleaning": (
+                        "| Spanish header |\n|---|\n| Spanish cell |"
+                    ),
+                    "translated_from_block_ids": ["table-block"],
+                },
+            ),
+            Block(
+                id="caption",
+                page_number=1,
+                block_type=BlockType.CAPTION,
+                text="Table I. English caption",
+                reading_order_index=1,
+                source_type=SourceType.OCR,
+            ),
+        ],
+        tables=[
+            TableModel(
+                id="stale-table",
+                page_numbers=[1],
+                headers=["Spanish header"],
+                rows=[["Spanish cell"]],
+                cells=[[TableModel.TableCell(text="Spanish cell")]],
+            )
+        ],
+    )
+    structured_path.write_text(document.model_dump_json(), encoding="utf-8")
+    store.update_status(
+        job_id,
+        stage=JobStage.COMPLETE,
+        artifacts={"json": str(structured_path)},
+    )
+
+    pdf_path = main._ensure_pdf_artifact(job_id, "pdf_readable")
+    rendered = pdf_path.read_text(encoding="utf-8")
+
+    assert "English header" in rendered
+    assert "English cell" in rendered
+    assert "Spanish header" not in rendered
+    assert "Spanish cell" not in rendered
+    assert rendered.count("Table I. English caption") == 1
 
 
 class _FakeOriginalLayoutReconstructor:

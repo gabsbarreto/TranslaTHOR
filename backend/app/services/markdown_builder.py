@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from app.models.schema import Block, BlockType, DocumentModel, FigureAsset, TableModel
+from app.services.table_markup import parse_table_rows, rows_have_consistent_shape
 
 
 class MarkdownBuilder:
@@ -19,11 +20,15 @@ class MarkdownBuilder:
             for block in document.blocks
             if block.block_type == BlockType.CAPTION
         }
+        table_caption_by_id = self._table_caption_map(document, caption_by_id)
         associated_caption_ids = {
             figure.caption_block_id
             for figure in document.figures
             if figure.caption_block_id
         }
+        associated_caption_ids.update(
+            caption.id for caption in table_caption_by_id.values()
+        )
         figure_anchors = self._figure_anchors(document, caption_by_id)
         rendered_figures: set[str] = set()
         tables_by_page: dict[int, list[TableModel]] = {}
@@ -58,20 +63,20 @@ class MarkdownBuilder:
                     document,
                     block,
                     tables_by_page.get(block.page_number, []),
+                    rendered_tables,
                 )
                 if matched_table is not None:
                     if matched_table.id in rendered_tables:
                         continue
-                    if self._render_table_from_block_text(matched_table, block.text):
-                        lines.append(block.text.strip() + "\n")
-                    else:
-                        title = matched_table.caption or f"Table {len(rendered_tables) + 1}"
-                        lines.append(f"\n### {title}\n")
-                        lines.append(self._table_html(matched_table))
-                        if matched_table.notes:
-                            lines.append(f"\n<small>{matched_table.notes}</small>\n")
-                        if matched_table.fallback_image_path:
-                            lines.append(f"\n![{title}]({matched_table.fallback_image_path})\n")
+                    lines.append(
+                        self._table_figure_html(
+                            matched_table,
+                            block=block,
+                            caption_by_id=caption_by_id,
+                            caption_block=table_caption_by_id.get(matched_table.id),
+                            ordinal=len(rendered_tables) + 1,
+                        )
+                    )
                     rendered_tables.add(matched_table.id)
                 elif block.text.strip():
                     lines.append(block.text.strip() + "\n")
@@ -98,13 +103,15 @@ class MarkdownBuilder:
         for table in document.tables:
             if table.id in rendered_tables:
                 continue
-            title = table.caption or f"Table {len(rendered_tables) + 1}"
-            lines.append(f"\n### {title}\n")
-            lines.append(self._table_html(table))
-            if table.notes:
-                lines.append(f"\n<small>{table.notes}</small>\n")
-            if table.fallback_image_path:
-                lines.append(f"\n![{title}]({table.fallback_image_path})\n")
+            lines.append(
+                self._table_figure_html(
+                    table,
+                    block=None,
+                    caption_by_id=caption_by_id,
+                    caption_block=table_caption_by_id.get(table.id),
+                    ordinal=len(rendered_tables) + 1,
+                )
+            )
             rendered_tables.add(table.id)
 
         return "\n".join(lines)
@@ -134,13 +141,16 @@ class MarkdownBuilder:
         document: DocumentModel,
         block: Block,
         page_tables: list[TableModel],
+        rendered_table_ids: set[str],
     ) -> TableModel | None:
         for table in page_tables:
-            if getattr(table, "debug", {}).get("marker_block_id") == block.id:
+            debug = getattr(table, "debug", {})
+            if debug.get("marker_block_id") == block.id or debug.get("source_block_id") == block.id:
                 return table
-        if page_tables:
-            return page_tables[0]
-        return None
+        return next(
+            (table for table in page_tables if table.id not in rendered_table_ids),
+            None,
+        )
 
     def _render_table_from_block_text(self, table: TableModel, block_text: str) -> bool:
         debug = getattr(table, "debug", {})
@@ -154,7 +164,196 @@ class MarkdownBuilder:
         return str(metadata.get("marker_block_type", "")).lower() == "tablecell"
 
     def _escape_table_cell(self, text: str) -> str:
-        return str(text).replace("\n", "<br>").replace("|", "\\|").strip()
+        return html.escape(str(text).strip()).replace("\n", "<br>")
+
+    def _table_figure_html(
+        self,
+        table: TableModel,
+        *,
+        block: Block | None,
+        caption_by_id: dict[str, Block],
+        caption_block: Block | None,
+        ordinal: int,
+    ) -> str:
+        rendered_table = table
+        if block is not None and self._render_table_from_block_text(table, block.text):
+            table_markup = block.text.strip()
+        else:
+            if block is not None:
+                rendered_table = self._table_with_block_translation(table, block)
+            table_markup = (
+                self._table_html(rendered_table)
+                if rendered_table.headers or rendered_table.rows or rendered_table.cells
+                else ""
+            )
+
+        if caption_block is None and table.caption_block_id:
+            caption_block = caption_by_id.get(table.caption_block_id)
+        caption = (
+            caption_block.text.strip()
+            if caption_block is not None and caption_block.text.strip()
+            else str(table.caption or "").strip()
+        )
+        if not caption:
+            caption = f"Table {ordinal}"
+
+        parts = ['<figure class="document-table">']
+        if table_markup.strip():
+            parts.append(table_markup)
+        elif table.fallback_image_path:
+            path = html.escape(str(Path(table.fallback_image_path).resolve()), quote=True)
+            parts.append(f'<img src="{path}" alt="{html.escape(caption, quote=True)}">')
+        if table.notes:
+            parts.append(f'<small class="table-notes">{html.escape(table.notes)}</small>')
+        parts.append(f"<figcaption>{html.escape(caption)}</figcaption>")
+        parts.append("</figure>\n")
+        return "\n".join(parts)
+
+    def _table_caption_map(
+        self,
+        document: DocumentModel,
+        caption_by_id: dict[str, Block],
+    ) -> dict[str, Block]:
+        """Resolve captions without mutating older persisted structured JSON.
+
+        Newly extracted tables carry ``caption_block_id``. Jobs created before
+        that link existed still contain a reliable table block followed by its
+        caption, so reconstruction recovers that narrow relationship at render
+        time and suppresses the standalone duplicate caption.
+        """
+
+        resolved: dict[str, Block] = {}
+        claimed_caption_ids: set[str] = set()
+        for table in document.tables:
+            if not table.caption_block_id:
+                continue
+            caption = caption_by_id.get(table.caption_block_id)
+            if caption is None:
+                continue
+            resolved[table.id] = caption
+            claimed_caption_ids.add(caption.id)
+
+        table_blocks_by_page: dict[int, list[Block]] = {}
+        for block in document.blocks:
+            if block.block_type == BlockType.TABLE:
+                table_blocks_by_page.setdefault(block.page_number, []).append(block)
+        for blocks in table_blocks_by_page.values():
+            blocks.sort(key=lambda item: item.reading_order_index)
+
+        claimed_table_block_ids: set[str] = set()
+        table_block_by_table_id: dict[str, Block] = {}
+        for table in document.tables:
+            page_number = table.page_numbers[0] if table.page_numbers else table.page
+            if page_number is None:
+                continue
+            candidates = table_blocks_by_page.get(page_number, [])
+            source_id = str(
+                table.debug.get("source_block_id")
+                or table.debug.get("marker_block_id")
+                or ""
+            )
+            table_block = next(
+                (candidate for candidate in candidates if candidate.id == source_id),
+                None,
+            )
+            if table_block is None:
+                table_block = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.id not in claimed_table_block_ids
+                    ),
+                    None,
+                )
+            if table_block is None:
+                continue
+            claimed_table_block_ids.add(table_block.id)
+            table_block_by_table_id[table.id] = table_block
+
+        for table in document.tables:
+            if table.id in resolved:
+                continue
+            table_block = table_block_by_table_id.get(table.id)
+            if table_block is None:
+                continue
+            page_number = table_block.page_number
+
+            caption_candidates = [
+                caption
+                for caption in caption_by_id.values()
+                if caption.page_number == page_number
+                and caption.id not in claimed_caption_ids
+                and 0 < caption.reading_order_index - table_block.reading_order_index <= 2
+            ]
+            if table_block.bbox is not None:
+                caption_candidates = [
+                    caption
+                    for caption in caption_candidates
+                    if caption.bbox is None
+                    or (
+                        caption.bbox.y0 >= table_block.bbox.y1 - 4.0
+                        and self._horizontal_overlap_ratio(
+                            table_block.bbox,
+                            caption.bbox,
+                        )
+                        >= 0.2
+                    )
+                ]
+            if not caption_candidates:
+                continue
+            caption = min(
+                caption_candidates,
+                key=lambda item: item.reading_order_index,
+            )
+            resolved[table.id] = caption
+            claimed_caption_ids.add(caption.id)
+        return resolved
+
+    def _horizontal_overlap_ratio(
+        self,
+        first,
+        second,
+    ) -> float:
+        overlap = max(0.0, min(first.x1, second.x1) - max(first.x0, second.x0))
+        return overlap / max(1.0, min(first.x1 - first.x0, second.x1 - second.x0))
+
+    def _table_with_block_translation(self, table: TableModel, block: Block) -> TableModel:
+        source_hint = str(
+            block.metadata.get("source_text_before_cleaning")
+            or block.metadata.get("source_text")
+            or ""
+        )
+        rows = parse_table_rows(block.text, source_hint=source_hint)
+        if not rows_have_consistent_shape(rows):
+            return table
+
+        expected_rows = (1 if table.headers else 0) + len(table.rows)
+        expected_columns = len(table.headers) or (len(table.rows[0]) if table.rows else 0)
+        if expected_rows and len(rows) != expected_rows:
+            return table
+        if expected_columns and any(len(row) != expected_columns for row in rows):
+            return table
+
+        rendered = table.model_copy(deep=True)
+        body_start = 0
+        if table.headers:
+            rendered.headers = [cell.text for cell in rows[0]]
+            body_start = 1
+        body = rows[body_start:]
+        rendered.rows = [[cell.text for cell in row] for row in body]
+        rendered.cells = [
+            [
+                (
+                    table.cells[row_index][column_index].model_copy(update={"text": cell.text})
+                    if row_index < len(table.cells)
+                    and column_index < len(table.cells[row_index])
+                    else TableModel.TableCell(text=cell.text)
+                )
+                for column_index, cell in enumerate(row)
+            ]
+            for row_index, row in enumerate(body)
+        ]
+        return rendered
 
     def _table_html(self, table: TableModel) -> str:
         rows = table.cells or []

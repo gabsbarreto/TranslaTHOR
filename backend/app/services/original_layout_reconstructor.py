@@ -8,7 +8,6 @@ import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
-from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,7 @@ from app.services.pdf_coordinates import (
     bbox_intersection_area,
     convert_bbox_to_pdf,
 )
+from app.services.table_markup import ParsedTableCell, parse_table_rows
 
 logger = logging.getLogger(__name__)
 
@@ -34,55 +34,9 @@ class _ReplacementRegion:
     source_text: str
     style_hints: dict[str, Any]
     coordinate_metadata: list[dict[str, Any]]
-
-
-@dataclass
-class _ParsedTableCell:
-    tag: str
-    text: str
-
-
-class _TableHTMLParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.rows: list[list[_ParsedTableCell]] = []
-        self._row: list[_ParsedTableCell] | None = None
-        self._cell_tag: str | None = None
-        self._cell_parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        _ = attrs
-        normalized = tag.lower()
-        if normalized == "tr":
-            self._row = []
-        elif normalized in {"td", "th"} and self._row is not None:
-            self._cell_tag = normalized
-            self._cell_parts = []
-        elif normalized == "br" and self._cell_tag is not None:
-            self._cell_parts.append("\n")
-
-    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        self.handle_starttag(tag, attrs)
-
-    def handle_data(self, data: str) -> None:
-        if self._cell_tag is not None:
-            self._cell_parts.append(data)
-
-    def handle_endtag(self, tag: str) -> None:
-        normalized = tag.lower()
-        if normalized in {"td", "th"} and self._row is not None and self._cell_tag is not None:
-            text = "\n".join(
-                line.strip()
-                for line in "".join(self._cell_parts).splitlines()
-                if line.strip()
-            )
-            self._row.append(_ParsedTableCell(tag=self._cell_tag, text=text))
-            self._cell_tag = None
-            self._cell_parts = []
-        elif normalized == "tr" and self._row is not None:
-            if self._row:
-                self.rows.append(self._row)
-            self._row = None
+    redaction_bboxes: list[BoundingBox] | None = None
+    redaction_fill: tuple[float, float, float] | None = None
+    reconstruction_strategy: str = "embedded_text_replacement"
 
 
 class OriginalLayoutReconstructor:
@@ -131,18 +85,21 @@ class OriginalLayoutReconstructor:
                 page_report: dict[str, Any] = {
                     "page_number": page_number,
                     "status": "unchanged",
+                    "reconstruction_strategy": "none",
                     "regions_replaced": 0,
                     "regions_skipped": 0,
                     "fallback_required": False,
                     "warnings": [],
                 }
                 report["pages"].append(page_report)
-                supported, reason = self._page_is_supported(
+                strategy, reason = self._page_strategy(
                     page,
                     page_metadata.get(page_number),
+                    blocks_by_page.get(page_number, []),
                 )
-                if not supported:
+                if strategy == "unsupported":
                     page_report["status"] = "fallback_original_page"
+                    page_report["fallback_required"] = True
                     page_report["warnings"].append(reason)
                     report["pages_using_fallback_behavior"] += 1
                     self._warning(
@@ -153,6 +110,23 @@ class OriginalLayoutReconstructor:
                     )
                     continue
 
+                scan_table_only = strategy == "ocr_table_overlay"
+                page_report["reconstruction_strategy"] = strategy
+                if scan_table_only:
+                    page_report["fallback_required"] = True
+                    warning = (
+                        "Only validated table cells are reconstructed on this OCR page; "
+                        "other scanned text remains unchanged."
+                    )
+                    page_report["warnings"].append(warning)
+                    report["scan_overlay_pages"] += 1
+                    self._warning(
+                        report,
+                        page_number=page_number,
+                        code="ocr_page_table_only_reconstruction",
+                        reason=warning,
+                    )
+
                 replacements = self._replacement_regions(
                     page=page,
                     page_number=page_number,
@@ -162,6 +136,7 @@ class OriginalLayoutReconstructor:
                     recovered_translations=recovered_translations,
                     report=report,
                     page_report=page_report,
+                    scan_table_only=scan_table_only,
                 )
                 approved: list[tuple[_ReplacementRegion, str, str, float]] = []
                 for region in replacements:
@@ -204,60 +179,127 @@ class OriginalLayoutReconstructor:
                         report["pages_successfully_reconstructed"] += 1
                     continue
 
+                backup = fitz.open()
+                backup.insert_pdf(
+                    pdf,
+                    from_page=page_number - 1,
+                    to_page=page_number - 1,
+                )
                 original_links = page.get_links()
-                for region, _html_text, _css, _scale in approved:
-                    page.add_redact_annot(
-                        self._fitz_rect(region.bbox),
-                        fill=None,
-                        cross_out=False,
-                    )
-                page.apply_redactions(images=0, graphics=0, text=0)
+                transaction_entries: list[dict[str, Any]] = []
+                failed_region: _ReplacementRegion | None = None
+                failed_scale = 0.0
+                transaction_error: str | None = None
+                try:
+                    for region, _html_text, _css, _scale in approved:
+                        redaction_bboxes = region.redaction_bboxes or [region.bbox]
+                        for redaction_bbox in redaction_bboxes:
+                            page.add_redact_annot(
+                                self._fitz_rect(redaction_bbox),
+                                fill=region.redaction_fill,
+                                cross_out=False,
+                            )
+                    if not page.apply_redactions(images=0, graphics=0, text=0):
+                        raise RuntimeError("redactions_not_applied")
 
-                page_failed = False
-                for region, html_text, css, _preflight_scale in approved:
-                    spare_height, scale = page.insert_htmlbox(
-                        self._fitz_rect(region.bbox),
-                        html_text,
-                        css=css,
-                        scale_low=self.minimum_scale,
-                        overlay=True,
+                    for region, html_text, css, _preflight_scale in approved:
+                        try:
+                            spare_height, scale = page.insert_htmlbox(
+                                self._fitz_rect(region.bbox),
+                                html_text,
+                                css=css,
+                                scale_low=self.minimum_scale,
+                                overlay=True,
+                            )
+                        except Exception as exc:
+                            failed_region = region
+                            transaction_error = f"text_insertion_error:{type(exc).__name__}"
+                            break
+                        entry = {
+                            "page_number": page_number,
+                            "block_ids": region.block_ids,
+                            "block_type": region.block_type.value,
+                            "bbox": region.bbox.model_dump(),
+                            "reconstruction_strategy": region.reconstruction_strategy,
+                            "source_text_mask_count": len(region.redaction_bboxes or []),
+                            "source_text_masks": [
+                                bbox.model_dump()
+                                for bbox in (region.redaction_bboxes or [])
+                            ],
+                            "coordinate_metadata": region.coordinate_metadata,
+                            "scale": round(float(scale), 6),
+                            "spare_height": round(float(spare_height), 6),
+                        }
+                        transaction_entries.append(entry)
+                        if spare_height < 0 or scale < self.minimum_scale:
+                            failed_region = region
+                            failed_scale = float(scale)
+                            transaction_error = "unexpected_post_redaction_overflow"
+                            report["text_boxes_did_not_fit"] += 1
+                            break
+                except Exception as exc:
+                    failed_region = failed_region or approved[0][0]
+                    transaction_error = f"page_reconstruction_error:{type(exc).__name__}"
+
+                if failed_region is not None:
+                    for entry in transaction_entries:
+                        report["scaling_applied"].append({**entry, "status": "rolled_back"})
+                    page = None
+                    pdf.delete_page(page_number - 1)
+                    pdf.insert_pdf(backup, from_page=0, to_page=0, start_at=page_number - 1)
+                    backup.close()
+                    page_report["regions_skipped"] += len(approved)
+                    page_report["fallback_required"] = True
+                    page_report["status"] = "fallback_original_page"
+                    failed_reason = (
+                        "unexpected_post_redaction_overflow"
+                        if transaction_error == "unexpected_post_redaction_overflow"
+                        else "page_reconstruction_transaction_failed"
                     )
-                    entry = {
-                        "page_number": page_number,
-                        "block_ids": region.block_ids,
-                        "block_type": region.block_type.value,
-                        "bbox": region.bbox.model_dump(),
-                        "scale": round(float(scale), 6),
-                        "spare_height": round(float(spare_height), 6),
-                    }
-                    report["scaling_applied"].append(entry)
-                    if spare_height < 0 or scale < self.minimum_scale:
-                        page_failed = True
-                        report["text_boxes_did_not_fit"] += 1
-                        page_report["regions_skipped"] += 1
-                        page_report["fallback_required"] = True
+                    for region, _html_text, _css, preflight_scale in approved:
                         self._skipped_region(
                             report,
                             region,
-                            reason="unexpected_post_redaction_overflow",
-                            scale=scale,
-                        )
-                        self._warning(
-                            report,
-                            page_number=page_number,
-                            code="unexpected_post_redaction_overflow",
                             reason=(
-                                f"Text insertion unexpectedly failed for {', '.join(region.block_ids)} "
-                                "after a successful preflight."
+                                failed_reason
+                                if region is failed_region
+                                else "page_transaction_rolled_back_after_insertion_failure"
                             ),
+                            scale=failed_scale or preflight_scale,
                         )
-                        continue
+                    self._warning(
+                        report,
+                        page_number=page_number,
+                        code="page_reconstruction_rolled_back",
+                        reason=(
+                            f"Page reconstruction was rolled back after {transaction_error}; "
+                            "the complete original page was retained."
+                        ),
+                    )
+                    report["pages_using_fallback_behavior"] += 1
+                    continue
+
+                backup.close()
+                self._restore_missing_links(page, original_links, report, page_number)
+                for entry, (region, _html_text, _css, _preflight_scale) in zip(
+                    transaction_entries,
+                    approved,
+                    strict=True,
+                ):
+                    report["scaling_applied"].append({**entry, "status": "committed"})
                     report["regions_replaced"] += 1
                     page_report["regions_replaced"] += 1
+                    report["scan_text_masks"] += len(region.redaction_bboxes or [])
                     report["regions"].append({**entry, "status": "replaced"})
-
-                self._restore_missing_links(page, original_links, report, page_number)
-                if page_failed or page_report["fallback_required"]:
+                raster_table_ids = {
+                    str(metadata["table_block_id"])
+                    for region, _html_text, _css, _preflight_scale in approved
+                    if region.reconstruction_strategy == "ocr_table_cell_overlay"
+                    for metadata in region.coordinate_metadata
+                    if metadata.get("table_block_id")
+                }
+                report["raster_tables_reconstructed"] += len(raster_table_ids)
+                if page_report["fallback_required"]:
                     page_report["status"] = "partial"
                     report["pages_using_fallback_behavior"] += 1
                 else:
@@ -328,29 +370,50 @@ class OriginalLayoutReconstructor:
             "warnings": [],
             "pages": [],
             "regions": [],
+            "scan_overlay_pages": 0,
+            "scan_text_masks": 0,
+            "raster_tables_reconstructed": 0,
             "safe_fallback": "readable_pdf",
             "minimum_text_scale": self.minimum_scale,
             "internal_figure_text_policy": "preserve_source_language",
         }
 
-    def _page_is_supported(self, page: fitz.Page, metadata) -> tuple[bool, str]:
+    def _page_strategy(
+        self,
+        page: fitz.Page,
+        metadata,
+        blocks: list[Block],
+    ) -> tuple[str, str]:
         if page.rotation:
-            return False, "Rotated pages are retained unchanged in this first original-layout implementation."
+            return "unsupported", "Rotated pages are retained unchanged in this first original-layout implementation."
         if metadata is None:
-            return False, "Structured page metadata is missing; the source page was retained unchanged."
+            return "unsupported", "Structured page metadata is missing; the source page was retained unchanged."
         if metadata.extraction_mode == SourceType.OCR:
+            translated_tables = [
+                block
+                for block in blocks
+                if block.block_type == BlockType.TABLE
+                and isinstance(block.metadata.get("translated_from_block_ids"), list)
+                and block.id in block.metadata.get("translated_from_block_ids", [])
+            ]
+            if (
+                metadata.has_embedded_text
+                and translated_tables
+                and len(page.get_text("words")) >= 5
+            ):
+                return "ocr_table_overlay", ""
             return (
-                False,
-                "The page was extracted through OCR, so visible source text cannot be safely removed without inpainting.",
+                "unsupported",
+                "The page was extracted through OCR and has no validated table geometry with aligned hidden-text masks; it was retained unchanged.",
             )
         if not metadata.has_embedded_text or metadata.embedded_text_quality < 0.35:
             return (
-                False,
+                "unsupported",
                 "The page is scanned, image-only, hidden-OCR, or has unreliable embedded text; it was retained unchanged.",
             )
         if len(page.get_text("text").strip()) < 5:
-            return False, "The page has no reliable removable PDF text and was retained unchanged."
-        return True, ""
+            return "unsupported", "The page has no reliable removable PDF text and was retained unchanged."
+        return "embedded_text_replacement", ""
 
     def _locked_regions(
         self,
@@ -410,11 +473,29 @@ class OriginalLayoutReconstructor:
         recovered_translations: dict[str, str],
         report: dict[str, Any],
         page_report: dict[str, Any],
+        scan_table_only: bool = False,
     ) -> list[_ReplacementRegion]:
         block_by_id = {block.id: block for block in all_blocks}
         consumed: set[str] = set()
         replacements: list[_ReplacementRegion] = []
+        scan_caption_ids: set[str] = set()
+        if scan_table_only:
+            ordered = sorted(blocks, key=lambda item: item.reading_order_index)
+            for index, candidate in enumerate(ordered[:-1]):
+                following = ordered[index + 1]
+                if (
+                    candidate.block_type == BlockType.TABLE
+                    and following.block_type == BlockType.CAPTION
+                    and following.reading_order_index - candidate.reading_order_index <= 2
+                ):
+                    scan_caption_ids.add(following.id)
         for block in blocks:
+            if (
+                scan_table_only
+                and block.block_type != BlockType.TABLE
+                and block.id not in scan_caption_ids
+            ):
+                continue
             if block.id in consumed:
                 continue
             recovered_text = recovered_translations.get(block.id)
@@ -444,6 +525,7 @@ class OriginalLayoutReconstructor:
                         locked_regions=locked_regions,
                         report=report,
                         page_report=page_report,
+                        scan_overlay=scan_table_only,
                     )
                 )
                 continue
@@ -528,8 +610,16 @@ class OriginalLayoutReconstructor:
             if source_text and self._normalized_text(source_text) == self._normalized_text(translated_text):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
-            replacements.append(
-                _ReplacementRegion(
+            if scan_table_only and not source_text:
+                self._skip_block(
+                    report,
+                    page_report,
+                    block,
+                    reason="caption_source_text_missing",
+                    bbox=bbox,
+                )
+                continue
+            replacement = _ReplacementRegion(
                     page_number=page_number,
                     block_ids=[item.id for item in source_blocks],
                     block_type=block.block_type,
@@ -539,7 +629,52 @@ class OriginalLayoutReconstructor:
                     style_hints=dict(block.style_hints or {}),
                     coordinate_metadata=conversions,
                 )
-            )
+            if scan_table_only:
+                mask_bounds = BoundingBox(
+                    x0=max(0.0, bbox.x0 - 3.0),
+                    y0=bbox.y0,
+                    x1=min(float(page.rect.width), bbox.x1 + 3.0),
+                    y1=min(float(page.rect.height), bbox.y1 + 4.0),
+                )
+                caption_similarity = self._scan_source_text_similarity(
+                    page,
+                    mask_bounds,
+                    source_text,
+                )
+                if caption_similarity["score"] < 0.62:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="caption_hidden_ocr_text_mismatch",
+                        bbox=bbox,
+                    )
+                    continue
+                masks = self._clamp_scan_masks(
+                    self._scan_text_line_masks(page, bbox, padding=3.0),
+                    mask_bounds,
+                )
+                fill, background_metadata = self._scan_background_fill(page, mask_bounds)
+                if fill is None or not masks:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="caption_scan_mask_not_reliable",
+                        bbox=bbox,
+                    )
+                    continue
+                replacement.redaction_bboxes = masks
+                replacement.redaction_fill = fill
+                replacement.reconstruction_strategy = "ocr_caption_overlay"
+                replacement.coordinate_metadata.append(
+                    {
+                        "mask_source": "hidden_ocr_line_geometry",
+                        "source_text_similarity": caption_similarity,
+                        "scan_background": background_metadata,
+                    }
+                )
+            replacements.append(replacement)
         return replacements
 
     def _recover_per_block_translations(self, document: DocumentModel) -> dict[str, str]:
@@ -589,9 +724,11 @@ class OriginalLayoutReconstructor:
         locked_regions: list[BoundingBox],
         report: dict[str, Any],
         page_report: dict[str, Any],
+        scan_overlay: bool = False,
     ) -> list[_ReplacementRegion]:
         translated_from = block.metadata.get("translated_from_block_ids")
         source_markup = str(block.metadata.get("source_text", ""))
+        source_hint = str(block.metadata.get("source_text_before_cleaning", ""))
         if (
             not isinstance(translated_from, list)
             or block.id not in translated_from
@@ -605,8 +742,8 @@ class OriginalLayoutReconstructor:
             )
             return []
 
-        source_rows = self._parse_table_rows(source_markup)
-        translated_rows = self._parse_table_rows(block.text)
+        source_rows = self._parse_table_rows(source_markup, source_hint=source_hint)
+        translated_rows = self._parse_table_rows(block.text, source_hint=source_hint)
         if (
             not source_rows
             or len(source_rows) != len(translated_rows)
@@ -645,7 +782,13 @@ class OriginalLayoutReconstructor:
             )
             return []
 
-        grid_rows = self._table_grid_rows(page, conversion.bbox)
+        expected_columns = len(source_rows[0]) if source_rows else 0
+        grid_rows, grid_strategy = self._table_grid_rows(
+            page,
+            conversion.bbox,
+            expected_rows=len(source_rows),
+            expected_columns=expected_columns,
+        )
         aligned = self._align_table_rows(
             page,
             source_rows,
@@ -671,6 +814,15 @@ class OriginalLayoutReconstructor:
                 translated_text = translated_cell.text.strip()
                 if self._normalized_text(source_text) == self._normalized_text(translated_text):
                     continue
+                if not source_text and translated_text:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="table_translation_added_content_to_empty_source_cell",
+                        bbox=conversion.bbox,
+                    )
+                    return []
                 if source_text and not translated_text:
                     self._skip_block(
                         report,
@@ -680,14 +832,18 @@ class OriginalLayoutReconstructor:
                         bbox=conversion.bbox,
                     )
                     return []
-                bbox = BoundingBox(
+                cell_bbox = BoundingBox(
                     x0=float(rectangle.x0),
                     y0=float(rectangle.y0),
                     x1=float(rectangle.x1),
                     y1=float(rectangle.y1),
                 )
+                if not translated_text:
+                    # Empty cells can contain arrows or other non-text artwork.
+                    # Leaving them untouched is part of the atomic table policy.
+                    continue
                 if any(
-                    self._overlaps_locked_region(bbox, locked)
+                    self._overlaps_locked_region(cell_bbox, locked)
                     for locked in locked_regions
                 ):
                     self._skip_block(
@@ -698,9 +854,37 @@ class OriginalLayoutReconstructor:
                         bbox=conversion.bbox,
                     )
                     return []
+                bbox = self._inset_bbox(cell_bbox, horizontal=2.0, vertical=1.0)
+                redaction_bboxes = None
+                redaction_fill: tuple[float, float, float] | None = None
+                background_metadata: dict[str, Any] = {}
+                if scan_overlay:
+                    redaction_bboxes = self._scan_cell_text_masks(page, cell_bbox)
+                    if source_text and not redaction_bboxes:
+                        self._skip_block(
+                            report,
+                            page_report,
+                            block,
+                            reason="table_source_text_masks_missing",
+                            bbox=conversion.bbox,
+                        )
+                        return []
+                    redaction_fill, background_metadata = self._scan_background_fill(
+                        page,
+                        cell_bbox,
+                    )
+                    if redaction_fill is None:
+                        self._skip_block(
+                            report,
+                            page_report,
+                            block,
+                            reason="table_scan_cell_background_not_uniform_or_light",
+                            bbox=conversion.bbox,
+                        )
+                        return []
                 style_hints = self._source_style_hints(
                     page,
-                    bbox,
+                    cell_bbox,
                     infer_alignment=True,
                 )
                 style_hints.update(
@@ -726,26 +910,62 @@ class OriginalLayoutReconstructor:
                         coordinate_metadata=[
                             {
                                 **conversion.metadata,
-                                "table_grid_detection": "pdf_vector_cell_rectangles",
+                                "table_grid_detection": grid_strategy,
                                 "table_block_id": block.id,
                                 "row_index": row_index,
                                 "column_index": column_index,
+                                "scan_background": background_metadata,
                             }
                         ],
+                        redaction_bboxes=redaction_bboxes,
+                        redaction_fill=redaction_fill,
+                        reconstruction_strategy=(
+                            "ocr_table_cell_overlay"
+                            if scan_overlay
+                            else "embedded_table_cell_replacement"
+                        ),
                     )
                 )
+        if replacements:
+            for region in replacements:
+                html_text, css = self._region_html_and_css(region, page)
+                spare_height, scale = self._preflight(
+                    page_width=page.rect.width,
+                    page_height=page.rect.height,
+                    region=region,
+                    html_text=html_text,
+                    css=css,
+                )
+                if spare_height < 0 or scale < self.minimum_scale:
+                    report["text_boxes_did_not_fit"] += 1
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="table_atomic_reconstruction_overflow",
+                        bbox=conversion.bbox,
+                    )
+                    self._warning(
+                        report,
+                        page_number=block.page_number,
+                        code="table_atomic_reconstruction_overflow",
+                        reason=(
+                            "At least one translated table cell did not fit at the minimum scale; "
+                            "the entire source table was retained."
+                        ),
+                    )
+                    return []
         return replacements
 
-    def _parse_table_rows(self, markup: str) -> list[list[_ParsedTableCell]]:
-        parser = _TableHTMLParser()
-        try:
-            parser.feed(markup)
-            parser.close()
-        except Exception:
-            return []
-        return parser.rows
+    def _parse_table_rows(
+        self,
+        markup: str,
+        *,
+        source_hint: str | None = None,
+    ) -> list[list[ParsedTableCell]]:
+        return parse_table_rows(markup, source_hint=source_hint)
 
-    def _table_markup_is_suspicious(self, rows: list[list[_ParsedTableCell]]) -> bool:
+    def _table_markup_is_suspicious(self, rows: list[list[ParsedTableCell]]) -> bool:
         lengths = [len(cell.text) for row in rows for cell in row]
         if not lengths:
             return True
@@ -757,16 +977,68 @@ class OriginalLayoutReconstructor:
         self,
         page: fitz.Page,
         bbox: BoundingBox,
-    ) -> list[list[fitz.Rect]]:
+        *,
+        expected_rows: int,
+        expected_columns: int,
+    ) -> tuple[list[list[fitz.Rect]], str]:
         table_rect = self._fitz_rect(bbox)
+        search_rect = fitz.Rect(
+            table_rect.x0 - 3.0,
+            table_rect.y0 - 3.0,
+            table_rect.x1 + 3.0,
+            table_rect.y1 + 3.0,
+        ) & page.rect
+        try:
+            finder = page.find_tables(clip=search_rect, strategy="lines_strict")
+            candidates = []
+            for table in finder.tables:
+                rows = [
+                    [fitz.Rect(cell) for cell in row.cells if cell is not None]
+                    for row in table.rows
+                ]
+                if (
+                    len(rows) == expected_rows
+                    and all(len(row) == expected_columns for row in rows)
+                ):
+                    candidate_rect = fitz.Rect(table.bbox)
+                    overlap = fitz.Rect(candidate_rect & table_rect).get_area()
+                    candidates.append((overlap, rows))
+            if candidates:
+                _overlap, rows = max(candidates, key=lambda item: item[0])
+                return rows, "pymupdf_find_tables_lines_strict"
+        except Exception as exc:
+            logger.debug("PyMuPDF table grid detection failed: %s", exc)
+
         rectangles: dict[tuple[float, float, float, float], fitz.Rect] = {}
+        verticals: list[float] = []
+        horizontals: list[float] = []
         try:
             drawings = page.get_drawings()
         except Exception:
-            return []
+            return [], "unavailable"
         for drawing in drawings:
             for item in drawing.get("items", []):
-                if not item or item[0] != "re":
+                if not item:
+                    continue
+                if item[0] == "l":
+                    start = fitz.Point(item[1])
+                    end = fitz.Point(item[2])
+                    if (
+                        abs(start.x - end.x) <= 1.2
+                        and min(start.y, end.y) <= table_rect.y0 + table_rect.height * 0.5
+                        and max(start.y, end.y) >= table_rect.y1 - table_rect.height * 0.5
+                        and table_rect.x0 - 3 <= start.x <= table_rect.x1 + 3
+                    ):
+                        verticals.append(float((start.x + end.x) / 2))
+                    if (
+                        abs(start.y - end.y) <= 1.2
+                        and min(start.x, end.x) <= table_rect.x0 + table_rect.width * 0.5
+                        and max(start.x, end.x) >= table_rect.x1 - table_rect.width * 0.5
+                        and table_rect.y0 - 3 <= start.y <= table_rect.y1 + 3
+                    ):
+                        horizontals.append(float((start.y + end.y) / 2))
+                    continue
+                if item[0] != "re":
                     continue
                 rectangle = fitz.Rect(item[1])
                 if rectangle.width < 5 or rectangle.height < 3:
@@ -801,15 +1073,271 @@ class OriginalLayoutReconstructor:
                 rows[-1].append(rectangle)
         for row in rows:
             row.sort(key=lambda value: value.x0)
-        return rows
+        if len(rows) == expected_rows and all(len(row) == expected_columns for row in rows):
+            return rows, "pdf_vector_cell_rectangles"
+
+        xs = self._cluster_coordinates(verticals)
+        ys = self._cluster_coordinates(horizontals)
+        if len(xs) == expected_columns + 1 and len(ys) == expected_rows + 1:
+            line_rows = [
+                [
+                    fitz.Rect(xs[column], ys[row], xs[column + 1], ys[row + 1])
+                    for column in range(expected_columns)
+                ]
+                for row in range(expected_rows)
+            ]
+            return line_rows, "pdf_vector_line_grid"
+        return [], "unavailable"
+
+    def _cluster_coordinates(self, values: list[float], tolerance: float = 1.2) -> list[float]:
+        clusters: list[list[float]] = []
+        for value in sorted(values):
+            if not clusters or abs(value - sum(clusters[-1]) / len(clusters[-1])) > tolerance:
+                clusters.append([value])
+            else:
+                clusters[-1].append(value)
+        return [sum(cluster) / len(cluster) for cluster in clusters]
+
+    def _scan_background_fill(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+    ) -> tuple[tuple[float, float, float] | None, dict[str, Any]]:
+        rectangle = self._fitz_rect(bbox)
+        try:
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(1.5, 1.5),
+                clip=rectangle,
+                colorspace=fitz.csRGB,
+                alpha=False,
+            )
+        except Exception as exc:
+            return None, {"reason": f"render_failed:{exc}"}
+        samples = pixmap.samples
+        if not samples or len(samples) % 3:
+            return None, {"reason": "empty_render"}
+        pixels = [tuple(samples[index : index + 3]) for index in range(0, len(samples), 3)]
+        total = len(pixels)
+        pixel_luminances = [
+            round(0.2126 * red + 0.7152 * green + 0.0722 * blue)
+            for red, green, blue in pixels
+        ]
+        luminances = sorted(pixel_luminances)
+        median = luminances[len(luminances) // 2]
+        light_ratio = sum(value >= 225 for value in luminances) / total
+
+        # Quantisation absorbs ordinary scan noise while retaining background
+        # colour. A single table-wide grayscale fill would visibly stripe a
+        # shaded or coloured header, so every changed cell is sampled itself.
+        background_candidates = [
+            pixel
+            for pixel, luminance in zip(pixels, pixel_luminances, strict=True)
+            if luminance >= 200
+        ]
+        background_candidate_ratio = len(background_candidates) / total
+        histogram: dict[tuple[int, int, int], int] = {}
+        for red, green, blue in background_candidates:
+            key = tuple(min(255, int(round(channel / 8.0) * 8)) for channel in (red, green, blue))
+            histogram[key] = histogram.get(key, 0) + 1
+        if not histogram:
+            return None, {"reason": "no_light_background_candidates"}
+        mode_bucket = max(histogram, key=histogram.get)
+        bucket_pixels = [
+            pixel
+            for pixel in background_candidates
+            if tuple(
+                min(255, int(round(channel / 8.0) * 8))
+                for channel in pixel
+            )
+            == mode_bucket
+        ]
+        mode = tuple(
+            sorted(pixel[channel] for pixel in bucket_pixels)[len(bucket_pixels) // 2]
+            for channel in range(3)
+        )
+        uniform_ratio = sum(
+            max(abs(red - mode[0]), abs(green - mode[1]), abs(blue - mode[2])) <= 18
+            for red, green, blue in background_candidates
+        ) / len(background_candidates)
+        mode_luminance = round(
+            0.2126 * mode[0] + 0.7152 * mode[1] + 0.0722 * mode[2]
+        )
+        metadata = {
+            "light_pixel_ratio": round(light_ratio, 6),
+            "median_luminance": median,
+            "background_candidate_ratio": round(background_candidate_ratio, 6),
+            "background_uniform_ratio": round(uniform_ratio, 6),
+            "sampled_background_rgb": list(mode),
+            "sampled_background_luminance": mode_luminance,
+            "threshold": {
+                "minimum_light_ratio": 0.45,
+                "minimum_median_luminance": 225,
+                "minimum_background_candidate_ratio": 0.55,
+                "minimum_background_uniform_ratio": 0.8,
+                "minimum_background_luminance": 225,
+            },
+        }
+        if (
+            light_ratio < 0.45
+            or median < 225
+            or background_candidate_ratio < 0.55
+            or uniform_ratio < 0.8
+            or mode_luminance < 225
+        ):
+            metadata["reason"] = "background_not_uniform_or_light"
+            return None, metadata
+        return tuple(channel / 255.0 for channel in mode), metadata
+
+    def _scan_cell_text_masks(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+    ) -> list[BoundingBox]:
+        # Hidden OCR word boxes localise source glyphs. Expand them enough to
+        # absorb scan/OCR baseline drift, but never across the full cell: an
+        # arrow, checkbox, or icon beside a label must remain untouched.
+        masks = self._scan_text_line_masks(
+            page,
+            bbox,
+            horizontal_expansion=2.5,
+            vertical_expansion=3.0,
+        )
+        return self._clamp_scan_masks(masks, bbox, guard=1.2)
+
+    def _scan_source_text_similarity(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+        expected_text: str,
+    ) -> dict[str, Any]:
+        expected = self._comparison_text(expected_text)
+        try:
+            actual_text = page.get_text("text", clip=self._fitz_rect(bbox))
+        except Exception as exc:
+            return {"score": 0.0, "reason": f"hidden_text_read_failed:{type(exc).__name__}"}
+        actual = self._comparison_text(actual_text)
+        if not expected or not actual:
+            return {
+                "score": 0.0,
+                "expected_characters": len(expected),
+                "actual_characters": len(actual),
+                "reason": "empty_expected_or_hidden_text",
+            }
+        score = SequenceMatcher(None, expected, actual).ratio()
+        if expected in actual or actual in expected:
+            score = max(score, min(len(expected), len(actual)) / max(len(expected), len(actual)))
+        return {
+            "score": round(float(score), 6),
+            "expected_characters": len(expected),
+            "actual_characters": len(actual),
+            "minimum_score": 0.62,
+        }
+
+    def _scan_text_line_masks(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+        *,
+        padding: float = 0.0,
+        horizontal_expansion: float = 2.0,
+        vertical_expansion: float = 1.8,
+    ) -> list[BoundingBox]:
+        rectangle = self._fitz_rect(bbox)
+        search_rectangle = fitz.Rect(
+            rectangle.x0 - padding,
+            rectangle.y0 - padding,
+            rectangle.x1 + padding,
+            rectangle.y1 + padding,
+        ) & page.rect
+        try:
+            words = page.get_text("words", clip=search_rectangle, sort=True)
+        except Exception:
+            return []
+        groups: dict[tuple[int, int], list[fitz.Rect]] = {}
+        for word in words:
+            if len(word) < 8 or not self._comparison_text(str(word[4])):
+                continue
+            groups.setdefault((int(word[5]), int(word[6])), []).append(
+                fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+            )
+
+        masks: list[BoundingBox] = []
+        inset = fitz.Rect(
+            search_rectangle.x0 + 0.25,
+            search_rectangle.y0 + 0.15,
+            search_rectangle.x1 - 0.25,
+            search_rectangle.y1 - 0.15,
+        )
+        for line_rectangles in groups.values():
+            line = fitz.Rect(line_rectangles[0])
+            for word_rect in line_rectangles[1:]:
+                line |= word_rect
+            line = fitz.Rect(
+                line.x0 - horizontal_expansion,
+                line.y0 - vertical_expansion,
+                line.x1 + horizontal_expansion,
+                line.y1 + vertical_expansion,
+            )
+            line &= inset
+            if line.width < 1 or line.height < 1:
+                continue
+            masks.append(
+                BoundingBox(
+                    x0=float(line.x0),
+                    y0=float(line.y0),
+                    x1=float(line.x1),
+                    y1=float(line.y1),
+                )
+            )
+        return masks
+
+    def _clamp_scan_masks(
+        self,
+        masks: list[BoundingBox],
+        bbox: BoundingBox,
+        *,
+        guard: float = 0.0,
+    ) -> list[BoundingBox]:
+        x0 = bbox.x0 + guard
+        y0 = bbox.y0 + guard
+        x1 = bbox.x1 - guard
+        y1 = bbox.y1 - guard
+        if x1 <= x0 or y1 <= y0:
+            return []
+        clamped: list[BoundingBox] = []
+        for mask in masks:
+            candidate = BoundingBox(
+                x0=max(x0, mask.x0),
+                y0=max(y0, mask.y0),
+                x1=min(x1, mask.x1),
+                y1=min(y1, mask.y1),
+            )
+            if candidate.x1 - candidate.x0 >= 1.0 and candidate.y1 - candidate.y0 >= 1.0:
+                clamped.append(candidate)
+        return clamped
+
+    def _inset_bbox(
+        self,
+        bbox: BoundingBox,
+        *,
+        horizontal: float,
+        vertical: float,
+    ) -> BoundingBox:
+        x0 = bbox.x0 + horizontal
+        y0 = bbox.y0 + vertical
+        x1 = bbox.x1 - horizontal
+        y1 = bbox.y1 - vertical
+        if x1 - x0 < 2 or y1 - y0 < 2:
+            return bbox.model_copy()
+        return BoundingBox(x0=x0, y0=y0, x1=x1, y1=y1)
 
     def _align_table_rows(
         self,
         page: fitz.Page,
-        source_rows: list[list[_ParsedTableCell]],
-        translated_rows: list[list[_ParsedTableCell]],
+        source_rows: list[list[ParsedTableCell]],
+        translated_rows: list[list[ParsedTableCell]],
         grid_rows: list[list[fitz.Rect]],
-    ) -> list[tuple[list[_ParsedTableCell], list[_ParsedTableCell], list[fitz.Rect]]] | None:
+    ) -> list[tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]]] | None:
         if not grid_rows or len(grid_rows) > len(source_rows):
             return None
 
@@ -819,7 +1347,7 @@ class OriginalLayoutReconstructor:
             logical_index: int,
         ) -> tuple[
             float,
-            tuple[tuple[list[_ParsedTableCell], list[_ParsedTableCell], list[fitz.Rect]], ...],
+            tuple[tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]], ...],
         ] | None:
             if grid_index == len(grid_rows) and logical_index == len(source_rows):
                 return 0.0, ()
@@ -864,13 +1392,13 @@ class OriginalLayoutReconstructor:
 
     def _combine_table_rows(
         self,
-        rows: list[list[_ParsedTableCell]],
-    ) -> list[_ParsedTableCell]:
-        combined: list[_ParsedTableCell] = []
+        rows: list[list[ParsedTableCell]],
+    ) -> list[ParsedTableCell]:
+        combined: list[ParsedTableCell] = []
         for column_index in range(len(rows[0])):
             cells = [row[column_index] for row in rows]
             combined.append(
-                _ParsedTableCell(
+                ParsedTableCell(
                     tag="th" if any(cell.tag == "th" for cell in cells) else "td",
                     text="\n".join(cell.text for cell in cells if cell.text),
                 )
@@ -880,11 +1408,12 @@ class OriginalLayoutReconstructor:
     def _table_row_similarity(
         self,
         page: fitz.Page,
-        source_row: list[_ParsedTableCell],
+        source_row: list[ParsedTableCell],
         rectangles: list[fitz.Rect],
     ) -> float:
         weighted_score = 0.0
         total_weight = 0.0
+        nonempty_cell_scores: list[float] = []
         for cell, rectangle in zip(source_row, rectangles, strict=True):
             expected = self._comparison_text(cell.text)
             actual = self._comparison_text(page.get_text("text", clip=rectangle))
@@ -898,7 +1427,13 @@ class OriginalLayoutReconstructor:
                 score = SequenceMatcher(None, expected, actual).ratio()
                 if expected in actual or actual in expected:
                     score = max(score, min(len(expected), len(actual)) / max(len(expected), len(actual)))
+            if expected or actual:
+                nonempty_cell_scores.append(score)
             weighted_score += score * weight
+        # A long correct cell must not outweigh a short cell mapped to the
+        # wrong box: every nonempty source/visual cell needs plausible text.
+        if any(score < 0.42 for score in nonempty_cell_scores):
+            return 0.0
         return weighted_score / max(1.0, total_weight)
 
     def _comparison_text(self, text: str) -> str:

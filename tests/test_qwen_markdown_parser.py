@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.models.inspection import PageInspection, PdfInspection
-from app.models.schema import BlockType
+from app.models.schema import Block, BlockType, BoundingBox, SourceType, TableModel
 from app.services.qwen_markdown_parser import QwenMarkdownParser
 
 
@@ -167,6 +167,170 @@ def test_qwen_parser_partitions_raw_ids_when_qwen_splits_reconciled_footnote() -
     )
 
     assert [block.metadata["source_region_ids"] for block in blocks] == [["r1"], ["r2"]]
+
+
+def test_qwen_parser_links_table_block_geometry_and_following_caption(tmp_path: Path) -> None:
+    markdown_dir = tmp_path / "markdown"
+    markdown_dir.mkdir()
+    (markdown_dir / "page_0001.md").write_text(
+        """<region index="1" type="Table">
+| A | B |
+|---|---|
+| uno | dos |
+</region>
+<region index="2" type="Caption">
+TABLA I. Ejemplo
+</region>
+""",
+        encoding="utf-8",
+    )
+    (markdown_dir / "page_0002.md").write_text("", encoding="utf-8")
+    manifest = {
+        "pages": [
+            {
+                "page_index": 1,
+                "width": 1200,
+                "height": 1600,
+                "reconciled_regions": [
+                    {
+                        "index": 1,
+                        "label": "Table",
+                        "bbox": [100, 200, 1100, 700],
+                        "source_region_ids": ["table-r1"],
+                    },
+                    {
+                        "index": 2,
+                        "label": "Caption",
+                        "bbox": [100, 710, 900, 760],
+                        "source_region_ids": ["caption-r2"],
+                    },
+                ],
+            }
+        ]
+    }
+
+    document, _source_markdown = QwenMarkdownParser().build_document_from_markdown_dir(
+        inspection=_inspection(),
+        markdown_dir=markdown_dir,
+        strict_page_files=True,
+        surya_layout_manifest=manifest,
+    )
+
+    table_block = next(block for block in document.blocks if block.block_type == BlockType.TABLE)
+    caption_block = next(block for block in document.blocks if block.block_type == BlockType.CAPTION)
+    table = document.tables[0]
+    assert table.debug["source_block_id"] == table_block.id
+    assert table.debug["source_region_ids"] == ["table-r1"]
+    assert table.bbox == table_block.bbox
+    assert table.caption_block_id == caption_block.id
+    assert table.caption == "TABLA I. Ejemplo"
+
+
+def test_qwen_parser_matches_tables_by_content_when_surya_misclassifies_one(
+    tmp_path: Path,
+) -> None:
+    markdown_dir = tmp_path / "markdown"
+    markdown_dir.mkdir()
+    (markdown_dir / "page_0001.md").write_text(
+        """<region index="1" type="text">
+| First | Value |
+|---|---|
+| uno | dos |
+</region>
+<region index="2" type="Table">
+| Second | Value |
+|---|---|
+| tres | cuatro |
+</region>
+""",
+        encoding="utf-8",
+    )
+    (markdown_dir / "page_0002.md").write_text("", encoding="utf-8")
+    manifest = {
+        "pages": [
+            {
+                "page_index": 1,
+                "width": 1200,
+                "height": 1600,
+                "reconciled_regions": [
+                    {
+                        "index": 1,
+                        "label": "Text",
+                        "bbox": [100, 200, 1100, 500],
+                        "source_region_ids": ["misclassified-r1"],
+                    },
+                    {
+                        "index": 2,
+                        "label": "Table",
+                        "bbox": [100, 600, 1100, 900],
+                        "source_region_ids": ["table-r2"],
+                    },
+                ],
+            }
+        ]
+    }
+
+    document, _source_markdown = QwenMarkdownParser().build_document_from_markdown_dir(
+        inspection=_inspection(),
+        markdown_dir=markdown_dir,
+        strict_page_files=True,
+        surya_layout_manifest=manifest,
+    )
+
+    first, second = document.tables
+    first_block = next(block for block in document.blocks if block.id == first.debug["source_block_id"])
+    second_block = next(block for block in document.blocks if block.id == second.debug["source_block_id"])
+    assert first_block.text.startswith("| First")
+    assert first_block.block_type == BlockType.TABLE
+    assert first.debug["geometry_reliable"] is False
+    assert first.bbox is None
+    assert first_block.bbox is None
+    assert second_block.text.startswith("| Second")
+    assert second.debug["geometry_reliable"] is True
+    assert second.debug["source_region_ids"] == ["table-r2"]
+    assert second.bbox == BoundingBox(x0=100, y0=600, x1=1100, y1=900)
+
+
+def test_qwen_parser_does_not_attach_caption_from_other_column() -> None:
+    table = TableModel(
+        id="table",
+        page_numbers=[1],
+        headers=["A", "B"],
+        rows=[["uno", "dos"]],
+    )
+    table_block = Block(
+        id="table-block",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text="| A | B |\n|---|---|\n| uno | dos |",
+        bbox=BoundingBox(x0=100, y0=200, x1=550, y1=700),
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "surya_region_type": "Table",
+            "qwen_region_type": "Table",
+            "surya_page_width": 1200,
+            "surya_page_height": 1600,
+        },
+    )
+    other_column_caption = Block(
+        id="other-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Figure 2. Unrelated caption",
+        bbox=BoundingBox(x0=650, y0=710, x1=1100, y1=760),
+        reading_order_index=1,
+        source_type=SourceType.OCR,
+        metadata={"qwen_region_type": "Caption"},
+    )
+
+    QwenMarkdownParser()._link_page_tables(
+        [table],
+        [table_block, other_column_caption],
+    )
+
+    assert table.caption_block_id is None
+    assert table.caption is None
 
 
 def _inspection() -> PdfInspection:

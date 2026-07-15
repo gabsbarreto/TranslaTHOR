@@ -23,6 +23,7 @@ from app.models.schema import (
     TableModel,
 )
 from app.services.profiler import PipelineProfiler
+from app.services.table_markup import parse_table_rows, rows_have_consistent_shape
 
 REGION_PATTERN = re.compile(
     r'<region\s+(?P<attributes>[^>]*)>(?P<body>.*?)</region>',
@@ -62,19 +63,19 @@ class QwenMarkdownParser:
         tables: list[TableModel] = []
         figures: list[FigureAsset] = []
         for page_number, markdown in page_items:
-            blocks.extend(
-                self._blocks_from_markdown(
-                    markdown,
-                    page_number,
-                    len(blocks),
-                    surya_page=self._surya_page(surya_layout_manifest, page_number),
-                )
+            page_blocks = self._blocks_from_markdown(
+                markdown,
+                page_number,
+                len(blocks),
+                surya_page=self._surya_page(surya_layout_manifest, page_number),
             )
+            blocks.extend(page_blocks)
             visible_markdown = self._without_region_wrappers(markdown)
             page_tables, page_figures = self._extract_structures_from_markdown(
                 visible_markdown,
                 page_number,
             )
+            self._link_page_tables(page_tables, page_blocks)
             tables.extend(page_tables)
             figures.extend(page_figures)
 
@@ -439,6 +440,140 @@ class QwenMarkdownParser:
                 caption_text = line
         flush_table()
         return tables, figures
+
+    def _link_page_tables(
+        self,
+        tables: list[TableModel],
+        blocks: list[Block],
+    ) -> None:
+        """Link the parallel Qwen table model to its canonical OCR block.
+
+        Qwen table Markdown is parsed both as a translatable Block and as a
+        structured TableModel. Persisting the relationship prevents the
+        translated block and rendered table from drifting apart.
+        """
+
+        candidates: dict[tuple[tuple[str, ...], ...], list[Block]] = {}
+        for block in blocks:
+            rows = parse_table_rows(block.text)
+            if not rows_have_consistent_shape(rows):
+                continue
+            signature = self._table_signature(
+                [[cell.text for cell in row] for row in rows]
+            )
+            candidates.setdefault(signature, []).append(block)
+
+        linked_blocks: list[Block] = []
+        used_block_ids: set[str] = set()
+        for table in tables:
+            signature = self._table_signature([table.headers, *table.rows])
+            matching = [
+                block
+                for block in candidates.get(signature, [])
+                if block.id not in used_block_ids
+            ]
+            if len(matching) != 1:
+                table.debug["link_status"] = "unlinked_ambiguous_or_missing_table_block"
+                continue
+            block = matching[0]
+            used_block_ids.add(block.id)
+            linked_blocks.append(block)
+            block.block_type = BlockType.TABLE
+
+            surya_type = self._normalized_region_type(
+                str(block.metadata.get("surya_region_type", ""))
+            )
+            geometry_reliable = surya_type == "table" and block.bbox is not None
+            block.metadata["table_geometry_reliable"] = geometry_reliable
+            if not geometry_reliable:
+                # Preserve the Surya evidence in metadata, but do not let a
+                # text/table disagreement drive source-page redaction.
+                block.bbox = None
+            table.bbox = block.bbox.model_copy() if geometry_reliable else None
+            table.debug.update(
+                {
+                    "source_block_id": block.id,
+                    "source_region_ids": list(block.metadata.get("source_region_ids", [])),
+                    "geometry_reliable": geometry_reliable,
+                    "coordinate_space": {
+                        "name": "surya_rendered_pixels" if geometry_reliable else "unresolved",
+                        "width": block.metadata.get("surya_page_width"),
+                        "height": block.metadata.get("surya_page_height"),
+                    },
+                }
+            )
+
+        table_blocks = sorted(linked_blocks, key=lambda item: item.reading_order_index)
+        captions = [
+            block
+            for block in blocks
+            if block.block_type == BlockType.CAPTION
+            and (
+                not block.metadata.get("qwen_region_type")
+                or self._normalized_region_type(
+                    str(block.metadata.get("qwen_region_type", ""))
+                )
+                == "caption"
+            )
+        ]
+        table_by_block_id = {
+            str(table.debug.get("source_block_id")): table
+            for table in tables
+            if table.debug.get("source_block_id")
+        }
+        for block in table_blocks:
+            table = table_by_block_id[block.id]
+            following = [
+                caption
+                for caption in captions
+                if caption.reading_order_index > block.reading_order_index
+            ]
+            if not following:
+                continue
+            caption = min(following, key=lambda item: item.reading_order_index)
+            next_table_order = min(
+                (
+                    item.reading_order_index
+                    for item in table_blocks
+                    if item.reading_order_index > block.reading_order_index
+                ),
+                default=None,
+            )
+            if next_table_order is not None and caption.reading_order_index > next_table_order:
+                continue
+            if caption.reading_order_index - block.reading_order_index > 3:
+                continue
+            if block.bbox is not None and caption.bbox is not None:
+                vertical_gap = caption.bbox.y0 - block.bbox.y1
+                block_height = max(1.0, block.bbox.y1 - block.bbox.y0)
+                if vertical_gap < -4.0 or vertical_gap > max(120.0, block_height * 0.75):
+                    continue
+                horizontal_overlap = max(
+                    0.0,
+                    min(block.bbox.x1, caption.bbox.x1)
+                    - max(block.bbox.x0, caption.bbox.x0),
+                )
+                overlap_ratio = horizontal_overlap / max(
+                    1.0,
+                    min(
+                        block.bbox.x1 - block.bbox.x0,
+                        caption.bbox.x1 - caption.bbox.x0,
+                    ),
+                )
+                if overlap_ratio < 0.2:
+                    continue
+            table.caption_block_id = caption.id
+            table.caption = caption.text.strip() or None
+            table.debug["caption_association"] = "next_caption_in_reading_order"
+
+    def _table_signature(
+        self,
+        rows: list[list[str]],
+    ) -> tuple[tuple[str, ...], ...]:
+        return tuple(
+            tuple(re.sub(r"\s+", " ", str(cell)).strip().casefold() for cell in row)
+            for row in rows
+        )
 
     def _detect_language(self, blocks: list[Block]) -> str | None:
         text = "\n".join(block.text for block in blocks if block.text.strip())[:4000].strip()

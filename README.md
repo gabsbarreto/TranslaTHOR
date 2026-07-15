@@ -37,6 +37,7 @@ backend/
       translation_worker.py         # Isolated translation process
       ocr_to_translation_parser.py  # Surya OCR regions -> logical translation chunks
       qwen_markdown_parser.py        # Qwen Markdown -> structured document
+      table_markup.py                # Shared HTML/Markdown table-shape parser
       figure_extractor.py            # Figure detection, coordinate conversion, and asset capture
       original_layout_reconstructor.py # Source-page text replacement and reconstruction report
       reconstructor.py              # Markdown -> HTML -> PDF
@@ -64,7 +65,9 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
 - **Readable PDF** reflows translated text for comfortable reading and places each detected figure
   in reading order using its clipped vector SVG when available, or its high-resolution PNG preview
   as a recorded fallback. The translated external caption is kept with the figure and is not
-  duplicated elsewhere.
+  duplicated elsewhere. Structured tables use the translated table block as their canonical copy,
+  retain empty cells and column shape, and are kept with one translated caption in a single
+  `<figure>` where the available page space permits.
 - **Faithful PDF** keeps the existing compact, two-column reconstructed output. It remains API
   compatible but is not shown as a primary browser download.
 - **Original layout PDF** starts from a separate output copy of the uploaded PDF. On reliable
@@ -72,6 +75,10 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   graphics, then inserts translated text into the corresponding boxes using source-PDF font metrics
   when available. Translation batches are kept page-local and do not cross figure or equation
   regions. Reliable vector-grid tables are reconstructed cell-by-cell without removing their lines.
+  A hidden-OCR scan can also reconstruct a ruled table when its OCR text layer, translated table
+  shape, and complete PDF grid agree: only bounded changed-text masks are covered, while rules, arrows,
+  numbers, and unchanged visual cells remain on the source page. The operation is atomic, so one
+  unsafe or overflowing cell retains the entire source table.
   Figures, graphs, equations, logos, colours, lines, page sizes, crop boxes, rotation, and
   decorations come from the original pages. A JSON reconstruction report records every replacement,
   skip, fallback page, text scale, overflow, raster figure fallback, and low-confidence association.
@@ -163,22 +170,29 @@ safe translated fallback.
 
 ## Reconstruction Limitations
 
-- Scanned and image-only pages are retained unchanged. This version does not inpaint visible source
-  text and will never place translated text over an unmodified scan.
-- Hidden-OCR and mixed/OCR pages are handled conservatively and may remain unchanged when the
-  visible source text cannot be proven removable.
+- Scanned and image-only pages without a reliable hidden text layer are retained unchanged. This
+  version does not perform general background inpainting and will never place translated text over
+  visible source text that has not first been safely covered.
+- On hidden-OCR pages, only ruled tables with a complete validated grid and aligned hidden-text
+  masks are eligible for scanned-table reconstruction. Their immediately following caption can be
+  translated with the same mask-based approach. All other page text remains unchanged, the page is
+  reported as partial, and the readable PDF remains the safe full-translation fallback.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
 - Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.
   Legacy cross-page translation batches are recovered only when their preserved source and
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.
-- Digital tables are translated cell-by-cell only when the translated HTML structure can be matched
-  to a complete vector cell grid and the source cell text validates that mapping. When Marker
+- Tables are translated cell-by-cell in original-layout output only when the translated HTML or
+  Markdown shape can be matched to a complete grid and the source cell text validates that mapping.
+  For scanned tables, the hidden OCR line boxes and a light, sufficiently uniform background must
+  also pass validation; only cells whose text actually changes are masked. When Marker
   collapses a ruled digital table into one oversized cell, the extraction stage attempts a clipped
   PyMuPDF repair and accepts it only with at least 88% source/candidate token agreement. Malformed,
-  duplicated, merged-cell, image-based, borderless, or otherwise ambiguous tables that cannot pass
-  this validation remain unchanged and are reported. Tables remain translated in the readable PDF.
+  duplicated, merged-cell, borderless, boxed prose panels, or otherwise ambiguous tables that
+  cannot pass this validation remain unchanged and are reported. A failure in any cell retains the
+  complete source table instead of producing a partially translated grid. Such tables can still be
+  translated as reflowed structured content in the readable PDF when OCR recovered their rows.
 - Translated text that cannot fit at the minimum 60% scale is reported and the source region is
   retained instead of silently deleting text or shrinking it to an unreadable size.
 - Figure detection follows Marker/Surya structured regions. False-positive visual regions or missed
