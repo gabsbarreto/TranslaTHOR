@@ -5,6 +5,7 @@ import shutil
 import sys
 import time
 import types
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -50,9 +51,9 @@ from app.config import (
     KEEP_EXTRACTION_DEBUG_ARTIFACTS,
     MARKER_TIMEOUT_SECONDS,
 )
-from app.models.schema import JobStage
+from app.models.schema import JobQueueState, JobStage
 from app.services.job_queue import JobQueue
-from app.services.job_store import JobStore
+from app.services.job_store import TERMINAL_JOB_STAGES, JobStore
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.original_layout_reconstructor import OriginalLayoutReconstructor
 from app.services.pipeline import TranslationPipeline
@@ -78,7 +79,14 @@ except Exception:
     sys.modules.setdefault("multipart", multipart_pkg)
     sys.modules.setdefault("multipart.multipart", multipart_submodule)
 
-app = FastAPI(title="Local PDF Translation App")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    job_store.reconcile_stale_jobs()
+    yield
+
+
+app = FastAPI(title="Local PDF Translation App", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -100,8 +108,10 @@ def health() -> dict[str, str]:
 
 
 @app.get("/api/jobs")
-def list_jobs() -> list[dict]:
-    return [status.model_dump() for status in job_store.list_jobs()]
+def list_jobs(include_archived: bool = False) -> list[dict]:
+    return [
+        status.model_dump() for status in job_store.list_jobs(include_archived=include_archived)
+    ]
 
 
 @app.delete("/api/jobs")
@@ -128,6 +138,47 @@ def cancel_job(job_id: str) -> dict[str, str]:
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail="Job is not queued or active.")
     return result
+
+
+@app.post("/api/jobs/{job_id}/archive")
+def archive_job(job_id: str) -> dict:
+    try:
+        return job_store.archive_job(job_id).model_dump()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/jobs/{job_id}/unarchive")
+def unarchive_job(job_id: str) -> dict:
+    try:
+        return job_store.unarchive_job(job_id).model_dump()
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/jobs/{job_id}")
+def delete_job(job_id: str) -> dict[str, int | str]:
+    try:
+        status = job_store.load_status(job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Job not found") from exc
+    if status.stage not in TERMINAL_JOB_STAGES:
+        raise HTTPException(
+            status_code=409,
+            detail="Only completed, cancelled, or failed jobs can be permanently deleted.",
+        )
+    if job_queue.contains(job_id):
+        raise HTTPException(
+            status_code=409,
+            detail="Job resources are still shutting down; try again shortly.",
+        )
+    if not job_store.delete_job(job_id):
+        raise HTTPException(status_code=404, detail="Job not found")
+    return {"removed": 1, "job_id": job_id}
 
 
 @app.get("/api/jobs/{job_id}")
@@ -158,29 +209,30 @@ async def create_job(
 ) -> dict:
     created: list[dict] = []
     for upload in files:
-        job_id, job_dir = job_store.create_job(upload.filename)
+        settings = _build_job_settings(
+            chunk_size=chunk_size,
+            model=model,
+            temperature=temperature,
+            top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
+            presence_penalty=presence_penalty,
+            repetition_penalty=repetition_penalty,
+            max_tokens=max_tokens,
+            output_mode=output_mode,
+            profile_pipeline=profile_pipeline,
+            extraction_mode=extraction_mode,
+            use_local_vlm_repair=use_local_vlm_repair,
+            keep_debug_artifacts=keep_debug_artifacts,
+        )
+        job_id, job_dir = job_store.create_job(upload.filename, settings=settings)
         pdf_path = job_dir / "input.pdf"
         with pdf_path.open("wb") as file:
             shutil.copyfileobj(upload.file, file)
         job_queue.enqueue(
             job_id,
             pdf_path,
-            _build_job_settings(
-                chunk_size=chunk_size,
-                model=model,
-                temperature=temperature,
-                top_p=top_p,
-                top_k=top_k,
-                min_p=min_p,
-                presence_penalty=presence_penalty,
-                repetition_penalty=repetition_penalty,
-                max_tokens=max_tokens,
-                output_mode=output_mode,
-                profile_pipeline=profile_pipeline,
-                extraction_mode=extraction_mode,
-                use_local_vlm_repair=use_local_vlm_repair,
-                keep_debug_artifacts=keep_debug_artifacts,
-            ),
+            settings,
         )
         created.append({"job_id": job_id, "filename": upload.filename})
     return {"jobs": created}
@@ -256,6 +308,10 @@ def _mark_interrupted_processing_jobs_cancelled() -> int:
                 progress=1.0,
                 message="Cancelled by Stop All Processes.",
                 error=None,
+                queue_state=JobQueueState.NONE,
+                queue_position=None,
+                jobs_ahead=None,
+                completed_at=job_store.utc_now(),
             )
             cancelled += 1
         except FileNotFoundError:
@@ -355,7 +411,9 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
     elif markdown_path.exists():
         markdown_text = markdown_path.read_text(encoding="utf-8", errors="ignore")
     else:
-        raise HTTPException(status_code=404, detail="Translated JSON or Markdown is required before PDF generation")
+        raise HTTPException(
+            status_code=404, detail="Translated JSON or Markdown is required before PDF generation"
+        )
     markdown_loaded = time.perf_counter()
     html = reconstructor.markdown_to_html(markdown_text, title=status.filename, output_mode=mode)
     html_built = time.perf_counter()
@@ -431,7 +489,9 @@ def _source_markdown_path(job_id: str) -> Path:
         )
     )
     if not path.exists():
-        raise HTTPException(status_code=404, detail="Original extraction Markdown is not available for this job.")
+        raise HTTPException(
+            status_code=404, detail="Original extraction Markdown is not available for this job."
+        )
     return path
 
 
@@ -444,7 +504,9 @@ def _ensure_source_pdf_artifact(job_id: str, mode: str) -> Path:
     if pdf_path.exists():
         return pdf_path
     markdown_text = source_markdown.read_text(encoding="utf-8", errors="ignore")
-    html = reconstructor.markdown_to_html(markdown_text, title=f"OCR source - {status.filename}", output_mode=mode)
+    html = reconstructor.markdown_to_html(
+        markdown_text, title=f"OCR source - {status.filename}", output_mode=mode
+    )
     reconstructor.html_to_pdf(html, pdf_path)
     artifacts = dict(status.artifacts)
     artifacts[key] = str(pdf_path)

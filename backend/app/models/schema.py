@@ -163,15 +163,29 @@ class JobStage(str, Enum):
     FAILED = "failed"
 
 
+class JobQueueState(str, Enum):
+    NONE = "none"
+    QUEUED = "queued"
+    RUNNING = "running"
+
+
 class JobStatus(BaseModel):
     job_id: str
     filename: str
     source_filename: str | None = None
     attempt: int = 0
     created_at: str | None = None
+    queued_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    archived_at: str | None = None
     stage: JobStage
     progress: float = 0.0
     message: str = ""
     error: str | None = None
+    queue_state: JobQueueState = JobQueueState.NONE
+    queue_position: int | None = None
+    jobs_ahead: int | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
     translation: dict[str, Any] = Field(default_factory=dict)

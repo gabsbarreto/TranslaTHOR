@@ -16,8 +16,10 @@ This browser-based app translates PDFs locally.
 9. Figure regions are deduplicated, validated, associated with captions, and captured as
    high-resolution PNG previews plus clipped vector SVG assets when the source supports them.
 10. A local MLX Qwen model translates the document into English.
-11. Markdown, JSON, readable/faithful PDFs, and a conservative original-layout PDF are available
-    for download after translation completes.
+11. The browser presents the readable PDF and conservative original-layout PDF as the two primary
+    results after translation completes. Structured Markdown, JSON, faithful reconstruction, and
+    diagnostic artifacts remain available to the backend and existing API routes without
+    cluttering the normal interface.
 
 The OCR path preserves the text emitted by Qwen. It does not remove running headers, footers, page numbers, or margin metadata.
 
@@ -63,7 +65,8 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   in reading order using its clipped vector SVG when available, or its high-resolution PNG preview
   as a recorded fallback. The translated external caption is kept with the figure and is not
   duplicated elsewhere.
-- **Faithful PDF** keeps the existing compact, two-column reconstructed output.
+- **Faithful PDF** keeps the existing compact, two-column reconstructed output. It remains API
+  compatible but is not shown as a primary browser download.
 - **Original layout PDF** starts from a separate output copy of the uploaded PDF. On reliable
   digital-text pages it removes source text while preserving overlapping raster images and vector
   graphics, then inserts translated text into the corresponding boxes using source-PDF font metrics
@@ -88,6 +91,23 @@ Translated PDF routes are enabled only after the job reaches `complete`:
 ```
 
 The reconstruction report becomes available after the original-layout PDF is generated.
+
+## Browser Workflow
+
+The normal interface requires no model or extraction configuration. Drop or select one or more
+PDFs and the server applies its configured automatic extraction and local translation defaults.
+
+- **Current activity** shows the stage, progress, filename, short job ID, and number of documents
+  waiting.
+- **Waiting** shows the FIFO queue and the number of jobs ahead of each document.
+- **Recent results** shows completed, failed, and cancelled work newest first. Completed records
+  expose only **Readable PDF** and **Original layout PDF** as primary actions.
+- **View details** contains warning, reconstruction, runtime configuration, and permanent-delete
+  controls. Routine warning text is collapsed so it does not obscure the job status.
+- **Exclude** archives a terminal record from the default results list without deleting its input
+  or generated artifacts. **Show excluded** makes archived records available for restoration.
+- Waiting work can be removed from the queue, while active work has an explicit stop action.
+  Permanent deletion is separate from cancellation and exclusion.
 
 ## Requirements
 
@@ -137,8 +157,9 @@ bash scripts/run_dev.sh
 Open `http://127.0.0.1:8000`.
 
 After a job finishes, use **Readable PDF** to test the reflowed output and **Original layout PDF**
-to test source-page reconstruction. If the original-layout warning is shown, download the
-**Reconstruction Report** and use the readable PDF as the safe translated fallback.
+to test source-page reconstruction. If original-layout reconstruction is partial, open
+**View details** to inspect its warning and reconstruction report, and use the readable PDF as the
+safe translated fallback.
 
 ## Reconstruction Limitations
 
