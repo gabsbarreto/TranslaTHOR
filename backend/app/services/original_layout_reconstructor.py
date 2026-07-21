@@ -63,6 +63,32 @@ class _SemanticTableGrid:
     assignment_signature: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _HiddenOCRLine:
+    block_index: int
+    line_index: int
+    bbox: BoundingBox
+    text: str
+
+    @property
+    def key(self) -> tuple[int, int]:
+        return self.block_index, self.line_index
+
+
+@dataclass(frozen=True)
+class _HiddenOCRMatch:
+    lines: tuple[_HiddenOCRLine, ...]
+    bbox: BoundingBox
+    text: str
+    score: float
+    competing_score: float
+    minimum_score: float
+
+    @property
+    def keys(self) -> frozenset[tuple[int, int]]:
+        return frozenset(line.key for line in self.lines)
+
+
 class OriginalLayoutReconstructor:
     """Conservatively replace translated text while retaining the source PDF page art."""
 
@@ -143,22 +169,11 @@ class OriginalLayoutReconstructor:
                     )
                     continue
 
+                scan_overlay = strategy in {"ocr_text_overlay", "ocr_table_overlay"}
                 scan_table_only = strategy == "ocr_table_overlay"
                 page_report["reconstruction_strategy"] = strategy
-                if scan_table_only:
-                    page_report["fallback_required"] = True
-                    warning = (
-                        "Only validated table cells are reconstructed on this OCR page; "
-                        "other scanned text remains unchanged."
-                    )
-                    page_report["warnings"].append(warning)
+                if scan_overlay:
                     report["scan_overlay_pages"] += 1
-                    self._warning(
-                        report,
-                        page_number=page_number,
-                        code="ocr_page_table_only_reconstruction",
-                        reason=warning,
-                    )
 
                 replacements = self._replacement_regions(
                     page=page,
@@ -170,6 +185,7 @@ class OriginalLayoutReconstructor:
                     recovered_translations=recovered_translations,
                     report=report,
                     page_report=page_report,
+                    scan_overlay=scan_overlay,
                     scan_table_only=scan_table_only,
                 )
                 approved: list[tuple[_ReplacementRegion, str, str, float]] = []
@@ -406,6 +422,8 @@ class OriginalLayoutReconstructor:
             "regions": [],
             "scan_overlay_pages": 0,
             "scan_text_masks": 0,
+            "scan_text_regions_aligned": 0,
+            "scan_text_regions_alignment_failed": 0,
             "raster_tables_reconstructed": 0,
             "safe_fallback": "readable_pdf",
             "minimum_text_scale": self.minimum_scale,
@@ -423,22 +441,28 @@ class OriginalLayoutReconstructor:
         if metadata is None:
             return "unsupported", "Structured page metadata is missing; the source page was retained unchanged."
         if metadata.extraction_mode == SourceType.OCR:
-            translated_tables = [
-                block
-                for block in blocks
-                if block.block_type == BlockType.TABLE
-                and isinstance(block.metadata.get("translated_from_block_ids"), list)
-                and block.id in block.metadata.get("translated_from_block_ids", [])
-            ]
             if (
                 metadata.has_embedded_text
-                and translated_tables
                 and len(page.get_text("words")) >= 5
             ):
-                return "ocr_table_overlay", ""
+                translated_tables = {
+                    block.id
+                    for block in blocks
+                    if block.block_type == BlockType.TABLE
+                    and isinstance(block.metadata.get("translated_from_block_ids"), list)
+                    and block.id in block.metadata.get("translated_from_block_ids", [])
+                }
+                translated_body = any(
+                    block.block_type not in {BlockType.TABLE, BlockType.CAPTION}
+                    and isinstance(block.metadata.get("translated_from_block_ids"), list)
+                    for block in blocks
+                )
+                if translated_tables and not translated_body:
+                    return "ocr_table_overlay", ""
+                return "ocr_text_overlay", ""
             return (
                 "unsupported",
-                "The page was extracted through OCR and has no validated table geometry with aligned hidden-text masks; it was retained unchanged.",
+                "The OCR page has no usable hidden text geometry for source-glyph alignment; it was retained unchanged.",
             )
         if not metadata.has_embedded_text or metadata.embedded_text_quality < 0.35:
             return (
@@ -508,11 +532,18 @@ class OriginalLayoutReconstructor:
         recovered_translations: dict[str, str],
         report: dict[str, Any],
         page_report: dict[str, Any],
+        scan_overlay: bool = False,
         scan_table_only: bool = False,
     ) -> list[_ReplacementRegion]:
         block_by_id = {block.id: block for block in all_blocks}
         consumed: set[str] = set()
         replacements: list[_ReplacementRegion] = []
+        claimed_scan_lines: set[tuple[int, int]] = set()
+        scan_text_sequences = (
+            self._hidden_ocr_text_sequences(self._hidden_ocr_text_blocks(page))
+            if scan_overlay
+            else []
+        )
         scan_caption_ids: set[str] = set()
         if scan_table_only:
             ordered = sorted(blocks, key=lambda item: item.reading_order_index)
@@ -561,7 +592,7 @@ class OriginalLayoutReconstructor:
                         locked_regions=locked_regions,
                         report=report,
                         page_report=page_report,
-                        scan_overlay=scan_table_only,
+                        scan_overlay=scan_overlay,
                     )
                 )
                 continue
@@ -628,15 +659,6 @@ class OriginalLayoutReconstructor:
                 continue
 
             bbox = self._union_bbox(converted)
-            if any(self._overlaps_locked_region(bbox, locked) for locked in locked_regions):
-                self._skip_block(
-                    report,
-                    page_report,
-                    block,
-                    reason="overlaps_figure_graph_or_equation",
-                    bbox=bbox,
-                )
-                continue
 
             source_text = " ".join(
                 str(item.metadata.get("source_text", "")).strip()
@@ -646,70 +668,121 @@ class OriginalLayoutReconstructor:
             if source_text and self._normalized_text(source_text) == self._normalized_text(translated_text):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
-            if scan_table_only and not source_text:
+            if scan_overlay and not source_text:
                 self._skip_block(
                     report,
                     page_report,
                     block,
-                    reason="caption_source_text_missing",
+                    reason="scan_source_text_missing",
                     bbox=bbox,
                 )
                 continue
-            replacement = _ReplacementRegion(
-                    page_number=page_number,
-                    block_ids=[item.id for item in source_blocks],
-                    block_type=block.block_type,
-                    bbox=bbox,
-                    translated_text=translated_text,
-                    source_text=source_text,
-                    style_hints=dict(block.style_hints or {}),
-                    coordinate_metadata=conversions,
-                )
-            if scan_table_only:
-                mask_bounds = BoundingBox(
-                    x0=max(0.0, bbox.x0 - 3.0),
-                    y0=bbox.y0,
-                    x1=min(float(page.rect.width), bbox.x1 + 3.0),
-                    y1=min(float(page.rect.height), bbox.y1 + 4.0),
-                )
-                caption_similarity = self._scan_source_text_similarity(
-                    page,
-                    mask_bounds,
-                    source_text,
-                )
-                if caption_similarity["score"] < 0.62:
+            scan_match: _HiddenOCRMatch | None = None
+            if scan_overlay:
+                if self._source_text_is_probably_english(source_text):
+                    # The application targets English. Re-typesetting an
+                    # already-English passage only introduces scan artefacts
+                    # when a translator has lightly paraphrased it.
+                    continue
+                if self._translation_script_is_suspicious(source_text, translated_text):
                     self._skip_block(
                         report,
                         page_report,
                         block,
-                        reason="caption_hidden_ocr_text_mismatch",
+                        reason="translated_text_script_incompatible_with_english_output",
                         bbox=bbox,
                     )
                     continue
-                masks = self._clamp_scan_masks(
-                    self._scan_text_line_masks(page, bbox, padding=3.0),
-                    mask_bounds,
+                scan_match, match_metadata = self._match_hidden_ocr_lines(
+                    page,
+                    source_text,
+                    preferred_bbox=bbox,
+                    unavailable_line_keys=claimed_scan_lines,
+                    text_sequences=scan_text_sequences,
                 )
-                fill, background_metadata = self._scan_background_fill(page, mask_bounds)
+                if scan_match is None:
+                    report["scan_text_regions_alignment_failed"] += 1
+                    failure_reason = str(
+                        match_metadata.get("reason", "hidden_ocr_text_alignment_failed")
+                    )
+                    if scan_table_only and block.block_type == BlockType.CAPTION:
+                        failure_reason = "caption_hidden_ocr_text_mismatch"
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason=failure_reason,
+                        bbox=bbox,
+                    )
+                    continue
+                if (
+                    block.block_type not in {BlockType.TABLE, BlockType.CAPTION}
+                    and self._scan_match_has_multicolumn_text(page, scan_match.lines)
+                ):
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="scan_region_multicolumn_layout_requires_table_geometry",
+                        bbox=scan_match.bbox,
+                    )
+                    continue
+                bbox = self._scan_match_envelope(page, scan_match.bbox)
+
+            if any(self._overlaps_locked_region(bbox, locked) for locked in locked_regions):
+                self._skip_block(
+                    report,
+                    page_report,
+                    block,
+                    reason="overlaps_figure_graph_or_equation",
+                    bbox=bbox,
+                )
+                continue
+            replacement = _ReplacementRegion(
+                page_number=page_number,
+                block_ids=[item.id for item in source_blocks],
+                block_type=block.block_type,
+                bbox=bbox,
+                translated_text=translated_text,
+                source_text=source_text,
+                style_hints=dict(block.style_hints or {}),
+                coordinate_metadata=conversions,
+            )
+            if scan_overlay and scan_match is not None:
+                masks = self._scan_match_masks(page, scan_match.lines)
+                fill, background_metadata = self._scan_background_fill(page, bbox)
                 if fill is None or not masks:
                     self._skip_block(
                         report,
                         page_report,
                         block,
-                        reason="caption_scan_mask_not_reliable",
+                        reason="scan_text_mask_or_background_not_reliable",
                         bbox=bbox,
                     )
                     continue
                 replacement.redaction_bboxes = masks
                 replacement.redaction_fill = fill
-                replacement.reconstruction_strategy = "ocr_caption_overlay"
+                replacement.reconstruction_strategy = "ocr_hidden_text_overlay"
                 replacement.coordinate_metadata.append(
                     {
-                        "mask_source": "hidden_ocr_line_geometry",
-                        "source_text_similarity": caption_similarity,
+                        "geometry_source": "hidden_ocr_contiguous_line_alignment",
+                        "coordinate_space": "pdf_points",
+                        "surya_region_bbox_pdf": converted[0].model_dump()
+                        if len(converted) == 1
+                        else self._union_bbox(converted).model_dump(),
+                        "matched_hidden_ocr_bbox_pdf": scan_match.bbox.model_dump(),
+                        "matched_hidden_ocr_text": scan_match.text,
+                        "source_text_similarity": {
+                            "score": round(scan_match.score, 6),
+                            "competing_score": round(scan_match.competing_score, 6),
+                            "minimum_score": scan_match.minimum_score,
+                        },
+                        "mask_source": "matched_hidden_ocr_line_geometry",
                         "scan_background": background_metadata,
                     }
                 )
+                claimed_scan_lines.update(scan_match.keys)
+                report["scan_text_regions_aligned"] += 1
             replacements.append(replacement)
         return replacements
 
@@ -1809,6 +1882,375 @@ class OriginalLayoutReconstructor:
             else:
                 clusters[-1].append(value)
         return [sum(cluster) / len(cluster) for cluster in clusters]
+
+    def _match_hidden_ocr_lines(
+        self,
+        page: fitz.Page,
+        expected_text: str,
+        *,
+        preferred_bbox: BoundingBox,
+        unavailable_line_keys: set[tuple[int, int]],
+        text_sequences: list[tuple[_HiddenOCRLine, ...]],
+    ) -> tuple[_HiddenOCRMatch | None, dict[str, Any]]:
+        """Align OCR source text to its actual PDF line geometry.
+
+        Surya provides the document structure and a useful initial position, but
+        a missed or merged layout region can shift later Qwen-to-Surya pairings.
+        The hidden OCR layer is therefore used as a second, independent geometry
+        check. Only contiguous lines are considered. Adjacent native PDF text
+        blocks may be joined only when their
+        geometry is continuous, which supports split headings and paragraphs
+        without jumping across columns or through an intervening figure.
+        """
+
+        expected = self._comparison_text(expected_text)
+        if len(expected) < 5:
+            return None, {
+                "reason": "hidden_ocr_source_text_too_short_for_unique_alignment",
+                "expected_characters": len(expected),
+            }
+        if not text_sequences:
+            return None, {"reason": "hidden_ocr_line_geometry_unavailable"}
+
+        minimum_characters = max(3, int(len(expected) * 0.35))
+        maximum_characters = max(24, int(len(expected) * 1.8) + 8)
+        preferred_center = (
+            (preferred_bbox.x0 + preferred_bbox.x1) / 2,
+            (preferred_bbox.y0 + preferred_bbox.y1) / 2,
+        )
+        candidates: list[
+            tuple[
+                float,
+                int,
+                float,
+                tuple[_HiddenOCRLine, ...],
+                str,
+                float,
+                float,
+                float,
+            ]
+        ] = []
+        for lines in text_sequences:
+            for start in range(len(lines)):
+                selected: list[_HiddenOCRLine] = []
+                for line in lines[start:]:
+                    if line.key in unavailable_line_keys:
+                        break
+                    selected.append(line)
+                    actual_text = " ".join(item.text for item in selected)
+                    actual = self._comparison_text(actual_text)
+                    if len(actual) > maximum_characters:
+                        break
+                    if len(actual) < minimum_characters:
+                        continue
+                    score = self._normalized_text_similarity(expected, actual)
+                    coverage = min(len(expected), len(actual)) / max(len(expected), len(actual))
+                    edge_length = min(36, len(expected), len(actual))
+                    prefix_score = SequenceMatcher(
+                        None,
+                        expected[:edge_length],
+                        actual[:edge_length],
+                    ).ratio()
+                    suffix_score = SequenceMatcher(
+                        None,
+                        expected[-edge_length:],
+                        actual[-edge_length:],
+                    ).ratio()
+                    candidate_bbox = self._union_bbox([item.bbox for item in selected])
+                    candidate_center = (
+                        (candidate_bbox.x0 + candidate_bbox.x1) / 2,
+                        (candidate_bbox.y0 + candidate_bbox.y1) / 2,
+                    )
+                    distance = math.hypot(
+                        candidate_center[0] - preferred_center[0],
+                        candidate_center[1] - preferred_center[1],
+                    )
+                    candidates.append(
+                        (
+                            score,
+                            abs(len(actual) - len(expected)),
+                            distance,
+                            tuple(selected),
+                            actual_text,
+                            coverage,
+                            prefix_score,
+                            suffix_score,
+                        )
+                    )
+
+        if not candidates:
+            return None, {
+                "reason": "hidden_ocr_text_alignment_no_candidate",
+                "expected_characters": len(expected),
+            }
+        candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+        best = candidates[0]
+        best_keys = {line.key for line in best[3]}
+        competing_score = max(
+            (
+                candidate[0]
+                for candidate in candidates[1:]
+                if best_keys.isdisjoint(line.key for line in candidate[3])
+            ),
+            default=0.0,
+        )
+        minimum_score = 0.96 if len(expected) < 8 else 0.9 if len(expected) < 20 else 0.84
+        if (
+            best[0] < minimum_score
+            or best[5] < 0.88
+            or best[6] < 0.55
+            or best[7] < 0.55
+        ):
+            return None, {
+                "reason": "hidden_ocr_text_alignment_low_confidence",
+                "score": round(best[0], 6),
+                "competing_score": round(competing_score, 6),
+                "minimum_score": minimum_score,
+                "length_coverage": round(best[5], 6),
+                "prefix_score": round(best[6], 6),
+                "suffix_score": round(best[7], 6),
+                "expected_characters": len(expected),
+            }
+        minimum_margin = 0.012 if best[0] >= 0.985 else 0.035
+        if competing_score and best[0] - competing_score < minimum_margin:
+            return None, {
+                "reason": "hidden_ocr_text_alignment_ambiguous",
+                "score": round(best[0], 6),
+                "competing_score": round(competing_score, 6),
+                "minimum_margin": minimum_margin,
+                "expected_characters": len(expected),
+            }
+
+        matched_lines = best[3]
+        return (
+            _HiddenOCRMatch(
+                lines=matched_lines,
+                bbox=self._union_bbox([line.bbox for line in matched_lines]),
+                text=best[4],
+                score=float(best[0]),
+                competing_score=float(competing_score),
+                minimum_score=minimum_score,
+            ),
+            {
+                "reason": "matched",
+                "score": round(best[0], 6),
+                "competing_score": round(competing_score, 6),
+            },
+        )
+
+    def _hidden_ocr_text_blocks(
+        self,
+        page: fitz.Page,
+    ) -> list[tuple[_HiddenOCRLine, ...]]:
+        try:
+            payload = page.get_text("dict")
+        except Exception:
+            return []
+        text_blocks: list[tuple[_HiddenOCRLine, ...]] = []
+        for block_index, text_block in enumerate(payload.get("blocks", [])):
+            lines: list[_HiddenOCRLine] = []
+            for line_index, line in enumerate(text_block.get("lines", [])):
+                spans = [
+                    span
+                    for span in line.get("spans", [])
+                    if self._comparison_text(str(span.get("text", "")))
+                ]
+                if not spans:
+                    continue
+                text = "".join(str(span.get("text", "")) for span in spans).strip()
+                rectangles: list[fitz.Rect] = []
+                for span in spans:
+                    try:
+                        rectangle = fitz.Rect(span["bbox"])
+                    except Exception:
+                        continue
+                    if rectangle.is_valid and not rectangle.is_empty:
+                        rectangles.append(rectangle)
+                if not rectangles:
+                    continue
+                rectangle = fitz.Rect(rectangles[0])
+                for span_rectangle in rectangles[1:]:
+                    rectangle |= span_rectangle
+                lines.append(
+                    _HiddenOCRLine(
+                        block_index=block_index,
+                        line_index=line_index,
+                        bbox=BoundingBox(
+                            x0=float(rectangle.x0),
+                            y0=float(rectangle.y0),
+                            x1=float(rectangle.x1),
+                            y1=float(rectangle.y1),
+                        ),
+                        text=text,
+                    )
+                )
+            if lines:
+                text_blocks.append(tuple(lines))
+        return text_blocks
+
+    def _hidden_ocr_text_sequences(
+        self,
+        text_blocks: list[tuple[_HiddenOCRLine, ...]],
+    ) -> list[tuple[_HiddenOCRLine, ...]]:
+        sequences = list(text_blocks)
+        for start in range(len(text_blocks)):
+            combined = list(text_blocks[start])
+            previous = text_blocks[start]
+            for following in text_blocks[start + 1 : start + 4]:
+                if not self._hidden_ocr_blocks_are_continuous(previous, following):
+                    break
+                combined.extend(following)
+                sequences.append(tuple(combined))
+                previous = following
+        return sequences
+
+    def _hidden_ocr_blocks_are_continuous(
+        self,
+        first: tuple[_HiddenOCRLine, ...],
+        second: tuple[_HiddenOCRLine, ...],
+    ) -> bool:
+        if not first or not second:
+            return False
+        first_bbox = self._union_bbox([line.bbox for line in first])
+        second_bbox = self._union_bbox([line.bbox for line in second])
+        first_height = max(1.0, first[-1].bbox.y1 - first[-1].bbox.y0)
+        second_height = max(1.0, second[0].bbox.y1 - second[0].bbox.y0)
+        vertical_gap = second_bbox.y0 - first_bbox.y1
+        if vertical_gap < -2.0 or vertical_gap > max(18.0, (first_height + second_height) * 1.4):
+            return False
+        horizontal_overlap = max(
+            0.0,
+            min(first_bbox.x1, second_bbox.x1) - max(first_bbox.x0, second_bbox.x0),
+        )
+        narrower_width = max(
+            1.0,
+            min(first_bbox.x1 - first_bbox.x0, second_bbox.x1 - second_bbox.x0),
+        )
+        return (
+            horizontal_overlap / narrower_width >= 0.5
+            or abs(first_bbox.x0 - second_bbox.x0) <= 18.0
+        )
+
+    def _scan_match_envelope(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+    ) -> BoundingBox:
+        return BoundingBox(
+            x0=max(0.0, bbox.x0 - 2.5),
+            y0=max(0.0, bbox.y0 - 1.5),
+            x1=min(float(page.rect.width), bbox.x1 + 2.5),
+            y1=min(float(page.rect.height), bbox.y1 + 2.5),
+        )
+
+    def _scan_match_masks(
+        self,
+        page: fitz.Page,
+        lines: tuple[_HiddenOCRLine, ...],
+    ) -> list[BoundingBox]:
+        masks: list[BoundingBox] = []
+        for line in lines:
+            masks.append(
+                BoundingBox(
+                    x0=max(0.0, line.bbox.x0 - 2.5),
+                    y0=max(0.0, line.bbox.y0 - 2.8),
+                    x1=min(float(page.rect.width), line.bbox.x1 + 2.5),
+                    y1=min(float(page.rect.height), line.bbox.y1 + 2.8),
+                )
+            )
+        return masks
+
+    def _scan_match_has_multicolumn_text(
+        self,
+        page: fitz.Page,
+        lines: tuple[_HiddenOCRLine, ...],
+    ) -> bool:
+        split_lines = 0
+        eligible_lines = 0
+        for line in lines:
+            try:
+                words = page.get_text("words", clip=self._fitz_rect(line.bbox), sort=True)
+            except Exception:
+                return False
+            word_rectangles = sorted(
+                (
+                    fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+                    for word in words
+                    if len(word) >= 5 and self._comparison_text(str(word[4]))
+                ),
+                key=lambda rectangle: rectangle.x0,
+            )
+            if len(word_rectangles) < 2:
+                continue
+            eligible_lines += 1
+            largest_gap = max(
+                following.x0 - current.x1
+                for current, following in zip(word_rectangles, word_rectangles[1:])
+            )
+            if largest_gap >= max(28.0, (line.bbox.x1 - line.bbox.x0) * 0.18):
+                split_lines += 1
+        return eligible_lines >= 3 and split_lines >= 2 and split_lines / eligible_lines >= 0.3
+
+    def _translation_script_is_suspicious(
+        self,
+        source_text: str,
+        translated_text: str,
+    ) -> bool:
+        """Reject obvious non-English script drift in the English-only workflow."""
+
+        def east_asian_count(value: str) -> int:
+            return sum(
+                any(
+                    marker in unicodedata.name(character, "")
+                    for marker in ("CJK", "HIRAGANA", "KATAKANA", "HANGUL")
+                )
+                for character in value
+            )
+
+        source_letters = sum(character.isalpha() for character in source_text)
+        target_letters = sum(character.isalpha() for character in translated_text)
+        if source_letters < 4 or target_letters < 1:
+            return False
+        return (
+            east_asian_count(source_text) / source_letters < 0.05
+            and east_asian_count(translated_text) / target_letters >= 0.2
+        )
+
+    def _source_text_is_probably_english(self, text: str) -> bool:
+        words = re.findall(r"[A-Za-z]+", text.casefold())
+        if len(words) < 5:
+            return False
+        english_function_words = {
+            "after",
+            "and",
+            "are",
+            "at",
+            "before",
+            "between",
+            "by",
+            "during",
+            "for",
+            "from",
+            "has",
+            "have",
+            "in",
+            "into",
+            "is",
+            "of",
+            "on",
+            "or",
+            "that",
+            "the",
+            "their",
+            "these",
+            "this",
+            "to",
+            "was",
+            "were",
+            "with",
+        }
+        hits = sum(word in english_function_words for word in words)
+        return hits >= 2 and hits / len(words) >= 0.08
 
     def _scan_background_fill(
         self,

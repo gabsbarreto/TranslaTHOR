@@ -1080,6 +1080,167 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
     assert outside_difference.getbbox() is None
 
 
+def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -> None:
+    page_width, page_height = 360, 240
+    scan_path = tmp_path / "shifted-scan.png"
+    scan = Image.new("RGB", (page_width, page_height), "white")
+    drawing = ImageDraw.Draw(scan)
+    drawing.text((30, 43), "Texto fuente correcto", fill="black")
+    drawing.text((30, 64), "segunda linea completa", fill="black")
+    drawing.text((30, 143), "REGION NO RELACIONADA", fill="black")
+    drawing.rectangle((260, 35, 335, 105), fill=(30, 100, 190))
+    scan.save(scan_path)
+
+    source = tmp_path / "shifted-hidden-ocr.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=page_width, height=page_height)
+    page.insert_image(page.rect, filename=str(scan_path))
+    page.insert_textbox(
+        fitz.Rect(28, 35, 205, 57),
+        "Texto fuente correcto",
+        fontsize=10,
+        render_mode=3,
+    )
+    page.insert_textbox(
+        fitz.Rect(28, 58, 205, 80),
+        "segunda linea completa",
+        fontsize=10,
+        render_mode=3,
+    )
+    page.insert_textbox(
+        fitz.Rect(28, 135, 220, 162),
+        "REGION NO RELACIONADA",
+        fontsize=10,
+        render_mode=3,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    block = Block(
+        id="shifted-body",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text="Correct translated text on both lines",
+        # Simulate a reading-order reconciliation error: this stored Surya
+        # box points to the unrelated second line.
+        bbox=BoundingBox(x0=28, y0=135, x1=220, y1=162),
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": "Texto fuente correcto segunda linea completa",
+            "translated_from_block_ids": ["shifted-body"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=page_width,
+                height=page_height,
+                has_embedded_text=True,
+                embedded_text_quality=0.2,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[block],
+        figures=[
+            FigureAsset(
+                id="locked-scan-figure",
+                page_number=1,
+                bbox=BoundingBox(x0=260, y0=35, x1=335, y1=105),
+            )
+        ],
+    )
+    output = tmp_path / "shifted-hidden-ocr-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "shifted-hidden-ocr-report.json",
+    )
+
+    assert report["regions_replaced"] == 1
+    assert report["scan_text_regions_aligned"] == 1
+    assert report["pages"][0]["reconstruction_strategy"] == "ocr_text_overlay"
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"]["y0"] < 70
+    alignment = replaced["coordinate_metadata"][-1]
+    assert alignment["geometry_source"] == "hidden_ocr_contiguous_line_alignment"
+    assert alignment["surya_region_bbox_pdf"]["y0"] > 120
+    assert alignment["matched_hidden_ocr_bbox_pdf"]["y0"] < 70
+
+    with fitz.open(output) as translated:
+        page = translated[0]
+        assert "Correct translated text" in page.get_text("text", clip=fitz.Rect(20, 25, 230, 95))
+        assert "REGION NO RELACIONADA" in page.get_text("text")
+        assert "Texto fuente correcto" not in page.get_text("text")
+        assert "segunda linea completa" not in page.get_text("text")
+    source_image = _render_rgb(source, scale=2)
+    output_image = _render_rgb(output, scale=2)
+    figure_box = (520, 70, 670, 210)
+    assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
+
+
+def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -> None:
+    source = tmp_path / "partial-hidden-ocr.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=320, height=150)
+    page.insert_textbox(
+        fitz.Rect(30, 35, 280, 60),
+        "Comienzo del texto fuente incompleto",
+        fontsize=9,
+        render_mode=3,
+    )
+    pdf.save(source)
+    pdf.close()
+    block = Block(
+        id="partial-source",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text="Translated complete paragraph",
+        bbox=BoundingBox(x0=30, y0=35, x1=280, y1=60),
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": "Comienzo del texto fuente incompleto seguido por una frase final que no existe",
+            "translated_from_block_ids": ["partial-source"],
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=320,
+                height=150,
+                has_embedded_text=True,
+                embedded_text_quality=0.1,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[block],
+    )
+    output = tmp_path / "partial-hidden-ocr-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "partial-hidden-ocr-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert report["scan_text_regions_alignment_failed"] == 1
+    assert any(
+        region.get("reason") == "hidden_ocr_text_alignment_low_confidence"
+        for region in report["regions"]
+    )
+    assert ImageChops.difference(
+        _render_rgb(source, scale=2),
+        _render_rgb(output, scale=2),
+    ).getbbox() is None
+
+
 def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -> None:
     source = tmp_path / "empty-cell-source.pdf"
     pdf = fitz.open()

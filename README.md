@@ -80,10 +80,14 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   regions. Tables with validated Marker cell polygons are reconstructed cell-by-cell without
   removing their lines. For older digital jobs, a partial-rule or whitespace-separated table can
   also be reconstructed when source text uniquely validates a coarsening of the PDF text lattice.
-  A hidden-OCR scan can also reconstruct a ruled table when its OCR text layer, translated table
-  shape, and complete PDF grid agree: only bounded changed-text masks are covered, while rules, arrows,
-  numbers, and unchanged visual cells remain on the source page. The operation is atomic, so one
-  unsafe or overflowing cell retains the entire source table.
+  A hidden-OCR scan can reconstruct verified body-text regions on top of its original page image.
+  Surya supplies the structure and initial position, then source text is aligned to contiguous
+  hidden-OCR lines to correct reading-order drift before any pixels are covered. Only matched glyph
+  strips on a light, uniform background are masked; ambiguous, partial, multi-column, or visually
+  complex matches remain unchanged. Ruled tables can also be reconstructed when their translated
+  shape and complete PDF grid agree, while rules, arrows, numbers, and unchanged cells remain on the
+  source page. The table operation is atomic, so one unsafe or overflowing cell retains the entire
+  source table.
   Figures, graphs, equations, logos, colours, lines, page sizes, crop boxes, rotation, and
   decorations come from the original pages. A JSON reconstruction report records every replacement,
   skip, fallback page, text scale, overflow, raster figure fallback, and low-confidence association.
@@ -178,10 +182,17 @@ safe translated fallback.
 - Scanned and image-only pages without a reliable hidden text layer are retained unchanged. This
   version does not perform general background inpainting and will never place translated text over
   visible source text that has not first been safely covered.
-- On hidden-OCR pages, only ruled tables with a complete validated grid and aligned hidden-text
-  masks are eligible for scanned-table reconstruction. Their immediately following caption can be
-  translated with the same mask-based approach. All other page text remains unchanged, the page is
-  reported as partial, and the readable PDF remains the safe full-translation fallback.
+- Hidden-OCR pages can replace body text when the complete source passage has one unambiguous match
+  to contiguous hidden-OCR lines. The stored Surya box is an auditable position hint rather than the
+  final authority, because a missed or merged region can shift later reading-order associations.
+  The original scan remains the background; only verified line masks on light, sufficiently uniform
+  paper are covered before translated text is inserted. Partial matches, multi-column regions that
+  require table geometry, already-English passages, and suspicious translation-script changes are
+  retained and reported. A page with any retained translatable region is reported as partial, and
+  the readable PDF remains the safe full-translation fallback.
+- Image-only scans without hidden OCR still require a future pixel-level text detector and
+  inpainting stage. Surya boxes alone are not treated as sufficient evidence for destructive
+  masking, because they describe layout regions rather than exact character strokes.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
 - Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.
