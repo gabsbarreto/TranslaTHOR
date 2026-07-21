@@ -14,9 +14,13 @@ from app.models.schema import (
     FigureAsset,
     PageMetadata,
     SourceType,
+    TableModel,
     TranslationChunk,
 )
-from app.services.original_layout_reconstructor import OriginalLayoutReconstructor
+from app.services.original_layout_reconstructor import (
+    OriginalLayoutReconstructor,
+    _SemanticTableGrid,
+)
 
 
 def _translated_block(
@@ -564,6 +568,351 @@ def test_vector_grid_table_is_reconstructed_cell_by_cell(tmp_path: Path) -> None
         assert len(translated[0].get_drawings()) == len(source_pdf[0].get_drawings())
     assert report["status"] == "complete"
     assert report["regions_replaced"] == 2
+
+
+def _horizontal_rule_table_source(path: Path) -> tuple[str, str, Block, list[float], list[float]]:
+    x_edges = [30.0, 135.0, 310.0, 390.0]
+    y_edges = [30.0, 55.0, 115.0, 180.0]
+    source_cells = [
+        ["Kategorie", "Beschreibung", "N"],
+        ["Lange Quelle", "Erste Beschreibung\nüber zwei Zeilen", "10"],
+        ["Zweite Quelle", "Weitere Beschreibung", "20"],
+    ]
+    pdf = fitz.open()
+    page = pdf.new_page(width=420, height=230)
+    for y in y_edges:
+        for left, right in zip(x_edges, x_edges[1:]):
+            page.draw_line((left, y), (right, y), color=(0, 0, 0), width=0.6)
+    for row_index, row in enumerate(source_cells):
+        for column_index, text in enumerate(row):
+            page.insert_textbox(
+                fitz.Rect(
+                    x_edges[column_index] + 3,
+                    y_edges[row_index] + 3,
+                    x_edges[column_index + 1] - 3,
+                    y_edges[row_index + 1] - 3,
+                ),
+                text,
+                fontsize=7.5,
+                align=fitz.TEXT_ALIGN_CENTER if column_index == 2 else fitz.TEXT_ALIGN_LEFT,
+            )
+    page.insert_text((30, 210), "OUTSIDE TABLE", fontsize=8)
+    pdf.save(path)
+    pdf.close()
+
+    source_markup = (
+        "<table><tr><th>Kategorie</th><th>Beschreibung</th><th>N</th></tr>"
+        "<tr><td>Lange Quelle</td><td>Erste Beschreibung<br>über zwei Zeilen</td><td>10</td></tr>"
+        "<tr><td>Zweite Quelle</td><td>Weitere Beschreibung</td><td>20</td></tr></table>"
+    )
+    translated_markup = (
+        "<table><tr><th>Category</th><th>Description</th><th>N</th></tr>"
+        "<tr><td>Long source</td><td>First description over two lines</td><td>10</td></tr>"
+        "<tr><td>Second source</td><td>Additional description</td><td>20</td></tr></table>"
+    )
+    block = Block(
+        id="horizontal-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_markup,
+        bbox=BoundingBox(x0=x_edges[0], y0=y_edges[0], x1=x_edges[-1], y1=y_edges[-1]),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_markup,
+            "translated_from_block_ids": ["horizontal-table"],
+            "marker_page_width": 420,
+            "marker_page_height": 230,
+        },
+    )
+    return source_markup, translated_markup, block, x_edges, y_edges
+
+
+def _single_page_table_document(block: Block, *, tables: list[TableModel] | None = None) -> DocumentModel:
+    return DocumentModel(
+        metadata=DocumentMetadata(filename="horizontal-table.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=420,
+                height=230,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+        tables=tables or [],
+    )
+
+
+def _stored_horizontal_table(
+    *,
+    block: Block,
+    source_markup: str,
+    x_edges: list[float],
+    y_edges: list[float],
+) -> TableModel:
+    parsed_source = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+
+    def table_cell(row: int, column: int) -> TableModel.TableCell:
+        return TableModel.TableCell(
+            text=parsed_source[row][column].text,
+            bbox=BoundingBox(
+                x0=x_edges[column],
+                y0=y_edges[row],
+                x1=x_edges[column + 1],
+                y1=y_edges[row + 1],
+            ),
+            row_index=row,
+            column_index=column,
+        )
+
+    return TableModel(
+        id="stored-horizontal-table",
+        page_numbers=[1],
+        page=1,
+        bbox=block.bbox,
+        headers=[cell.text for cell in parsed_source[0]],
+        header_cells=[table_cell(0, column) for column in range(3)],
+        rows=[[cell.text for cell in row] for row in parsed_source[1:]],
+        cells=[
+            [table_cell(row, column) for column in range(3)]
+            for row in range(1, 3)
+        ],
+        debug={
+            "marker_block_id": block.id,
+            "cell_geometry_source": "marker_table_cell_polygons",
+            "cell_coordinate_space": {
+                "name": "marker_page_coordinates",
+                "width": 420,
+                "height": 230,
+            },
+        },
+    )
+
+
+def test_horizontal_rule_table_is_semantically_coalesced(tmp_path: Path) -> None:
+    source = tmp_path / "horizontal-table-source.pdf"
+    _source_markup, _translated_markup, block, _x_edges, y_edges = _horizontal_rule_table_source(
+        source
+    )
+    output = tmp_path / "horizontal-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_single_page_table_document(block),
+        report_path=tmp_path / "horizontal-table-report.json",
+    )
+
+    with fitz.open(source) as source_pdf, fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Category" in text
+        assert "Additional description" in text
+        assert "Kategorie" not in text
+        assert "Beschreibung" not in text
+        assert "OUTSIDE TABLE" in text
+        assert len(translated[0].get_drawings()) == len(source_pdf[0].get_drawings())
+    strategies = {
+        metadata.get("table_grid_detection")
+        for region in report["regions"]
+        for metadata in region.get("coordinate_metadata", [])
+    }
+    assert "pymupdf_text_lattice_semantic_alignment" in strategies
+    assert not any(
+        region.get("reason") == "table_cell_geometry_unreliable"
+        for region in report["regions"]
+    )
+
+    source_image = _render_rgb(source, scale=2)
+    output_image = _render_rgb(output, scale=2)
+    for y in y_edges:
+        rule_strip = (60, round(y * 2) - 1, 780, round(y * 2) + 2)
+        assert source_image.crop(rule_strip).tobytes() == output_image.crop(rule_strip).tobytes()
+    assert source_image.crop((60, 400, 780, 440)).tobytes() == output_image.crop(
+        (60, 400, 780, 440)
+    ).tobytes()
+
+
+def test_marker_cell_polygons_are_preferred_for_table_geometry(tmp_path: Path) -> None:
+    source = tmp_path / "stored-table-source.pdf"
+    source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
+        source
+    )
+    table = _stored_horizontal_table(
+        block=block,
+        source_markup=source_markup,
+        x_edges=x_edges,
+        y_edges=y_edges,
+    )
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=tmp_path / "stored-table-output.pdf",
+        document=_single_page_table_document(block, tables=[table]),
+        report_path=tmp_path / "stored-table-report.json",
+    )
+
+    strategies = {
+        metadata.get("table_grid_detection")
+        for region in report["regions"]
+        for metadata in region.get("coordinate_metadata", [])
+    }
+    assert strategies == {"marker_table_cell_polygons"}
+    assert report["regions_skipped"] == 0
+
+
+def test_marker_cell_polygons_require_matching_source_topology(tmp_path: Path) -> None:
+    source = tmp_path / "stored-table-topology-source.pdf"
+    source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
+        source
+    )
+    source_rows = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+    table = _stored_horizontal_table(
+        block=block,
+        source_markup=source_markup,
+        x_edges=x_edges,
+        y_edges=y_edges,
+    )
+    assert block.bbox is not None
+
+    invalid_tables: list[TableModel] = []
+    invalid_row = table.model_copy(deep=True)
+    invalid_row.header_cells[0].row_index = 1
+    invalid_tables.append(invalid_row)
+    invalid_column = table.model_copy(deep=True)
+    invalid_column.header_cells[1].column_index = 0
+    invalid_tables.append(invalid_column)
+    invalid_rowspan = table.model_copy(deep=True)
+    invalid_rowspan.cells[0][0].rowspan = 2
+    invalid_tables.append(invalid_rowspan)
+    invalid_colspan = table.model_copy(deep=True)
+    invalid_colspan.cells[0][1].colspan = 2
+    invalid_tables.append(invalid_colspan)
+
+    with fitz.open(source) as pdf:
+        reconstructor = OriginalLayoutReconstructor()
+        valid_rows, valid_strategy = reconstructor._stored_table_grid_rows(
+            page=pdf[0],
+            block=block,
+            table=table,
+            source_rows=source_rows,
+            table_bbox=block.bbox,
+        )
+        assert valid_rows
+        assert valid_strategy == "marker_table_cell_polygons"
+        for invalid_table in invalid_tables:
+            rows, strategy = reconstructor._stored_table_grid_rows(
+                page=pdf[0],
+                block=block,
+                table=invalid_table,
+                source_rows=source_rows,
+                table_bbox=block.bbox,
+            )
+            assert rows == []
+            assert strategy == "unavailable"
+
+
+def test_marker_cell_polygons_reject_swapped_and_repeated_regions(tmp_path: Path) -> None:
+    source = tmp_path / "stored-table-placement-source.pdf"
+    source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
+        source
+    )
+    source_rows = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+    table = _stored_horizontal_table(
+        block=block,
+        source_markup=source_markup,
+        x_edges=x_edges,
+        y_edges=y_edges,
+    )
+    assert block.bbox is not None
+
+    swapped = table.model_copy(deep=True)
+    first_bbox = swapped.header_cells[0].bbox
+    second_bbox = swapped.header_cells[1].bbox
+    assert first_bbox is not None
+    assert second_bbox is not None
+    swapped.header_cells[0].bbox = second_bbox
+    swapped.header_cells[1].bbox = first_bbox
+
+    repeated = table.model_copy(deep=True)
+    repeated_bbox = repeated.header_cells[0].bbox
+    assert repeated_bbox is not None
+    repeated.header_cells[1].bbox = repeated_bbox.model_copy(deep=True)
+
+    with fitz.open(source) as pdf:
+        reconstructor = OriginalLayoutReconstructor()
+        for invalid_table in (swapped, repeated):
+            rows, strategy = reconstructor._stored_table_grid_rows(
+                page=pdf[0],
+                block=block,
+                table=invalid_table,
+                source_rows=source_rows,
+                table_bbox=block.bbox,
+            )
+            assert rows == []
+            assert strategy == "unavailable"
+
+
+def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) -> None:
+    source = tmp_path / "mismatched-horizontal-table.pdf"
+    _source_markup, _translated_markup, block, _x_edges, _y_edges = _horizontal_rule_table_source(
+        source
+    )
+    block.metadata["source_text"] = str(block.metadata["source_text"]).replace(
+        "Kategorie",
+        "Unrelated source heading",
+    )
+    output = tmp_path / "mismatched-horizontal-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_single_page_table_document(block),
+        report_path=tmp_path / "mismatched-horizontal-table-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert any(
+        region.get("reason") == "table_cell_geometry_unreliable"
+        for region in report["regions"]
+    )
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_semantic_table_geometry_rejects_near_tied_partitions(monkeypatch) -> None:
+    reconstructor = OriginalLayoutReconstructor()
+    source_rows = reconstructor._parse_table_rows(
+        "<table><tr><td>Alpha</td><td>Beta</td></tr></table>"
+    )
+    boundary_candidates = [(10.0, 100.0, 210.0), (10.0, 120.0, 210.0)]
+    monkeypatch.setattr(
+        reconstructor,
+        "_horizontal_rule_column_candidates",
+        lambda _page, _rect, _columns: boundary_candidates,
+    )
+
+    def candidate(*, column_edges, **_kwargs):
+        first = column_edges == boundary_candidates[0]
+        return _SemanticTableGrid(
+            rows=((fitz.Rect(10, 10, 100, 30), fitz.Rect(100, 10, 210, 30)),),
+            score=0.80 if first else 0.79,
+            signature=tuple(column_edges),
+            assignment_signature=("alpha", "beta" if first else "beta-shifted"),
+        )
+
+    monkeypatch.setattr(reconstructor, "_semantic_grid_candidate", candidate)
+    pdf = fitz.open()
+    page = pdf.new_page(width=220, height=100)
+    try:
+        rows = reconstructor._semantic_text_table_grid_rows(
+            page=page,
+            table_rect=fitz.Rect(10, 10, 210, 30),
+            search_rect=fitz.Rect(7, 7, 213, 33),
+            source_rows=source_rows,
+        )
+    finally:
+        pdf.close()
+
+    assert rows == []
 
 
 def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Path) -> None:

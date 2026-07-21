@@ -2,10 +2,20 @@ from __future__ import annotations
 
 import html
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 from app.models.schema import Block, BlockType, DocumentModel, FigureAsset, TableModel
 from app.services.table_markup import parse_table_rows, rows_have_consistent_shape
+
+
+@dataclass
+class _CaptionFlowEdge:
+    to: int
+    reverse: int
+    capacity: int
+    cost: tuple[float, ...]
+    assignment: tuple[str, str] | None = None
 
 
 class MarkdownBuilder:
@@ -217,18 +227,24 @@ class MarkdownBuilder:
         """Resolve captions without mutating older persisted structured JSON.
 
         Newly extracted tables carry ``caption_block_id``. Jobs created before
-        that link existed still contain a reliable table block followed by its
-        caption, so reconstruction recovers that narrow relationship at render
-        time and suppresses the standalone duplicate caption.
+        that link existed still contain a table and caption on the same page,
+        but OCR reading order can put the caption on either side of the table.
+        Recover those relationships from bounded spatial and reading-order
+        evidence, then suppress the standalone duplicate caption.
         """
 
         resolved: dict[str, Block] = {}
         claimed_caption_ids: set[str] = set()
+        figure_caption_ids = {
+            figure.caption_block_id
+            for figure in document.figures
+            if figure.caption_block_id in caption_by_id
+        }
         for table in document.tables:
             if not table.caption_block_id:
                 continue
             caption = caption_by_id.get(table.caption_block_id)
-            if caption is None:
+            if caption is None or caption.id in claimed_caption_ids:
                 continue
             resolved[table.id] = caption
             claimed_caption_ids.add(caption.id)
@@ -270,44 +286,210 @@ class MarkdownBuilder:
             claimed_table_block_ids.add(table_block.id)
             table_block_by_table_id[table.id] = table_block
 
+        page_heights = {page.page_number: page.height for page in document.pages}
+        ranked_candidates: list[tuple[tuple[float, ...], str, Block]] = []
         for table in document.tables:
             if table.id in resolved:
                 continue
             table_block = table_block_by_table_id.get(table.id)
             if table_block is None:
                 continue
-            page_number = table_block.page_number
+            table_bbox = table_block.bbox or table.bbox
+            for caption in caption_by_id.values():
+                if (
+                    caption.page_number != table_block.page_number
+                    or caption.id in claimed_caption_ids
+                    or caption.id in figure_caption_ids
+                ):
+                    continue
+                score = self._table_caption_score(
+                    table_block,
+                    table_bbox,
+                    caption,
+                    page_height=page_heights.get(table_block.page_number),
+                )
+                if score is not None:
+                    ranked_candidates.append((score, table.id, caption))
 
-            caption_candidates = [
-                caption
-                for caption in caption_by_id.values()
-                if caption.page_number == page_number
-                and caption.id not in claimed_caption_ids
-                and 0 < caption.reading_order_index - table_block.reading_order_index <= 2
-            ]
-            if table_block.bbox is not None:
-                caption_candidates = [
-                    caption
-                    for caption in caption_candidates
-                    if caption.bbox is None
-                    or (
-                        caption.bbox.y0 >= table_block.bbox.y1 - 4.0
-                        and self._horizontal_overlap_ratio(
-                            table_block.bbox,
-                            caption.bbox,
-                        )
-                        >= 0.2
-                    )
-                ]
-            if not caption_candidates:
-                continue
-            caption = min(
-                caption_candidates,
-                key=lambda item: item.reading_order_index,
-            )
-            resolved[table.id] = caption
-            claimed_caption_ids.add(caption.id)
+        inferred = self._minimum_cost_caption_assignment(ranked_candidates)
+        resolved.update(inferred)
         return resolved
+
+    def _minimum_cost_caption_assignment(
+        self,
+        candidates: list[tuple[tuple[float, ...], str, Block]],
+    ) -> dict[str, Block]:
+        """Choose the largest reliable one-to-one assignment at minimum cost.
+
+        A locally closest pair is not always the best page-level assignment: a
+        flexible table can otherwise consume the only caption available to a
+        neighbouring table. Successive shortest augmenting paths give maximum
+        cardinality first and minimum aggregate evidence cost second. The
+        residual edges allow an earlier choice to be reassigned when that
+        produces a better complete matching.
+        """
+
+        if not candidates:
+            return {}
+        caption_by_id = {caption.id: caption for _score, _table_id, caption in candidates}
+        table_ids = sorted({table_id for _score, table_id, _caption in candidates})
+        caption_ids = sorted(
+            caption_by_id,
+            key=lambda caption_id: (
+                caption_by_id[caption_id].page_number,
+                caption_by_id[caption_id].reading_order_index,
+                caption_id,
+            ),
+        )
+        source = 0
+        table_offset = 1
+        caption_offset = table_offset + len(table_ids)
+        sink = caption_offset + len(caption_ids)
+        graph: list[list[_CaptionFlowEdge]] = [[] for _ in range(sink + 1)]
+        table_node = {table_id: table_offset + index for index, table_id in enumerate(table_ids)}
+        caption_node = {
+            caption_id: caption_offset + index
+            for index, caption_id in enumerate(caption_ids)
+        }
+        zero = tuple(0.0 for _ in candidates[0][0])
+
+        def add_edge(
+            start: int,
+            end: int,
+            cost: tuple[float, ...],
+            *,
+            assignment: tuple[str, str] | None = None,
+        ) -> None:
+            forward = _CaptionFlowEdge(
+                to=end,
+                reverse=len(graph[end]),
+                capacity=1,
+                cost=cost,
+                assignment=assignment,
+            )
+            reverse = _CaptionFlowEdge(
+                to=start,
+                reverse=len(graph[start]),
+                capacity=0,
+                cost=tuple(-value for value in cost),
+            )
+            graph[start].append(forward)
+            graph[end].append(reverse)
+
+        for table_id in table_ids:
+            add_edge(source, table_node[table_id], zero)
+        ordered_candidates = sorted(
+            candidates,
+            key=lambda item: (
+                item[1],
+                item[2].page_number,
+                item[2].reading_order_index,
+                item[2].id,
+            ),
+        )
+        for score, table_id, caption in ordered_candidates:
+            add_edge(
+                table_node[table_id],
+                caption_node[caption.id],
+                score,
+                assignment=(table_id, caption.id),
+            )
+        for caption_id in caption_ids:
+            add_edge(caption_node[caption_id], sink, zero)
+
+        # Bellman-Ford is intentionally used instead of a greedy augmenting
+        # path: residual edges have negative tuple costs after the first match.
+        while True:
+            distances: list[tuple[float, ...] | None] = [None] * len(graph)
+            previous: list[tuple[int, int] | None] = [None] * len(graph)
+            distances[source] = zero
+            for _ in range(len(graph) - 1):
+                changed = False
+                for node, edges in enumerate(graph):
+                    distance = distances[node]
+                    if distance is None:
+                        continue
+                    for edge_index, edge in enumerate(edges):
+                        if edge.capacity <= 0:
+                            continue
+                        candidate_distance = tuple(
+                            left + right for left, right in zip(distance, edge.cost, strict=True)
+                        )
+                        if distances[edge.to] is None or candidate_distance < distances[edge.to]:
+                            distances[edge.to] = candidate_distance
+                            previous[edge.to] = (node, edge_index)
+                            changed = True
+                if not changed:
+                    break
+            if previous[sink] is None:
+                break
+            node = sink
+            while node != source:
+                prior = previous[node]
+                if prior is None:  # pragma: no cover - guarded by the complete path above
+                    break
+                start, edge_index = prior
+                edge = graph[start][edge_index]
+                edge.capacity -= 1
+                graph[node][edge.reverse].capacity += 1
+                node = start
+
+        resolved: dict[str, Block] = {}
+        for table_id in table_ids:
+            for edge in graph[table_node[table_id]]:
+                if edge.assignment is None or edge.capacity != 0:
+                    continue
+                assigned_table_id, caption_id = edge.assignment
+                resolved[assigned_table_id] = caption_by_id[caption_id]
+                break
+        return resolved
+
+    def _table_caption_score(
+        self,
+        table_block: Block,
+        table_bbox,
+        caption: Block,
+        *,
+        page_height: float | None,
+    ) -> tuple[float, ...] | None:
+        """Return a lower-is-better score for a reliable legacy association."""
+
+        order_delta = caption.reading_order_index - table_block.reading_order_index
+        order_distance = abs(order_delta)
+        if table_bbox is not None and caption.bbox is not None:
+            # A generous but finite order window tolerates column-order errors
+            # without associating unrelated captions elsewhere on the page.
+            if order_distance > 6:
+                return None
+            overlap = self._horizontal_overlap_ratio(table_bbox, caption.bbox)
+            if overlap < 0.2:
+                return None
+
+            caption_above = caption.bbox.y1 <= table_bbox.y0 + 4.0
+            caption_below = caption.bbox.y0 >= table_bbox.y1 - 4.0
+            if not (caption_above or caption_below):
+                return None
+            edge_gap = (
+                max(0.0, table_bbox.y0 - caption.bbox.y1)
+                if caption_above
+                else max(0.0, caption.bbox.y0 - table_bbox.y1)
+            )
+            height = max(1.0, float(page_height or 800.0))
+            max_edge_gap = max(36.0, min(120.0, height * 0.12))
+            if edge_gap > max_edge_gap:
+                return None
+
+            # Spatial evidence ranks ahead of the legacy no-bbox fallback.
+            # Edge proximity is strongest, with order distance and overlap as
+            # deterministic tie breakers.
+            return (0.0, edge_gap / height, float(order_distance), -overlap)
+
+        # Older structured JSON may have no usable boxes. Preserve the narrow
+        # historical fallback only for an immediately following caption; an
+        # above-caption relationship is not safe to infer without geometry.
+        if not 0 < order_delta <= 2:
+            return None
+        return (1.0, float(order_delta), 0.0, 0.0)
 
     def _horizontal_overlap_ratio(
         self,

@@ -3,17 +3,26 @@ from __future__ import annotations
 import html
 import json
 import logging
+import math
 import re
 import unicodedata
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from functools import lru_cache
+from itertools import combinations
 from pathlib import Path
 from typing import Any
 
 import fitz
 
-from app.models.schema import Block, BlockType, BoundingBox, DocumentModel, SourceType
+from app.models.schema import (
+    Block,
+    BlockType,
+    BoundingBox,
+    DocumentModel,
+    SourceType,
+    TableModel,
+)
 from app.services.pdf_coordinates import (
     bbox_area,
     bbox_intersection_area,
@@ -39,6 +48,21 @@ class _ReplacementRegion:
     reconstruction_strategy: str = "embedded_text_replacement"
 
 
+@dataclass(frozen=True)
+class _PhysicalTableLine:
+    y0: float
+    y1: float
+    cells: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _SemanticTableGrid:
+    rows: tuple[tuple[fitz.Rect, ...], ...]
+    score: float
+    signature: tuple[float, ...]
+    assignment_signature: tuple[str, ...]
+
+
 class OriginalLayoutReconstructor:
     """Conservatively replace translated text while retaining the source PDF page art."""
 
@@ -61,6 +85,15 @@ class OriginalLayoutReconstructor:
         blocks_by_page: dict[int, list[Block]] = {}
         for block in document.blocks:
             blocks_by_page.setdefault(block.page_number, []).append(block)
+        tables_by_block_id: dict[str, TableModel] = {}
+        for table in document.tables:
+            source_block_id = str(
+                table.debug.get("source_block_id")
+                or table.debug.get("marker_block_id")
+                or ""
+            )
+            if source_block_id and source_block_id not in tables_by_block_id:
+                tables_by_block_id[source_block_id] = table
         recovered_translations = self._recover_per_block_translations(document)
 
         temporary_path = output_pdf_path.with_name(f".{output_pdf_path.stem}.tmp.pdf")
@@ -133,6 +166,7 @@ class OriginalLayoutReconstructor:
                     blocks=blocks_by_page.get(page_number, []),
                     all_blocks=document.blocks,
                     locked_regions=locked_by_page.get(page_number, []),
+                    tables_by_block_id=tables_by_block_id,
                     recovered_translations=recovered_translations,
                     report=report,
                     page_report=page_report,
@@ -470,6 +504,7 @@ class OriginalLayoutReconstructor:
         blocks: list[Block],
         all_blocks: list[Block],
         locked_regions: list[BoundingBox],
+        tables_by_block_id: dict[str, TableModel],
         recovered_translations: dict[str, str],
         report: dict[str, Any],
         page_report: dict[str, Any],
@@ -522,6 +557,7 @@ class OriginalLayoutReconstructor:
                     self._table_replacement_regions(
                         page=page,
                         block=block,
+                        table_model=tables_by_block_id.get(block.id),
                         locked_regions=locked_regions,
                         report=report,
                         page_report=page_report,
@@ -721,6 +757,7 @@ class OriginalLayoutReconstructor:
         *,
         page: fitz.Page,
         block: Block,
+        table_model: TableModel | None,
         locked_regions: list[BoundingBox],
         report: dict[str, Any],
         page_report: dict[str, Any],
@@ -749,6 +786,15 @@ class OriginalLayoutReconstructor:
             or len(source_rows) != len(translated_rows)
             or any(
                 len(source_row) != len(translated_row)
+                or any(
+                    source_cell.rowspan != translated_cell.rowspan
+                    or source_cell.colspan != translated_cell.colspan
+                    for source_cell, translated_cell in zip(
+                        source_row,
+                        translated_row,
+                        strict=True,
+                    )
+                )
                 for source_row, translated_row in zip(
                     source_rows,
                     translated_rows,
@@ -783,12 +829,21 @@ class OriginalLayoutReconstructor:
             return []
 
         expected_columns = len(source_rows[0]) if source_rows else 0
-        grid_rows, grid_strategy = self._table_grid_rows(
-            page,
-            conversion.bbox,
-            expected_rows=len(source_rows),
-            expected_columns=expected_columns,
+        grid_rows, grid_strategy = self._stored_table_grid_rows(
+            page=page,
+            block=block,
+            table=table_model,
+            source_rows=source_rows,
+            table_bbox=conversion.bbox,
         )
+        if not grid_rows:
+            grid_rows, grid_strategy = self._table_grid_rows(
+                page,
+                conversion.bbox,
+                source_rows=source_rows,
+                expected_rows=len(source_rows),
+                expected_columns=expected_columns,
+            )
         aligned = self._align_table_rows(
             page,
             source_rows,
@@ -854,7 +909,16 @@ class OriginalLayoutReconstructor:
                         bbox=conversion.bbox,
                     )
                     return []
-                bbox = self._inset_bbox(cell_bbox, horizontal=2.0, vertical=1.0)
+                horizontal_inset = (
+                    4.0
+                    if grid_strategy == "pymupdf_text_lattice_semantic_alignment"
+                    else 2.0
+                )
+                bbox = self._inset_bbox(
+                    cell_bbox,
+                    horizontal=horizontal_inset,
+                    vertical=1.0,
+                )
                 redaction_bboxes = None
                 redaction_fill: tuple[float, float, float] | None = None
                 background_metadata: dict[str, Any] = {}
@@ -973,11 +1037,178 @@ class OriginalLayoutReconstructor:
         remainder = max(1, sum(lengths) - largest)
         return largest > 400 and largest > remainder * 0.45
 
+    def _stored_table_grid_rows(
+        self,
+        *,
+        page: fitz.Page,
+        block: Block,
+        table: TableModel | None,
+        source_rows: list[list[ParsedTableCell]],
+        table_bbox: BoundingBox,
+    ) -> tuple[list[list[fitz.Rect]], str]:
+        """Return extraction-time cell polygons after validating their topology.
+
+        Marker already predicts complete table-cell polygons, including cells
+        in whitespace-separated and partially ruled tables. Persisted geometry
+        is therefore the preferred source for new jobs. It remains advisory:
+        malformed, incomplete, overlapping, or out-of-table cells are rejected
+        and reconstruction falls back to source-PDF geometry recovery.
+        """
+
+        if table is None:
+            return [], "unavailable"
+        header_cells = list(getattr(table, "header_cells", []) or [])
+        body_cells = list(table.cells or [])
+        model_rows = ([header_cells] if header_cells else []) + body_cells
+        if (
+            not model_rows
+            or len(model_rows) != len(source_rows)
+            or any(
+                len(model_row) != len(source_row)
+                for model_row, source_row in zip(model_rows, source_rows, strict=True)
+            )
+            or any(cell.bbox is None for row in model_rows for cell in row)
+        ):
+            return [], "unavailable"
+
+        expected_rows: list[list[tuple[int, int, int, int]]] = []
+        occupied_until: dict[int, int] = {}
+        for row_index, source_row in enumerate(source_rows):
+            expected_row: list[tuple[int, int, int, int]] = []
+            next_column = 0
+            for source_cell in source_row:
+                while any(
+                    occupied_until.get(column, 0) > row_index
+                    for column in range(next_column, next_column + source_cell.colspan)
+                ):
+                    next_column += 1
+                if row_index + source_cell.rowspan > len(source_rows):
+                    return [], "unavailable"
+                expected_row.append(
+                    (
+                        row_index,
+                        next_column,
+                        source_cell.rowspan,
+                        source_cell.colspan,
+                    )
+                )
+                if source_cell.rowspan > 1:
+                    for column in range(next_column, next_column + source_cell.colspan):
+                        occupied_until[column] = row_index + source_cell.rowspan
+                next_column += source_cell.colspan
+            expected_rows.append(expected_row)
+
+        for model_row, expected_row in zip(model_rows, expected_rows, strict=True):
+            for cell, (row_index, column_index, rowspan, colspan) in zip(
+                model_row,
+                expected_row,
+                strict=True,
+            ):
+                if (
+                    cell.row_index != row_index
+                    or cell.column_index != column_index
+                    or cell.rowspan != rowspan
+                    or cell.colspan != colspan
+                ):
+                    return [], "unavailable"
+
+        coordinate_metadata = dict(block.metadata)
+        stored_space = table.debug.get("cell_coordinate_space")
+        if isinstance(stored_space, dict):
+            coordinate_metadata["coordinate_space"] = stored_space
+            width = stored_space.get("width")
+            height = stored_space.get("height")
+            if width is not None:
+                coordinate_metadata["source_page_width"] = width
+                coordinate_metadata["marker_page_width"] = width
+            if height is not None:
+                coordinate_metadata["source_page_height"] = height
+                coordinate_metadata["marker_page_height"] = height
+
+        table_rect = self._fitz_rect(table_bbox)
+        converted_rows: list[list[fitz.Rect]] = []
+        placements: list[tuple[int, int, int, int, fitz.Rect]] = []
+        for model_row, expected_row in zip(model_rows, expected_rows, strict=True):
+            converted_row: list[fitz.Rect] = []
+            for cell, (row_index, column_index, rowspan, colspan) in zip(
+                model_row,
+                expected_row,
+                strict=True,
+            ):
+                conversion = convert_bbox_to_pdf(
+                    cell.bbox,
+                    page_width=page.rect.width,
+                    page_height=page.rect.height,
+                    metadata=coordinate_metadata,
+                )
+                if conversion.bbox is None:
+                    return [], "unavailable"
+                rectangle = self._fitz_rect(conversion.bbox)
+                if (
+                    rectangle.width < 1
+                    or rectangle.height < 1
+                    or self._rect_outside_with_tolerance(
+                        rectangle,
+                        page.rect,
+                        tolerance=0.05,
+                    )
+                    or self._rect_outside_with_tolerance(rectangle, table_rect, tolerance=4.0)
+                ):
+                    return [], "unavailable"
+                converted_row.append(rectangle)
+                placements.append((row_index, column_index, rowspan, colspan, rectangle))
+            converted_rows.append(converted_row)
+
+        for index, placement in enumerate(placements):
+            row_index, column_index, rowspan, colspan, rectangle = placement
+            for other_placement in placements[index + 1 :]:
+                other_row, other_column, other_rowspan, other_colspan, other = other_placement
+                intersection = fitz.Rect(rectangle & other)
+                if intersection.get_area() > 0.75:
+                    return [], "unavailable"
+                rectangle_mid_x = (rectangle.x0 + rectangle.x1) / 2
+                other_mid_x = (other.x0 + other.x1) / 2
+                rectangle_mid_y = (rectangle.y0 + rectangle.y1) / 2
+                other_mid_y = (other.y0 + other.y1) / 2
+                if (
+                    column_index + colspan <= other_column
+                    and rectangle_mid_x >= other_mid_x
+                ) or (
+                    other_column + other_colspan <= column_index
+                    and other_mid_x >= rectangle_mid_x
+                ):
+                    return [], "unavailable"
+                if (
+                    row_index + rowspan <= other_row
+                    and rectangle_mid_y >= other_mid_y
+                ) or (
+                    other_row + other_rowspan <= row_index
+                    and other_mid_y >= rectangle_mid_y
+                ):
+                    return [], "unavailable"
+
+        return converted_rows, "marker_table_cell_polygons"
+
+    def _rect_outside_with_tolerance(
+        self,
+        rectangle: fitz.Rect,
+        container: fitz.Rect,
+        *,
+        tolerance: float,
+    ) -> bool:
+        return (
+            rectangle.x0 < container.x0 - tolerance
+            or rectangle.y0 < container.y0 - tolerance
+            or rectangle.x1 > container.x1 + tolerance
+            or rectangle.y1 > container.y1 + tolerance
+        )
+
     def _table_grid_rows(
         self,
         page: fitz.Page,
         bbox: BoundingBox,
         *,
+        source_rows: list[list[ParsedTableCell]],
         expected_rows: int,
         expected_columns: int,
     ) -> tuple[list[list[fitz.Rect]], str]:
@@ -1087,7 +1318,488 @@ class OriginalLayoutReconstructor:
                 for row in range(expected_rows)
             ]
             return line_rows, "pdf_vector_line_grid"
+
+        semantic_rows = self._semantic_text_table_grid_rows(
+            page=page,
+            table_rect=table_rect,
+            search_rect=search_rect,
+            source_rows=source_rows,
+        )
+        if semantic_rows:
+            return semantic_rows, "pymupdf_text_lattice_semantic_alignment"
         return [], "unavailable"
+
+    def _semantic_text_table_grid_rows(
+        self,
+        *,
+        page: fitz.Page,
+        table_rect: fitz.Rect,
+        search_rect: fitz.Rect,
+        source_rows: list[list[ParsedTableCell]],
+    ) -> list[list[fitz.Rect]]:
+        """Coarsen a physical text lattice to the known semantic table shape.
+
+        Borderless and partially ruled tables often contain excellent PDF text
+        geometry but no closed vector cells. PyMuPDF deliberately reports the
+        physical baselines and whitespace bands in that case, which can be much
+        finer than the logical HTML table. We treat those bands only as column
+        boundary candidates, then accept a layout solely when the source cell
+        text uniquely aligns to every PDF word in monotonic row order.
+        """
+
+        if (
+            not source_rows
+            or not source_rows[0]
+            or any(len(row) != len(source_rows[0]) for row in source_rows)
+        ):
+            return []
+        logical_columns = len(source_rows[0])
+        boundary_candidates = self._horizontal_rule_column_candidates(
+            page,
+            table_rect,
+            logical_columns,
+        )
+        try:
+            finder = page.find_tables(clip=search_rect, strategy="text")
+        except Exception as exc:
+            logger.debug("PyMuPDF text-table lattice detection failed: %s", exc)
+            finder = None
+
+        if finder is not None:
+            for table in finder.tables:
+                candidate_rect = fitz.Rect(table.bbox)
+                intersection = fitz.Rect(candidate_rect & table_rect).get_area()
+                if intersection / max(1.0, min(candidate_rect.get_area(), table_rect.get_area())) < 0.55:
+                    continue
+                physical_columns = int(table.col_count)
+                if (
+                    physical_columns < logical_columns
+                    or physical_columns > min(12, logical_columns + 6)
+                ):
+                    continue
+                x_values = [
+                    float(value)
+                    for row in table.rows
+                    for cell in row.cells
+                    if cell is not None
+                    for value in (cell[0], cell[2])
+                ]
+                physical_edges = self._cluster_coordinates(x_values, tolerance=1.0)
+                if len(physical_edges) != physical_columns + 1:
+                    continue
+                internal_edges = physical_edges[1:-1]
+                if len(internal_edges) < logical_columns - 1:
+                    continue
+                candidate_count = math.comb(len(internal_edges), logical_columns - 1)
+                if candidate_count > 256:
+                    continue
+                for selected in combinations(internal_edges, logical_columns - 1):
+                    boundary_candidates.append(
+                        (float(table_rect.x0), *selected, float(table_rect.x1))
+                    )
+
+        unique_boundaries: dict[tuple[float, ...], tuple[float, ...]] = {}
+        for boundaries in boundary_candidates:
+            if (
+                len(boundaries) != logical_columns + 1
+                or any(right - left < 3.0 for left, right in zip(boundaries, boundaries[1:]))
+            ):
+                continue
+            key = tuple(round(value, 2) for value in boundaries)
+            unique_boundaries[key] = tuple(float(value) for value in boundaries)
+
+        candidates: dict[tuple[float, ...], _SemanticTableGrid] = {}
+        for boundaries in unique_boundaries.values():
+            candidate = self._semantic_grid_candidate(
+                page=page,
+                table_rect=table_rect,
+                source_rows=source_rows,
+                column_edges=boundaries,
+            )
+            if candidate is not None:
+                current = candidates.get(candidate.signature)
+                if current is None or candidate.score > current.score:
+                    candidates[candidate.signature] = candidate
+        ranked = sorted(candidates.values(), key=lambda item: item.score, reverse=True)
+        if not ranked:
+            return []
+        assignments: dict[tuple[str, ...], _SemanticTableGrid] = {}
+        for candidate in ranked:
+            assignments.setdefault(candidate.assignment_signature, candidate)
+        ranked_assignments = sorted(
+            assignments.values(),
+            key=lambda item: item.score,
+            reverse=True,
+        )
+        if (
+            len(ranked_assignments) > 1
+            and self._semantic_scores_are_ambiguous(
+                ranked_assignments[0].score,
+                ranked_assignments[1].score,
+            )
+        ):
+            logger.debug("Rejected ambiguous semantic table geometry with near-tied layouts")
+            return []
+        return [list(row) for row in ranked_assignments[0].rows]
+
+    def _horizontal_rule_column_candidates(
+        self,
+        page: fitz.Page,
+        table_rect: fitz.Rect,
+        logical_columns: int,
+    ) -> list[tuple[float, ...]]:
+        """Recover column separators from per-column horizontal rule segments."""
+
+        y_groups: list[tuple[float, list[float]]] = []
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return []
+        for drawing in drawings:
+            for item in drawing.get("items", []):
+                if not item or item[0] != "l":
+                    continue
+                start = fitz.Point(item[1])
+                end = fitz.Point(item[2])
+                if (
+                    abs(start.y - end.y) > 1.2
+                    or max(start.x, end.x) < table_rect.x0 - 4.0
+                    or min(start.x, end.x) > table_rect.x1 + 4.0
+                    or start.y < table_rect.y0 - 4.0
+                    or start.y > table_rect.y1 + 4.0
+                    or abs(start.x - end.x) < 3.0
+                ):
+                    continue
+                y = float((start.y + end.y) / 2)
+                group = next((entry for entry in y_groups if abs(entry[0] - y) <= 1.2), None)
+                if group is None:
+                    group = (y, [])
+                    y_groups.append(group)
+                group[1].extend([float(start.x), float(end.x)])
+
+        candidates: list[tuple[float, ...]] = []
+        for _y, endpoints in y_groups:
+            edges = self._cluster_coordinates(endpoints, tolerance=1.2)
+            if len(edges) != logical_columns + 1:
+                continue
+            if edges[-1] - edges[0] < table_rect.width * 0.65:
+                continue
+            candidates.append(
+                (float(table_rect.x0), *edges[1:-1], float(table_rect.x1))
+            )
+        return candidates
+
+    def _semantic_grid_candidate(
+        self,
+        *,
+        page: fitz.Page,
+        table_rect: fitz.Rect,
+        source_rows: list[list[ParsedTableCell]],
+        column_edges: tuple[float, ...],
+    ) -> _SemanticTableGrid | None:
+        physical_lines = self._physical_table_lines(page, table_rect, column_edges)
+        if not physical_lines or len(physical_lines) < len(source_rows):
+            return None
+        logical_columns = len(source_rows[0])
+
+        @lru_cache(maxsize=None)
+        def combined_cells(start: int, end: int) -> tuple[str, ...]:
+            return tuple(
+                " ".join(
+                    physical_lines[index].cells[column]
+                    for index in range(start, end)
+                    if physical_lines[index].cells[column]
+                )
+                for column in range(logical_columns)
+            )
+
+        @lru_cache(maxsize=None)
+        def solve(
+            logical_index: int,
+            physical_index: int,
+        ) -> tuple[tuple[float, tuple[tuple[int, int], ...]], ...]:
+            if logical_index == len(source_rows) and physical_index == len(physical_lines):
+                return ((0.0, ()),)
+            if logical_index >= len(source_rows) or physical_index >= len(physical_lines):
+                return ()
+            remaining_rows = len(source_rows) - logical_index - 1
+            max_take = len(physical_lines) - physical_index - remaining_rows
+            candidates: list[tuple[float, tuple[tuple[int, int], ...]]] = []
+            for take in range(1, max_take + 1):
+                end = physical_index + take
+                actual_cells = combined_cells(physical_index, end)
+                score = self._semantic_table_row_similarity(
+                    source_rows[logical_index],
+                    actual_cells,
+                )
+                if score < 0.68:
+                    continue
+                for tail_score, tail_ranges in solve(logical_index + 1, end):
+                    candidates.append(
+                        (score + tail_score, ((physical_index, end), *tail_ranges))
+                    )
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            unique: dict[tuple[tuple[int, int], ...], float] = {}
+            for score, ranges in candidates:
+                unique.setdefault(ranges, score)
+                if len(unique) >= 2:
+                    break
+            return tuple((score, ranges) for ranges, score in unique.items())
+
+        solutions = solve(0, 0)
+        if not solutions:
+            return None
+        best_score, row_ranges = solutions[0]
+        average_score = best_score / len(source_rows)
+        if average_score < 0.68:
+            return None
+        if len(solutions) > 1:
+            second_average = solutions[1][0] / len(source_rows)
+            if self._semantic_scores_are_ambiguous(average_score, second_average):
+                return None
+
+        horizontal_rules = self._horizontal_table_rule_positions(page, table_rect)
+        first_text_top = min(
+            physical_lines[index].y0 for index in range(row_ranges[0][0], row_ranges[0][1])
+        )
+        top_rules = [
+            value
+            for value in horizontal_rules
+            if table_rect.y0 - 1.0 <= value <= first_text_top + 2.0
+        ]
+        row_edges = [
+            float(
+                min(top_rules, key=lambda value: abs(value - first_text_top))
+                if top_rules
+                else table_rect.y0
+            )
+        ]
+        for current, following in zip(row_ranges, row_ranges[1:]):
+            current_bottom = max(
+                physical_lines[index].y1 for index in range(current[0], current[1])
+            )
+            following_top = min(
+                physical_lines[index].y0 for index in range(following[0], following[1])
+            )
+            midpoint = (current_bottom + following_top) / 2
+            rules_between = [
+                value
+                for value in horizontal_rules
+                if current_bottom - 2.0 <= value <= following_top + 2.0
+            ]
+            boundary = (
+                min(rules_between, key=lambda value: abs(value - midpoint))
+                if rules_between
+                else midpoint
+            )
+            if boundary <= row_edges[-1] or boundary >= table_rect.y1:
+                return None
+            row_edges.append(float(boundary))
+        last_text_bottom = max(
+            physical_lines[index].y1 for index in range(row_ranges[-1][0], row_ranges[-1][1])
+        )
+        bottom_rules = [
+            value
+            for value in horizontal_rules
+            if last_text_bottom - 2.0 <= value <= table_rect.y1 + 1.0
+        ]
+        bottom = (
+            min(bottom_rules, key=lambda value: abs(value - last_text_bottom))
+            if bottom_rules
+            else table_rect.y1
+        )
+        if bottom <= row_edges[-1]:
+            return None
+        row_edges.append(float(bottom))
+
+        rows = tuple(
+            tuple(
+                fitz.Rect(
+                    column_edges[column],
+                    row_edges[row],
+                    column_edges[column + 1],
+                    row_edges[row + 1],
+                )
+                for column in range(logical_columns)
+            )
+            for row in range(len(source_rows))
+        )
+        signature = tuple(
+            round(value, 2)
+            for value in (
+                *column_edges,
+                *row_edges,
+            )
+        )
+        assignment_signature = tuple(
+            self._comparison_text(cell)
+            for start, end in row_ranges
+            for cell in combined_cells(start, end)
+        )
+        return _SemanticTableGrid(
+            rows=rows,
+            score=average_score,
+            signature=signature,
+            assignment_signature=assignment_signature,
+        )
+
+    def _semantic_scores_are_ambiguous(self, best: float, second: float) -> bool:
+        difference = best - second
+        if difference <= 1e-6:
+            return True
+        # An exact or near-exact source-text alignment is itself decisive. For
+        # noisier text, require a wider margin between competing partitions.
+        return best < 0.985 and difference < 0.025
+
+    def _horizontal_table_rule_positions(
+        self,
+        page: fitz.Page,
+        table_rect: fitz.Rect,
+    ) -> list[float]:
+        groups: list[dict[str, Any]] = []
+        try:
+            drawings = page.get_drawings()
+        except Exception:
+            return []
+        for drawing in drawings:
+            for item in drawing.get("items", []):
+                if not item or item[0] != "l":
+                    continue
+                start = fitz.Point(item[1])
+                end = fitz.Point(item[2])
+                if (
+                    abs(start.y - end.y) > 1.2
+                    or start.y < table_rect.y0 - 4.0
+                    or start.y > table_rect.y1 + 4.0
+                ):
+                    continue
+                clipped_start = max(table_rect.x0, min(start.x, end.x))
+                clipped_end = min(table_rect.x1, max(start.x, end.x))
+                if clipped_end - clipped_start < 3.0:
+                    continue
+                y = float((start.y + end.y) / 2)
+                group = next(
+                    (candidate for candidate in groups if abs(float(candidate["y"]) - y) <= 1.2),
+                    None,
+                )
+                if group is None:
+                    group = {"y": y, "segments": []}
+                    groups.append(group)
+                group["segments"].append((float(clipped_start), float(clipped_end)))
+
+        positions: list[float] = []
+        for group in groups:
+            segments = sorted(group["segments"])
+            merged: list[list[float]] = []
+            for start, end in segments:
+                if not merged or start > merged[-1][1] + 1.5:
+                    merged.append([start, end])
+                else:
+                    merged[-1][1] = max(merged[-1][1], end)
+            coverage = sum(end - start for start, end in merged)
+            if coverage >= table_rect.width * 0.5:
+                positions.append(float(group["y"]))
+        return sorted(positions)
+
+    def _physical_table_lines(
+        self,
+        page: fitz.Page,
+        table_rect: fitz.Rect,
+        column_edges: tuple[float, ...],
+    ) -> tuple[_PhysicalTableLine, ...]:
+        try:
+            words = page.get_text("words", clip=table_rect, sort=True)
+        except Exception:
+            return ()
+        words = [word for word in words if len(word) >= 5 and self._comparison_text(str(word[4]))]
+        if not words:
+            return ()
+
+        for word in words:
+            word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+            tolerance = min(1.5, max(0.6, word_rect.height * 0.1))
+            if any(
+                word_rect.x0 + tolerance < boundary < word_rect.x1 - tolerance
+                for boundary in column_edges[1:-1]
+            ):
+                return ()
+
+        heights = sorted(float(word[3]) - float(word[1]) for word in words)
+        median_height = heights[len(heights) // 2]
+        y_tolerance = min(3.5, max(1.0, median_height * 0.25))
+        grouped: list[list[Any]] = []
+        for word in sorted(words, key=lambda value: (float(value[1]), float(value[0]))):
+            y0 = float(word[1])
+            if (
+                not grouped
+                or abs(y0 - sum(float(item[1]) for item in grouped[-1]) / len(grouped[-1]))
+                > y_tolerance
+            ):
+                grouped.append([word])
+            else:
+                grouped[-1].append(word)
+
+        lines: list[_PhysicalTableLine] = []
+        for group in grouped:
+            cell_words: list[list[Any]] = [[] for _ in range(len(column_edges) - 1)]
+            for word in sorted(group, key=lambda value: float(value[0])):
+                center = (float(word[0]) + float(word[2])) / 2
+                column = next(
+                    (
+                        index
+                        for index, (left, right) in enumerate(
+                            zip(column_edges, column_edges[1:])
+                        )
+                        if left <= center < right
+                        or (index == len(column_edges) - 2 and center == right)
+                    ),
+                    None,
+                )
+                if column is None:
+                    return ()
+                cell_words[column].append(word)
+            lines.append(
+                _PhysicalTableLine(
+                    y0=min(float(word[1]) for word in group),
+                    y1=max(float(word[3]) for word in group),
+                    cells=tuple(
+                        " ".join(str(word[4]) for word in words_in_cell)
+                        for words_in_cell in cell_words
+                    ),
+                )
+            )
+        return tuple(lines)
+
+    def _semantic_table_row_similarity(
+        self,
+        source_row: list[ParsedTableCell],
+        actual_cells: tuple[str, ...],
+    ) -> float:
+        weighted_score = 0.0
+        total_weight = 0.0
+        nonempty_scores: list[float] = []
+        for source_cell, actual_text in zip(source_row, actual_cells, strict=True):
+            expected = self._comparison_text(source_cell.text)
+            actual = self._comparison_text(actual_text)
+            weight = float(max(2, len(expected), len(actual)))
+            total_weight += weight
+            score = self._normalized_text_similarity(expected, actual)
+            if expected or actual:
+                nonempty_scores.append(score)
+            weighted_score += score * weight
+        if any(score < 0.42 for score in nonempty_scores):
+            return 0.0
+        return weighted_score / max(1.0, total_weight)
+
+    def _normalized_text_similarity(self, expected: str, actual: str) -> float:
+        if not expected and not actual:
+            return 1.0
+        if not expected or not actual:
+            return 0.0
+        score = SequenceMatcher(None, expected, actual).ratio()
+        if expected in actual or actual in expected:
+            score = max(score, min(len(expected), len(actual)) / max(len(expected), len(actual)))
+        return score
 
     def _cluster_coordinates(self, values: list[float], tolerance: float = 1.2) -> list[float]:
         clusters: list[list[float]] = []
@@ -1518,11 +2230,24 @@ class OriginalLayoutReconstructor:
             payload = page.get_text("dict", clip=rectangle)
         except Exception:
             return {}
+        line_rectangles: list[fitz.Rect] = []
         for text_block in payload.get("blocks", []):
             for line in text_block.get("lines", []):
+                line_rectangle: fitz.Rect | None = None
                 for span in line.get("spans", []):
                     if str(span.get("text", "")).strip():
                         spans.append(span)
+                        try:
+                            span_rectangle = fitz.Rect(span["bbox"])
+                            line_rectangle = (
+                                span_rectangle
+                                if line_rectangle is None
+                                else fitz.Rect(line_rectangle | span_rectangle)
+                            )
+                        except Exception:
+                            continue
+                if line_rectangle is not None:
+                    line_rectangles.append(line_rectangle)
         if not spans:
             return {}
 
@@ -1531,7 +2256,6 @@ class OriginalLayoutReconstructor:
         bold_weight = 0
         italic_weight = 0
         sans_weight = 0
-        text_rectangles: list[fitz.Rect] = []
         for span in spans:
             text = str(span.get("text", ""))
             weight = max(1, len(text.strip()))
@@ -1550,10 +2274,6 @@ class OriginalLayoutReconstructor:
                 italic_weight += weight
             if any(name in font_name for name in ("arial", "helv", "sans")):
                 sans_weight += weight
-            try:
-                text_rectangles.append(fitz.Rect(span["bbox"]))
-            except Exception:
-                continue
 
         hints: dict[str, Any] = {}
         if weighted_sizes:
@@ -1567,14 +2287,26 @@ class OriginalLayoutReconstructor:
         hints["font_weight"] = "bold" if bold_weight > total_weight / 2 else "normal"
         hints["font_style"] = "italic" if italic_weight > total_weight / 2 else "normal"
         hints["font_family"] = "sans-serif" if sans_weight > total_weight / 2 else "serif"
-        if infer_alignment and text_rectangles:
-            text_x0 = min(value.x0 for value in text_rectangles)
-            text_x1 = max(value.x1 for value in text_rectangles)
-            left_gap = max(0.0, text_x0 - rectangle.x0)
-            right_gap = max(0.0, rectangle.x1 - text_x1)
-            if abs(left_gap - right_gap) <= max(2.0, rectangle.width * 0.08):
+        if infer_alignment and line_rectangles:
+            gaps = [
+                (
+                    max(0.0, line.x0 - rectangle.x0),
+                    max(0.0, rectangle.x1 - line.x1),
+                )
+                for line in line_rectangles
+            ]
+            tolerance = max(2.0, rectangle.width * 0.08)
+            centered_lines = sum(
+                abs(left_gap - right_gap) <= tolerance
+                for left_gap, right_gap in gaps
+            )
+            sorted_left = sorted(left_gap for left_gap, _right_gap in gaps)
+            sorted_right = sorted(right_gap for _left_gap, right_gap in gaps)
+            median_left = sorted_left[len(sorted_left) // 2]
+            median_right = sorted_right[len(sorted_right) // 2]
+            if centered_lines / len(gaps) >= 0.6:
                 hints["text_align"] = "center"
-            elif right_gap + 2.0 < left_gap:
+            elif median_right + 2.0 < median_left:
                 hints["text_align"] = "right"
             else:
                 hints["text_align"] = "left"

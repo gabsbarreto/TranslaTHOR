@@ -465,6 +465,290 @@ out.mkdir(parents=True, exist_ok=True)
     assert result.markdown.count("Celda original") == 1
 
 
+def test_marker_builder_persists_table_cell_geometry_spans_and_order() -> None:
+    detection = PDFTypeDetectionResult(
+        classification="digital_good_text",
+        page_count=1,
+        pages=[_page_stats(1)],
+        embedded_text_chars=1000,
+        embedded_text_words=160,
+        meaningful_page_count=1,
+        garbled_page_count=0,
+        image_dominant_page_count=0,
+        scanned_page_count=0,
+        mixed=False,
+    )
+    html = (
+        '<table><tr><th rowspan="2">Group</th><th colspan="2">Measures</th></tr>'
+        "<tr><th>A</th><th>B</th></tr>"
+        "<tr><td>Control</td><td>10</td><td>12</td></tr></table>"
+    )
+
+    def cell(
+        name: str,
+        text: str,
+        row: int,
+        column: int,
+        polygon: list[list[int]],
+        **extra,
+    ) -> dict:
+        return {
+            "id": f"/page/0/TableCell/{name}",
+            "block_type": "TableCell",
+            "html": text,
+            "row_index": row,
+            "column_index": column,
+            "polygon": polygon,
+            "confidence": 0.93,
+            **extra,
+        }
+
+    # Explicit coordinates make child emission order irrelevant. The final
+    # malformed child must not shift geometry onto any logical table cell.
+    children = [
+        cell(
+            "b",
+            "B",
+            1,
+            2,
+            [[200, 40], [300, 40], [300, 70], [200, 70]],
+            colspan=999_999_999,
+        ),
+        cell(
+            "group",
+            "Group",
+            0,
+            0,
+            [[10, 10], [100, 10], [100, 70], [10, 70]],
+            rowspan=2,
+        ),
+        # A matched child with geometry outside the page retains provenance,
+        # but its unsafe polygon and bbox are discarded.
+        cell("12", "12", 2, 2, [[700, 70], [800, 70], [800, 100], [700, 100]]),
+        cell(
+            "measures",
+            "Measures",
+            0,
+            1,
+            [[100, 10], [300, 10], [300, 40], [100, 40]],
+            colspan=2,
+        ),
+        cell("a", "A", 1, 1, [[100, 40], [200, 40], [200, 70], [100, 70]]),
+        cell("control", "Control", 2, 0, [[10, 70], [100, 70], [100, 100], [10, 100]]),
+        cell("10", "10", 2, 1, [[100, 70], [200, 70], [200, 100], [100, 100]]),
+        {
+            "id": "/page/0/TableCell/malformed",
+            "block_type": "TableCell",
+            "html": "not a real cell",
+            "row_index": "bad",
+            "polygon": [[999]],
+        },
+    ]
+    payload = [
+        {
+            "id": "/page/0/Page/0",
+            "block_type": "Page",
+            "polygon": [[0, 0], [612, 0], [612, 792], [0, 792]],
+            "children": [
+                {
+                    "id": "/page/0/Table/1",
+                    "block_type": "Table",
+                    "html": html,
+                    "polygon": [[10, 10], [300, 10], [300, 100], [10, 100]],
+                    "children": children,
+                }
+            ],
+        }
+    ]
+
+    document, markdown, chunks = MarkerDocumentBuilder().build_document(
+        marker_payload=payload,
+        detection=detection,
+        filename="paper.pdf",
+        source_type=SourceType.EMBEDDED,
+        parser_metadata={},
+        warnings=[],
+    )
+
+    assert len(document.blocks) == 1
+    assert len(chunks) == 1
+    assert markdown.count("Control") == 1
+    table = document.tables[0]
+    assert table.headers == ["Group", "Measures"]
+    assert [[cell.text for cell in row] for row in table.cells] == [["A", "B"], ["Control", "10", "12"]]
+    assert [(cell.text, cell.row_index, cell.column_index) for cell in table.header_cells] == [
+        ("Group", 0, 0),
+        ("Measures", 0, 1),
+    ]
+    assert table.header_cells[0].rowspan == 2
+    assert table.header_cells[1].colspan == 2
+    assert table.header_cells[0].bbox is not None
+    assert table.header_cells[0].bbox.model_dump() == {"x0": 10.0, "y0": 10.0, "x1": 100.0, "y1": 70.0}
+    assert table.header_cells[0].polygon == [[10.0, 10.0], [100.0, 10.0], [100.0, 70.0], [10.0, 70.0]]
+    assert table.header_cells[0].confidence == pytest.approx(0.93)
+    assert table.cells[0][0].column_index == 1  # column zero is occupied by the rowspan
+    assert table.cells[0][1].colspan == 1  # Reject unsafe Marker span overrides.
+    assert table.cells[1][2].source_id == "/page/0/TableCell/12"
+    assert table.cells[1][2].bbox is None
+    assert table.cells[1][2].polygon == []
+    assert table.debug["cell_geometry_source"] == "marker_table_cell_polygons"
+    assert table.debug["cell_geometry_status"] == "partial"
+    assert table.debug["cell_coordinate_space"] == {
+        "name": "marker_page_coordinates",
+        "width": 612.0,
+        "height": 792.0,
+    }
+    assert table.debug["matched_marker_table_cell_count"] == 7
+    assert table.debug["unmatched_marker_table_cell_count"] == 1
+    assert table.debug["unmatched_logical_table_cell_count"] == 0
+    assert table.debug["valid_marker_table_cell_geometry_count"] == 6
+    assert table.debug["missing_logical_table_cell_geometry_count"] == 1
+    assert table.debug["invalid_marker_table_cell_geometry_count"] == 1
+
+
+def test_marker_builder_does_not_shift_incomplete_table_cell_geometry() -> None:
+    detection = PDFTypeDetectionResult(
+        classification="digital_good_text",
+        page_count=1,
+        pages=[_page_stats(1)],
+        embedded_text_chars=1000,
+        embedded_text_words=160,
+        meaningful_page_count=1,
+        garbled_page_count=0,
+        image_dominant_page_count=0,
+        scanned_page_count=0,
+        mixed=False,
+    )
+    payload = [
+        {
+            "id": "/page/0/Page/0",
+            "block_type": "Page",
+            "children": [
+                {
+                    "id": "/page/0/Table/1",
+                    "block_type": "Table",
+                    "html": "<table><tr><th>A</th><th>B</th></tr><tr><td>same</td><td>same</td></tr></table>",
+                    "children": [
+                        {
+                            "id": "/page/0/TableCell/only-b",
+                            "block_type": "TableCell",
+                            "text": "B",
+                            "polygon": [[100, 0], [200, 0], [200, 20], [100, 20]],
+                        },
+                        {
+                            "id": "/page/0/TableCell/ambiguous",
+                            "block_type": "TableCell",
+                            "text": "same",
+                            "polygon": [[0, 20], [100, 20], [100, 40], [0, 40]],
+                        },
+                    ],
+                }
+            ],
+        }
+    ]
+
+    document, _, chunks = MarkerDocumentBuilder().build_document(
+        marker_payload=payload,
+        detection=detection,
+        filename="paper.pdf",
+        source_type=SourceType.EMBEDDED,
+        parser_metadata={},
+        warnings=[],
+    )
+
+    table = document.tables[0]
+    assert table.header_cells[0].bbox is None
+    assert table.header_cells[1].source_id == "/page/0/TableCell/only-b"
+    assert table.cells[0][0].bbox is None
+    assert table.cells[0][1].bbox is None
+    assert table.debug["matched_marker_table_cell_count"] == 1
+    assert table.debug["unmatched_marker_table_cell_count"] == 1
+    assert table.debug["unmatched_logical_table_cell_count"] == 3
+    assert table.debug["cell_geometry_status"] == "partial"
+    assert table.debug["cell_geometry_source"] == "marker_table_cell_polygons"
+    assert len(document.blocks) == 1
+    assert len(chunks) == 1
+
+
+@pytest.mark.parametrize(
+    ("children", "expected_status", "expected_source", "expected_unmatched_logical"),
+    [
+        (
+            [
+                {
+                    "id": "cell-a",
+                    "block_type": "TableCell",
+                    "text": "A",
+                    "row_index": 0,
+                    "column_index": 0,
+                    "polygon": [[0, 0], [100, 0], [100, 20], [0, 20]],
+                },
+                {
+                    "id": "cell-b",
+                    "block_type": "TableCell",
+                    "text": "B",
+                    "row_index": 0,
+                    "column_index": 1,
+                    "polygon": [[100, 0], [200, 0], [200, 20], [100, 20]],
+                },
+            ],
+            "complete",
+            "marker_table_cell_polygons",
+            0,
+        ),
+        ([], "unavailable", "unavailable", 2),
+    ],
+)
+def test_marker_table_geometry_debug_distinguishes_complete_and_unavailable(
+    children: list[dict],
+    expected_status: str,
+    expected_source: str,
+    expected_unmatched_logical: int,
+) -> None:
+    detection = PDFTypeDetectionResult(
+        classification="digital_good_text",
+        page_count=1,
+        pages=[_page_stats(1)],
+        embedded_text_chars=1000,
+        embedded_text_words=160,
+        meaningful_page_count=1,
+        garbled_page_count=0,
+        image_dominant_page_count=0,
+        scanned_page_count=0,
+        mixed=False,
+    )
+    payload = [
+        {
+            "id": "/page/0/Page/0",
+            "block_type": "Page",
+            "polygon": [[0, 0], [612, 0], [612, 792], [0, 792]],
+            "children": [
+                {
+                    "id": "/page/0/Table/1",
+                    "block_type": "Table",
+                    "html": "<table><tr><td>A</td><td>B</td></tr></table>",
+                    "polygon": [[0, 0], [200, 0], [200, 20], [0, 20]],
+                    "children": children,
+                }
+            ],
+        }
+    ]
+
+    document, _, _ = MarkerDocumentBuilder().build_document(
+        marker_payload=payload,
+        detection=detection,
+        filename="paper.pdf",
+        source_type=SourceType.EMBEDDED,
+        parser_metadata={},
+        warnings=[],
+    )
+
+    debug = document.tables[0].debug
+    assert debug["cell_geometry_status"] == expected_status
+    assert debug["cell_geometry_source"] == expected_source
+    assert debug["unmatched_logical_table_cell_count"] == expected_unmatched_logical
+
+
 def test_local_vlm_repair_server_unavailable_does_not_raise() -> None:
     service = LocalVLMRepairService(
         LocalVLMConfig(

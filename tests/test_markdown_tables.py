@@ -1,8 +1,12 @@
+from pathlib import Path
+
 from app.models.schema import (
     Block,
     BlockType,
+    BoundingBox,
     DocumentMetadata,
     DocumentModel,
+    FigureAsset,
     PageMetadata,
     SourceType,
     TableModel,
@@ -291,3 +295,284 @@ def test_markdown_builder_matches_multiple_legacy_tables_in_page_order() -> None
         assert f"Spanish C{number}" not in markdown
         assert markdown.count(f"Table {number}. English caption") == 1
     assert markdown.count('<figure class="document-table">') == 2
+
+
+def test_markdown_builder_recovers_caption_geometrically_above_table() -> None:
+    table = TableModel(
+        id="legacy-table",
+        page_numbers=[1],
+        headers=["Heading"],
+        rows=[["Cell"]],
+        cells=[[TableModel.TableCell(text="Cell")]],
+        debug={"source_block_id": "table-block"},
+    )
+    blocks = [
+        Block(
+            id="above-caption",
+            page_number=1,
+            block_type=BlockType.CAPTION,
+            text="Caption placed above the table",
+            bbox=BoundingBox(x0=100, y0=90, x1=500, y1=112),
+            # Marker can emit this after the table despite its page position.
+            reading_order_index=12,
+            source_type=SourceType.OCR,
+        ),
+        Block(
+            id="table-block",
+            page_number=1,
+            block_type=BlockType.TABLE,
+            text="| Heading |\n|---|\n| Cell |",
+            bbox=BoundingBox(x0=100, y0=120, x1=500, y1=300),
+            reading_order_index=10,
+            source_type=SourceType.OCR,
+        ),
+        Block(
+            id="other-column-caption",
+            page_number=1,
+            block_type=BlockType.CAPTION,
+            text="Caption belonging to another column",
+            bbox=BoundingBox(x0=520, y0=305, x1=590, y1=330),
+            reading_order_index=11,
+            source_type=SourceType.OCR,
+        ),
+    ]
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="above-caption.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=0.2,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=blocks,
+        tables=[table],
+    )
+
+    markdown = MarkdownBuilder().build(document)
+
+    assert "<figcaption>Caption placed above the table</figcaption>" in markdown
+    assert markdown.count("Caption placed above the table") == 1
+    assert "*Caption belonging to another column*" in markdown
+
+
+def test_markdown_builder_prefers_closest_reliable_caption() -> None:
+    table = TableModel(
+        id="legacy-table",
+        page_numbers=[1],
+        headers=["Heading"],
+        rows=[["Cell"]],
+        cells=[[TableModel.TableCell(text="Cell")]],
+        debug={"source_block_id": "table-block"},
+    )
+    blocks = [
+        Block(
+            id="far-caption",
+            page_number=1,
+            block_type=BlockType.CAPTION,
+            text="More distant caption",
+            bbox=BoundingBox(x0=100, y0=100, x1=500, y1=120),
+            reading_order_index=9,
+            source_type=SourceType.OCR,
+        ),
+        Block(
+            id="table-block",
+            page_number=1,
+            block_type=BlockType.TABLE,
+            text="| Heading |\n|---|\n| Cell |",
+            bbox=BoundingBox(x0=100, y0=200, x1=500, y1=400),
+            reading_order_index=10,
+            source_type=SourceType.OCR,
+        ),
+        Block(
+            id="near-caption",
+            page_number=1,
+            block_type=BlockType.CAPTION,
+            text="Closest caption",
+            bbox=BoundingBox(x0=100, y0=406, x1=500, y1=426),
+            reading_order_index=11,
+            source_type=SourceType.OCR,
+        ),
+    ]
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="competing-captions.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=0.2,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=blocks,
+        tables=[table],
+    )
+
+    markdown = MarkdownBuilder().build(document)
+
+    assert "<figcaption>Closest caption</figcaption>" in markdown
+    assert "<figcaption>More distant caption</figcaption>" not in markdown
+    assert "*More distant caption*" in markdown
+    assert markdown.count("Closest caption") == 1
+
+
+def test_markdown_builder_maximizes_caption_assignment_before_distance() -> None:
+    tables = [
+        TableModel(
+            id=f"table-{number}",
+            page_numbers=[1],
+            headers=["Heading"],
+            rows=[[f"Cell {number}"]],
+            cells=[[TableModel.TableCell(text=f"Cell {number}")]],
+            debug={"source_block_id": f"table-block-{number}"},
+        )
+        for number in (1, 2)
+    ]
+    distant_caption = Block(
+        id="distant-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Caption available only to the first table",
+        bbox=BoundingBox(x0=100, y0=100, x1=300, y1=120),
+        reading_order_index=9,
+        source_type=SourceType.OCR,
+    )
+    shared_caption = Block(
+        id="shared-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Caption between both tables",
+        bbox=BoundingBox(x0=100, y0=306, x1=300, y1=326),
+        reading_order_index=11,
+        source_type=SourceType.OCR,
+    )
+    blocks = [
+        distant_caption,
+        Block(
+            id="table-block-1",
+            page_number=1,
+            block_type=BlockType.TABLE,
+            text="| Heading |\n|---|\n| Cell 1 |",
+            bbox=BoundingBox(x0=100, y0=200, x1=300, y1=300),
+            reading_order_index=10,
+            source_type=SourceType.OCR,
+        ),
+        shared_caption,
+        Block(
+            id="table-block-2",
+            page_number=1,
+            block_type=BlockType.TABLE,
+            text="| Heading |\n|---|\n| Cell 2 |",
+            bbox=BoundingBox(x0=100, y0=340, x1=300, y1=440),
+            reading_order_index=12,
+            source_type=SourceType.OCR,
+        ),
+    ]
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="crossed-captions.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=0.2,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=blocks,
+        tables=tables,
+    )
+    builder = MarkdownBuilder()
+
+    resolved = builder._table_caption_map(
+        document,
+        {distant_caption.id: distant_caption, shared_caption.id: shared_caption},
+    )
+    markdown = builder.build(document)
+
+    assert resolved["table-1"].id == "distant-caption"
+    assert resolved["table-2"].id == "shared-caption"
+    assert markdown.count("Caption available only to the first table") == 1
+    assert markdown.count("Caption between both tables") == 1
+
+
+def test_markdown_builder_reserves_explicit_figure_caption_from_table_inference(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "figure.png"
+    image_path.write_bytes(b"placeholder")
+    figure_caption = Block(
+        id="figure-caption",
+        page_number=1,
+        block_type=BlockType.CAPTION,
+        text="Figure 1. Figure-only caption",
+        bbox=BoundingBox(x0=100, y0=100, x1=300, y1=120),
+        reading_order_index=1,
+        source_type=SourceType.OCR,
+    )
+    table = TableModel(
+        id="legacy-table",
+        page_numbers=[1],
+        headers=["Heading"],
+        rows=[["Cell"]],
+        cells=[[TableModel.TableCell(text="Cell")]],
+        debug={"source_block_id": "table-block"},
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="figure-caption.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=True,
+                embedded_text_quality=0.2,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[
+            Block(
+                id="figure-block",
+                page_number=1,
+                block_type=BlockType.FIGURE,
+                text="",
+                bbox=BoundingBox(x0=100, y0=20, x1=300, y1=90),
+                reading_order_index=0,
+                source_type=SourceType.OCR,
+            ),
+            figure_caption,
+            Block(
+                id="table-block",
+                page_number=1,
+                block_type=BlockType.TABLE,
+                text="| Heading |\n|---|\n| Cell |",
+                bbox=BoundingBox(x0=100, y0=130, x1=300, y1=250),
+                reading_order_index=2,
+                source_type=SourceType.OCR,
+            ),
+        ],
+        tables=[table],
+        figures=[
+            FigureAsset(
+                id="figure-1",
+                page_number=1,
+                bbox=BoundingBox(x0=100, y0=20, x1=300, y1=90),
+                caption_block_id=figure_caption.id,
+                image_path=str(image_path),
+                source_block_ids=["figure-block"],
+            )
+        ],
+    )
+    builder = MarkdownBuilder()
+
+    markdown = builder.build(document)
+
+    assert builder._table_caption_map(document, {figure_caption.id: figure_caption}) == {}
+    assert markdown.count("<figcaption>Figure 1. Figure-only caption</figcaption>") == 1
+    assert "<figcaption>Table 1</figcaption>" in markdown

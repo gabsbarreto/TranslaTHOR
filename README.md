@@ -11,8 +11,11 @@ This browser-based app translates PDFs locally.
 5. Qwen full-page OCR reads rendered page images directly when Marker needs an uncertain-document OCR fallback.
 6. Surya OCR regions are cleaned and merged into traceable logical translation chunks.
 7. Extracted text is normalized into a shared structured document model.
-8. Structurally collapsed Marker tables are checked against the source PDF. Ruled digital tables
-   are repaired from the exact clipped PyMuPDF table grid only when the source text strongly agrees.
+8. Marker table-cell polygons are retained for reconstruction. When older digital jobs have no
+   stored cells, partial-rule and whitespace-separated tables can recover their logical grid from
+   PDF text geometry only when every source cell has one unambiguous, monotonic alignment.
+   Structurally collapsed ruled tables are also checked against the source PDF and repaired from an
+   exact clipped PyMuPDF grid only when the source text strongly agrees.
 9. Figure regions are deduplicated, validated, associated with captions, and captured as
    high-resolution PNG previews plus clipped vector SVG assets when the source supports them.
 10. A local MLX Qwen model translates the document into English.
@@ -74,7 +77,9 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   digital-text pages it removes source text while preserving overlapping raster images and vector
   graphics, then inserts translated text into the corresponding boxes using source-PDF font metrics
   when available. Translation batches are kept page-local and do not cross figure or equation
-  regions. Reliable vector-grid tables are reconstructed cell-by-cell without removing their lines.
+  regions. Tables with validated Marker cell polygons are reconstructed cell-by-cell without
+  removing their lines. For older digital jobs, a partial-rule or whitespace-separated table can
+  also be reconstructed when source text uniquely validates a coarsening of the PDF text lattice.
   A hidden-OCR scan can also reconstruct a ruled table when its OCR text layer, translated table
   shape, and complete PDF grid agree: only bounded changed-text masks are covered, while rules, arrows,
   numbers, and unchanged visual cells remain on the source page. The operation is atomic, so one
@@ -184,13 +189,19 @@ safe translated fallback.
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.
 - Tables are translated cell-by-cell in original-layout output only when the translated HTML or
-  Markdown shape can be matched to a complete grid and the source cell text validates that mapping.
+  Markdown shape can be matched to validated cell geometry and the source cell text validates that
+  mapping. New extractions retain Marker cell polygons as the preferred geometry. Older clean
+  digital PDFs with partial horizontal rules or whitespace-separated columns can use a semantic
+  fallback: physical PDF text lines and candidate column edges are coalesced into the logical table
+  only when all source cells align in a unique monotonic solution.
   For scanned tables, the hidden OCR line boxes and a light, sufficiently uniform background must
   also pass validation; only cells whose text actually changes are masked. When Marker
   collapses a ruled digital table into one oversized cell, the extraction stage attempts a clipped
   PyMuPDF repair and accepts it only with at least 88% source/candidate token agreement. Malformed,
-  duplicated, merged-cell, borderless, boxed prose panels, or otherwise ambiguous tables that
-  cannot pass this validation remain unchanged and are reported. A failure in any cell retains the
+  duplicated, boxed prose panels, tables whose visible PDF text disagrees with extraction, or
+  otherwise ambiguous tables remain unchanged and are reported. Borderless tables require stored
+  extractor geometry or a uniquely validated text-lattice solution; geometry is never inferred
+  from translated text alone. A failure in any cell retains the
   complete source table instead of producing a partially translated grid. Such tables can still be
   translated as reflowed structured content in the readable PDF when OCR recovered their rows.
 - Translated text that cannot fit at the minimum 60% scale is reported and the source region is

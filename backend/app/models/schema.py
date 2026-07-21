@@ -91,6 +91,11 @@ class TableModel(BaseModel):
         colspan: int = 1
         bbox: BoundingBox | None = None
         confidence: float | None = None
+        row_index: int | None = None
+        column_index: int | None = None
+        source_id: str | None = None
+        polygon: list[list[float]] = Field(default_factory=list)
+        extraction_metadata: dict[str, Any] = Field(default_factory=dict)
 
     id: str
     page_numbers: list[int]
@@ -100,6 +105,7 @@ class TableModel(BaseModel):
     caption: str | None = None
     notes: str | None = None
     headers: list[str] = Field(default_factory=list)
+    header_cells: list[TableCell] = Field(default_factory=list)
     rows: list[list[str]] = Field(default_factory=list)
     cells: list[list[TableCell]] = Field(default_factory=list)
     continued_from_previous_page: bool = False

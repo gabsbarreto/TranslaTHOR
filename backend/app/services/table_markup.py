@@ -5,10 +5,19 @@ from dataclasses import dataclass
 from html.parser import HTMLParser
 
 
+# Keep malformed OCR/Marker markup from turning a cell span into an
+# unbounded amount of topology work. Values beyond this extraction limit are
+# treated as invalid instead of being clamped, because inventing a very large
+# span would make the recovered table structure less trustworthy.
+MAX_TABLE_CELL_SPAN = 1_000
+
+
 @dataclass(frozen=True)
 class ParsedTableCell:
     tag: str
     text: str
+    rowspan: int = 1
+    colspan: int = 1
 
 
 class _TableHTMLParser(HTMLParser):
@@ -18,15 +27,19 @@ class _TableHTMLParser(HTMLParser):
         self._row: list[ParsedTableCell] | None = None
         self._cell_tag: str | None = None
         self._cell_parts: list[str] = []
+        self._cell_rowspan = 1
+        self._cell_colspan = 1
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        _ = attrs
         normalized = tag.lower()
         if normalized == "tr":
             self._row = []
         elif normalized in {"td", "th"} and self._row is not None:
             self._cell_tag = normalized
             self._cell_parts = []
+            attributes = {str(key).lower(): value for key, value in attrs}
+            self._cell_rowspan = _positive_span(attributes.get("rowspan"))
+            self._cell_colspan = _positive_span(attributes.get("colspan"))
         elif normalized == "br" and self._cell_tag is not None:
             self._cell_parts.append("\n")
 
@@ -45,9 +58,18 @@ class _TableHTMLParser(HTMLParser):
                 for line in "".join(self._cell_parts).splitlines()
                 if line.strip()
             )
-            self._row.append(ParsedTableCell(tag=self._cell_tag, text=text))
+            self._row.append(
+                ParsedTableCell(
+                    tag=self._cell_tag,
+                    text=text,
+                    rowspan=self._cell_rowspan,
+                    colspan=self._cell_colspan,
+                )
+            )
             self._cell_tag = None
             self._cell_parts = []
+            self._cell_rowspan = 1
+            self._cell_colspan = 1
         elif normalized == "tr" and self._row is not None:
             if self._row:
                 self.rows.append(self._row)
@@ -170,6 +192,14 @@ def _cells_from_markdown_rows(rows: list[list[str]]) -> list[list[ParsedTableCel
 
 def _is_separator_cell(text: str) -> bool:
     return bool(re.fullmatch(r":?-{1,}:?", text.strip()))
+
+
+def _positive_span(value: str | None) -> int:
+    try:
+        parsed = int(str(value or "1").strip())
+    except (TypeError, ValueError):
+        return 1
+    return parsed if 0 < parsed <= MAX_TABLE_CELL_SPAN else 1
 
 
 def _split_pipe_cells(text: str) -> list[str]:
