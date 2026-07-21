@@ -81,16 +81,19 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   removing their lines. For older digital jobs, a partial-rule or whitespace-separated table can
   also be reconstructed when source text uniquely validates a coarsening of the PDF text lattice.
   A hidden-OCR scan can reconstruct verified body-text regions on top of its original page image.
-  Surya supplies the structure and initial position, then source text is aligned to contiguous
-  hidden-OCR lines to correct reading-order drift before any pixels are covered. Only matched glyph
-  strips on a light, uniform background are masked; ambiguous, partial, multi-column, or visually
+  Surya supplies the structure and initial position, then source text is aligned to spatially
+  contiguous hidden-OCR lines to correct reading-order drift and malformed native PDF text blocks
+  before any pixels are covered. Multi-block passages are translated with shared context while an
+  indexed boundary contract keeps one target per physical region. Only matched glyph strips on a
+  light, uniform background are masked; ambiguous, partial, genuinely multi-column, or visually
   complex matches remain unchanged. Ruled tables can also be reconstructed when their translated
   shape and complete PDF grid agree, while rules, arrows, numbers, and unchanged cells remain on the
   source page. The table operation is atomic, so one unsafe or overflowing cell retains the entire
   source table.
   Figures, graphs, equations, logos, colours, lines, page sizes, crop boxes, rotation, and
   decorations come from the original pages. A JSON reconstruction report records every replacement,
-  skip, fallback page, text scale, overflow, raster figure fallback, and low-confidence association.
+  skip, fallback page, text scale, overflow, raster figure fallback, low-confidence association, and
+  the score/coverage diagnostics for failed hidden-OCR alignment.
 
 In this first figure-handling level, a graph or figure is preserved as one unchanged visual. Only
 its external caption is translated. Axis labels, legends, abbreviations, annotations, and all other
@@ -183,8 +186,11 @@ safe translated fallback.
   version does not perform general background inpainting and will never place translated text over
   visible source text that has not first been safely covered.
 - Hidden-OCR pages can replace body text when the complete source passage has one unambiguous match
-  to contiguous hidden-OCR lines. The stored Surya box is an auditable position hint rather than the
-  final authority, because a missed or merged region can shift later reading-order associations.
+  to a spatially contiguous hidden-OCR line lane. The stored Surya box is an auditable position hint
+  rather than the final authority, because a missed or merged region can shift later reading-order
+  associations. Line lanes may bridge a malformed native PDF text-block boundary, but they cannot
+  jump between columns. Multi-column classification requires a stable gutter across several lines;
+  isolated OCR glyph fragments are ignored.
   The original scan remains the background; only verified line masks on light, sufficiently uniform
   paper are covered before translated text is inserted. Partial matches, multi-column regions that
   require table geometry, already-English passages, and suspicious translation-script changes are
@@ -196,6 +202,9 @@ safe translated fallback.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
 - Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.
+  New translations preserve one independently placeable target per source block, even when several
+  blocks share one model request for linguistic context; long groups are batched without translating
+  a physical block twice.
   Legacy cross-page translation batches are recovered only when their preserved source and
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.

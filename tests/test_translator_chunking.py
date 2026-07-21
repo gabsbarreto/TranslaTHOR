@@ -1,7 +1,16 @@
 import sys
 from types import ModuleType
 
-from app.models.schema import Block, BlockType, BoundingBox, DocumentMetadata, DocumentModel, PageMetadata, SourceType
+from app.models.schema import (
+    Block,
+    BlockType,
+    BoundingBox,
+    DocumentMetadata,
+    DocumentModel,
+    PageMetadata,
+    SourceType,
+    TranslationChunk,
+)
 from app.services.markdown_builder import MarkdownBuilder
 
 if "langdetect" not in sys.modules:
@@ -455,7 +464,7 @@ def test_translated_list_text_strips_accidental_markdown_marker_before_rendering
     assert "- - Criterion" not in translated_markdown
 
 
-def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
+def test_batched_prose_chunk_is_sent_once_and_mapped_back_to_each_block() -> None:
     document = DocumentModel(
         metadata=DocumentMetadata(filename="paper.pdf", page_count=1, detected_language="pt"),
         pages=[
@@ -479,20 +488,225 @@ def test_merged_prose_chunk_is_sent_as_one_translation_request() -> None:
     translator._token_count = lambda text: len(text.split())  # type: ignore[method-assign]
     calls: list[str] = []
 
-    def fake_translate(text, context, source_language, block_type):
-        _ = (context, source_language, block_type)
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
         calls.append(text)
-        return f"T::{text}"
+        return text.replace("Primeiro bloco.", "First block.").replace(
+            "Segundo bloco.",
+            "Second block.",
+        )
 
-    translator._translate_chunk_with_validation = fake_translate  # type: ignore[method-assign]
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
 
     translated_doc, _ = translator.translate_document(document, "")
 
     assert len(calls) == 1
     assert "Primeiro bloco." in calls[0]
     assert "Segundo bloco." in calls[0]
-    assert translated_doc.blocks[0].text.startswith("T::Primeiro bloco.")
-    assert translated_doc.blocks[1].text == ""
+    assert translated_doc.blocks[0].text == "First block."
+    assert translated_doc.blocks[1].text == "Second block."
+
+
+def test_prepared_context_group_preserves_each_physical_block_target() -> None:
+    left = _block("qwen-p2-b27", "Al no haber", 700, 730, x0=50)
+    right = _block(
+        "qwen-p2-b28",
+        "existido cobertura sanitaria en la sanidad publica hasta 1999.",
+        100,
+        160,
+        x0=330,
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(
+            filename="scan.pdf",
+            page_count=1,
+            detected_language="es",
+            translation={"ocr_logical_chunks_prepared": True},
+        ),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=600,
+                height=800,
+                has_embedded_text=False,
+                embedded_text_quality=0.0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[left, right],
+        translation_chunks=[
+            TranslationChunk(
+                id="p0001-c001",
+                block_ids=[left.id, right.id],
+                source_text=(
+                    "Al no haber existido cobertura sanitaria en la sanidad publica "
+                    "hasta 1999."
+                ),
+                context="Introduccion",
+                source_language="es",
+                chunk_type="paragraph",
+                page_start=1,
+                page_end=1,
+            )
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_group_size=5))
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        return text.replace("Al no haber", "Since there was no").replace(
+            "existido cobertura sanitaria en la sanidad publica hasta 1999.",
+            "public healthcare coverage until 1999.",
+        )
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    assert len(calls) == 1
+    assert translated_doc.blocks[0].text == "Since there was no"
+    assert translated_doc.blocks[1].text == "public healthcare coverage until 1999."
+    assert translated_doc.blocks[0].metadata["translated_from_block_ids"] == [left.id]
+    assert translated_doc.blocks[1].metadata["translated_from_block_ids"] == [right.id]
+    assert "merged_into_block_id" not in translated_doc.blocks[1].metadata
+
+
+def test_long_prepared_context_group_translates_each_physical_block_once() -> None:
+    first_text = "BloqueUno " + "contenido " * 78 + "final."
+    second_text = "BloqueDos " + "contenido " * 78 + "final."
+    first = _block("first", first_text, 100, 300)
+    second = _block("second", second_text, 320, 520)
+    document = DocumentModel(
+        metadata=DocumentMetadata(
+            filename="scan.pdf",
+            page_count=1,
+            detected_language="es",
+            translation={"ocr_logical_chunks_prepared": True},
+        ),
+        pages=[],
+        blocks=[first, second],
+        translation_chunks=[
+            TranslationChunk(
+                id="p0001-c001",
+                block_ids=[first.id, second.id],
+                source_text=f"{first_text} {second_text}",
+                context="Seccion",
+                source_language="es",
+                page_start=1,
+                page_end=1,
+            )
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings(chunk_size=128, max_tokens=2048))
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        return text.replace("BloqueUno", "BlockOne").replace("BloqueDos", "BlockTwo")
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    assert sum("BloqueUno" in call for call in calls) == 1
+    assert sum("BloqueDos" in call for call in calls) == 1
+    assert translated_doc.blocks[0].text.startswith("BlockOne")
+    assert translated_doc.blocks[1].text.startswith("BlockTwo")
+    assert [chunk.block_ids for chunk in translated_doc.translation_chunks] == [
+        [first.id],
+        [second.id],
+    ]
+
+
+def test_malformed_grouped_translation_falls_back_to_each_physical_block() -> None:
+    first = _block("first", "Primer bloque fisico.", 100, 130)
+    second = _block("second", "Segundo bloque fisico.", 150, 180)
+    document = DocumentModel(
+        metadata=DocumentMetadata(
+            filename="scan.pdf",
+            page_count=1,
+            detected_language="es",
+            translation={"ocr_logical_chunks_prepared": True},
+        ),
+        pages=[],
+        blocks=[first, second],
+        translation_chunks=[
+            TranslationChunk(
+                id="p0001-c001",
+                block_ids=[first.id, second.id],
+                source_text="Primer bloque fisico. Segundo bloque fisico.",
+                context="Seccion",
+                source_language="es",
+                page_start=1,
+                page_end=1,
+            )
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda chunk: False  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        if "<translathor-segment" in text:
+            return "One merged target without segment tags."
+        return {
+            "Primer bloque fisico.": "First physical block.",
+            "Segundo bloque fisico.": "Second physical block.",
+        }[text]
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    assert len(calls) == 4
+    assert translated_doc.blocks[0].text == "First physical block."
+    assert translated_doc.blocks[1].text == "Second physical block."
+    assert [chunk.block_ids for chunk in translated_doc.translation_chunks] == [
+        [first.id],
+        [second.id],
+    ]
+
+
+def test_translation_prompt_includes_context_and_source_language() -> None:
+    prompt = MlxTranslator(TranslationSettings())._build_prompt(
+        "Texto que traducir.",
+        "Use the prior section's terminology.",
+        "es",
+    )
+
+    assert "SOURCE LANGUAGE: es" in prompt
+    assert "Use the prior section's terminology." in prompt
+    assert "TEXT:\nTexto que traducir." in prompt
 
 
 def test_qwen_markdown_parser_preserves_header_and_footer_text() -> None:

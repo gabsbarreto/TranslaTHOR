@@ -713,6 +713,7 @@ class OriginalLayoutReconstructor:
                         block,
                         reason=failure_reason,
                         bbox=bbox,
+                        alignment_diagnostics=match_metadata,
                     )
                     continue
                 if (
@@ -2093,16 +2094,95 @@ class OriginalLayoutReconstructor:
         text_blocks: list[tuple[_HiddenOCRLine, ...]],
     ) -> list[tuple[_HiddenOCRLine, ...]]:
         sequences = list(text_blocks)
-        for start in range(len(text_blocks)):
-            combined = list(text_blocks[start])
-            previous = text_blocks[start]
-            for following in text_blocks[start + 1 : start + 4]:
-                if not self._hidden_ocr_blocks_are_continuous(previous, following):
+        all_lines = [line for block in text_blocks for line in block]
+        if len(all_lines) < 2:
+            return sequences
+
+        # Native OCR text blocks are not reliable paragraph containers. A
+        # continuation can be placed near the end of a later block after lines
+        # from the opposite column. Build additional reading lanes from line
+        # geometry so that the matcher can take that continuation without also
+        # consuming the unrelated lines.
+        candidate_edges: list[
+            tuple[tuple[int, float, float, float], _HiddenOCRLine, _HiddenOCRLine]
+        ] = []
+        for first in all_lines:
+            for second in all_lines:
+                if not self._hidden_ocr_lines_are_continuous(first, second):
+                    continue
+                same_native_sequence = (
+                    first.block_index == second.block_index
+                    and second.line_index == first.line_index + 1
+                )
+                first_height = max(1.0, first.bbox.y1 - first.bbox.y0)
+                top_advance = second.bbox.y0 - first.bbox.y0
+                horizontal_offset = abs(first.bbox.x0 - second.bbox.x0)
+                candidate_edges.append(
+                    (
+                        (
+                            0 if same_native_sequence else 1,
+                            top_advance / first_height,
+                            horizontal_offset,
+                            second.bbox.x0,
+                        ),
+                        first,
+                        second,
+                    )
+                )
+
+        successors: dict[tuple[int, int], _HiddenOCRLine] = {}
+        predecessors: dict[tuple[int, int], _HiddenOCRLine] = {}
+        for _score, first, second in sorted(candidate_edges, key=lambda item: item[0]):
+            if first.key in successors or second.key in predecessors:
+                continue
+            successors[first.key] = second
+            predecessors[second.key] = first
+
+        known_sequences = {tuple(line.key for line in sequence) for sequence in sequences}
+        for first in all_lines:
+            if first.key in predecessors:
+                continue
+            lane = [first]
+            seen = {first.key}
+            while lane[-1].key in successors:
+                following = successors[lane[-1].key]
+                if following.key in seen:
                     break
-                combined.extend(following)
-                sequences.append(tuple(combined))
-                previous = following
+                lane.append(following)
+                seen.add(following.key)
+            signature = tuple(line.key for line in lane)
+            if len(lane) > 1 and signature not in known_sequences:
+                sequences.append(tuple(lane))
+                known_sequences.add(signature)
         return sequences
+
+    def _hidden_ocr_lines_are_continuous(
+        self,
+        first: _HiddenOCRLine,
+        second: _HiddenOCRLine,
+    ) -> bool:
+        first_height = max(1.0, first.bbox.y1 - first.bbox.y0)
+        second_height = max(1.0, second.bbox.y1 - second.bbox.y0)
+        top_advance = second.bbox.y0 - first.bbox.y0
+        vertical_gap = second.bbox.y0 - first.bbox.y1
+        if top_advance < min(2.0, first_height * 0.25):
+            return False
+        if vertical_gap < -min(first_height, second_height) * 0.25:
+            return False
+        if vertical_gap > max(18.0, (first_height + second_height) * 1.4):
+            return False
+        horizontal_overlap = max(
+            0.0,
+            min(first.bbox.x1, second.bbox.x1) - max(first.bbox.x0, second.bbox.x0),
+        )
+        narrower_width = max(
+            1.0,
+            min(first.bbox.x1 - first.bbox.x0, second.bbox.x1 - second.bbox.x0),
+        )
+        return (
+            horizontal_overlap / narrower_width >= 0.5
+            or abs(first.bbox.x0 - second.bbox.x0) <= 18.0
+        )
 
     def _hidden_ocr_blocks_are_continuous(
         self,
@@ -2111,25 +2191,7 @@ class OriginalLayoutReconstructor:
     ) -> bool:
         if not first or not second:
             return False
-        first_bbox = self._union_bbox([line.bbox for line in first])
-        second_bbox = self._union_bbox([line.bbox for line in second])
-        first_height = max(1.0, first[-1].bbox.y1 - first[-1].bbox.y0)
-        second_height = max(1.0, second[0].bbox.y1 - second[0].bbox.y0)
-        vertical_gap = second_bbox.y0 - first_bbox.y1
-        if vertical_gap < -2.0 or vertical_gap > max(18.0, (first_height + second_height) * 1.4):
-            return False
-        horizontal_overlap = max(
-            0.0,
-            min(first_bbox.x1, second_bbox.x1) - max(first_bbox.x0, second_bbox.x0),
-        )
-        narrower_width = max(
-            1.0,
-            min(first_bbox.x1 - first_bbox.x0, second_bbox.x1 - second_bbox.x0),
-        )
-        return (
-            horizontal_overlap / narrower_width >= 0.5
-            or abs(first_bbox.x0 - second_bbox.x0) <= 18.0
-        )
+        return self._hidden_ocr_lines_are_continuous(first[-1], second[0])
 
     def _scan_match_envelope(
         self,
@@ -2165,31 +2227,99 @@ class OriginalLayoutReconstructor:
         page: fitz.Page,
         lines: tuple[_HiddenOCRLine, ...],
     ) -> bool:
-        split_lines = 0
+        try:
+            page_words = page.get_text("words", sort=False)
+        except Exception:
+            return False
+
+        gaps_by_line: list[list[tuple[float, float]]] = []
         eligible_lines = 0
         for line in lines:
-            try:
-                words = page.get_text("words", clip=self._fitz_rect(line.bbox), sort=True)
-            except Exception:
-                return False
+            line_rectangle = self._fitz_rect(line.bbox)
             word_rectangles = sorted(
                 (
                     fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
-                    for word in words
-                    if len(word) >= 5 and self._comparison_text(str(word[4]))
+                    for word in page_words
+                    if len(word) >= 5
+                    and self._comparison_text(str(word[4]))
+                    and self._word_belongs_to_hidden_ocr_line(word, line_rectangle)
                 ),
                 key=lambda rectangle: rectangle.x0,
             )
             if len(word_rectangles) < 2:
                 continue
             eligible_lines += 1
-            largest_gap = max(
-                following.x0 - current.x1
-                for current, following in zip(word_rectangles, word_rectangles[1:])
+            gap_threshold = max(28.0, (line.bbox.x1 - line.bbox.x0) * 0.18)
+            line_gaps: list[tuple[float, float]] = []
+            occupied_right = word_rectangles[0].x1
+            for rectangle in word_rectangles[1:]:
+                gap = rectangle.x0 - occupied_right
+                if gap >= gap_threshold:
+                    line_gaps.append((occupied_right, rectangle.x0))
+                # Clipped OCR glyphs can be nested inside a genuine word. Use
+                # the union of occupied intervals rather than treating the
+                # nested glyph as the new right edge.
+                occupied_right = max(occupied_right, rectangle.x1)
+            gaps_by_line.append(line_gaps)
+
+        if eligible_lines < 3:
+            return False
+        split_lines = sum(bool(gaps) for gaps in gaps_by_line)
+        required_lines = max(2, math.ceil(eligible_lines * 0.3))
+        if split_lines < required_lines:
+            return False
+
+        # A real column division leaves a gutter at a stable horizontal
+        # position. Isolated large inter-word gaps (or clipped OCR debris) do
+        # not justify flattening the region as a table.
+        for candidate_line, candidate_gaps in enumerate(gaps_by_line):
+            for candidate_left, candidate_right in candidate_gaps:
+                supporting_lines = 1
+                for other_line, other_gaps in enumerate(gaps_by_line):
+                    if other_line == candidate_line:
+                        continue
+                    if any(
+                        min(candidate_right, other_right)
+                        - max(candidate_left, other_left)
+                        >= 8.0
+                        for other_left, other_right in other_gaps
+                    ):
+                        supporting_lines += 1
+                if supporting_lines >= required_lines:
+                    return True
+        return False
+
+    def _word_belongs_to_hidden_ocr_line(
+        self,
+        word: tuple[Any, ...],
+        line_rectangle: fitz.Rect,
+    ) -> bool:
+        try:
+            word_rectangle = fitz.Rect(
+                float(word[0]),
+                float(word[1]),
+                float(word[2]),
+                float(word[3]),
             )
-            if largest_gap >= max(28.0, (line.bbox.x1 - line.bbox.x0) * 0.18):
-                split_lines += 1
-        return eligible_lines >= 3 and split_lines >= 2 and split_lines / eligible_lines >= 0.3
+        except (TypeError, ValueError):
+            return False
+        horizontal_overlap = max(
+            0.0,
+            min(word_rectangle.x1, line_rectangle.x1)
+            - max(word_rectangle.x0, line_rectangle.x0),
+        )
+        vertical_overlap = max(
+            0.0,
+            min(word_rectangle.y1, line_rectangle.y1)
+            - max(word_rectangle.y0, line_rectangle.y0),
+        )
+        if horizontal_overlap <= 0.0 or vertical_overlap <= 0.0:
+            return False
+        overlap_height = max(
+            1.0,
+            min(word_rectangle.height, line_rectangle.height),
+        )
+        return bool(vertical_overlap / overlap_height >= 0.6)
 
     def _translation_script_is_suspicious(
         self,
@@ -2819,21 +2949,23 @@ class OriginalLayoutReconstructor:
         reason: str,
         bbox: BoundingBox | None = None,
         fallback_required: bool = True,
+        alignment_diagnostics: dict[str, Any] | None = None,
     ) -> None:
         report["regions_skipped"] += 1
         page_report["regions_skipped"] += 1
         if fallback_required:
             page_report["fallback_required"] = True
-        report["regions"].append(
-            {
-                "page_number": block.page_number,
-                "block_ids": [block.id],
-                "block_type": block.block_type.value,
-                "bbox": bbox.model_dump() if bbox is not None else None,
-                "status": "skipped",
-                "reason": reason,
-            }
-        )
+        region = {
+            "page_number": block.page_number,
+            "block_ids": [block.id],
+            "block_type": block.block_type.value,
+            "bbox": bbox.model_dump() if bbox is not None else None,
+            "status": "skipped",
+            "reason": reason,
+        }
+        if alignment_diagnostics:
+            region["alignment_diagnostics"] = dict(alignment_diagnostics)
+        report["regions"].append(region)
         self._warning(
             report,
             page_number=block.page_number,

@@ -19,6 +19,7 @@ from app.models.schema import (
 )
 from app.services.original_layout_reconstructor import (
     OriginalLayoutReconstructor,
+    _HiddenOCRLine,
     _SemanticTableGrid,
 )
 
@@ -1182,6 +1183,142 @@ def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -
     assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
 
 
+def test_hidden_ocr_body_does_not_treat_clipped_neighbor_glyphs_as_columns() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+    lines = tuple(
+        _HiddenOCRLine(
+            block_index=10,
+            line_index=index,
+            bbox=BoundingBox(x0=300, y0=40 + index * 14, x1=500, y1=52 + index * 14),
+            text=f"ordinary paragraph line {index}",
+        )
+        for index in range(6)
+    )
+    words: list[tuple[float, float, float, float, str, int, int, int]] = []
+    for index, line in enumerate(lines):
+        y0, y1 = line.bbox.y0, line.bbox.y1
+        for word_index, (x0, x1, text) in enumerate(
+            (
+                (300.0, 356.0, "ordinary"),
+                (385.0, 420.0, "paragraph"),
+                (425.0, 459.0, "line"),
+                (464.0, 481.0, str(index)),
+            )
+        ):
+            words.append((x0, y0, x1, y1, text, 10, index, word_index))
+    # Reproduce malformed clipped-word output from a hidden-OCR scan. Tiny
+    # pieces of descenders from the preceding OCR line intersect the next
+    # line's rectangle. Once sorted by x, those nested fragments manufacture
+    # gaps that are not present in the matched line itself.
+    for line_index in (2, 3):
+        line = lines[line_index]
+        decoy_y0 = line.bbox.y0 - 12
+        decoy_y1 = line.bbox.y0 + 1
+        for word_index, x0 in enumerate((321.0, 386.0, 464.0)):
+            words.append(
+                (x0, decoy_y0, x0 + 5, decoy_y1, "q", 99, line_index, word_index)
+            )
+
+    class _ClippedWordPage:
+        def get_text(self, kind: str, *, clip=None, sort=False):
+            assert kind == "words"
+            if clip is None:
+                return words
+            return [
+                word
+                for word in words
+                if fitz.Rect(*word[:4]).intersects(fitz.Rect(clip))
+            ]
+
+    assert not reconstructor._scan_match_has_multicolumn_text(_ClippedWordPage(), lines)
+
+
+def test_hidden_ocr_body_requires_a_stable_gutter_for_multiple_columns() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+    lines = tuple(
+        _HiddenOCRLine(
+            block_index=10,
+            line_index=index,
+            bbox=BoundingBox(x0=40, y0=40 + index * 14, x1=300, y1=52 + index * 14),
+            text=f"left {index} right {index}",
+        )
+        for index in range(4)
+    )
+    words = [
+        word
+        for index, line in enumerate(lines)
+        for word in (
+            (40.0, line.bbox.y0, 90.0, line.bbox.y1, "left", 10, index, 0),
+            (220.0, line.bbox.y0, 270.0, line.bbox.y1, "right", 10, index, 1),
+        )
+    ]
+
+    class _TwoColumnPage:
+        def get_text(self, kind: str, *, clip=None, sort=False):
+            assert kind == "words"
+            return words
+
+    assert reconstructor._scan_match_has_multicolumn_text(_TwoColumnPage(), lines)
+
+
+def test_hidden_ocr_alignment_joins_spatial_continuation_from_malformed_block() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+
+    def line(
+        block_index: int,
+        line_index: int,
+        bbox: tuple[float, float, float, float],
+        text: str,
+    ) -> _HiddenOCRLine:
+        return _HiddenOCRLine(
+            block_index=block_index,
+            line_index=line_index,
+            bbox=BoundingBox(x0=bbox[0], y0=bbox[1], x1=bbox[2], y1=bbox[3]),
+            text=text,
+        )
+
+    paragraph = (
+        line(14, 0, (308, 741, 549, 756), "Todos los pacientes reciben documentos"),
+        line(14, 1, (300, 755, 549, 770), "sobre los cambios corporales"),
+        line(14, 2, (299, 768, 546, 783), "y efectos que se deriven del tra-"),
+    )
+    malformed_block = tuple(
+        line(
+            15,
+            index,
+            (38, 580 + index * 13, 288, 595 + index * 13),
+            f"unrelated left-column line {index}",
+        )
+        for index in range(16)
+    ) + (
+        line(15, 16, (300, 781, 395, 796), "tamiento hormonal."),
+        line(15, 17, (557, 786, 573, 796), "footer"),
+    )
+
+    sequences = reconstructor._hidden_ocr_text_sequences([paragraph, malformed_block])
+    expected = (
+        "Todos los pacientes reciben documentos sobre los cambios corporales "
+        "y efectos que se deriven del tratamiento hormonal."
+    )
+    pdf = fitz.open()
+    page = pdf.new_page(width=595, height=842)
+    try:
+        match, metadata = reconstructor._match_hidden_ocr_lines(
+            page,
+            expected,
+            preferred_bbox=BoundingBox(x0=299, y0=741, x1=549, y1=796),
+            unavailable_line_keys=set(),
+            text_sequences=sequences,
+        )
+    finally:
+        pdf.close()
+
+    assert metadata["reason"] == "matched"
+    assert match is not None
+    assert match.lines == (*paragraph, malformed_block[-2])
+    assert "unrelated left-column" not in match.text
+
+
 def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -> None:
     source = tmp_path / "partial-hidden-ocr.pdf"
     pdf = fitz.open()
@@ -1231,10 +1368,17 @@ def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -
 
     assert report["regions_replaced"] == 0
     assert report["scan_text_regions_alignment_failed"] == 1
-    assert any(
-        region.get("reason") == "hidden_ocr_text_alignment_low_confidence"
+    skipped = next(
+        region
         for region in report["regions"]
+        if region.get("reason") == "hidden_ocr_text_alignment_low_confidence"
     )
+    diagnostics = skipped["alignment_diagnostics"]
+    assert diagnostics["reason"] == "hidden_ocr_text_alignment_low_confidence"
+    assert diagnostics["score"] < diagnostics["minimum_score"]
+    assert diagnostics["length_coverage"] < 1.0
+    assert "prefix_score" in diagnostics
+    assert "suffix_score" in diagnostics
     assert ImageChops.difference(
         _render_rgb(source, scale=2),
         _render_rgb(output, scale=2),

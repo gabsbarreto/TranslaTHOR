@@ -68,6 +68,11 @@ class MlxTranslator:
     _TABLE_ROW_OPEN_RE = re.compile(r"(?is)<tr\b[^>]*>")
     _TABLE_ROW_CLOSE_RE = re.compile(r"(?is)</tr\s*>")
     _TABLE_CELL_RE = re.compile(r"(?is)<t[dh]\b[^>]*>(?P<body>.*?)</t[dh]\s*>")
+    _SEGMENT_TAG = "translathor-segment"
+    _SEGMENT_RE = re.compile(
+        r"(?is)<translathor-segment\s+index=(?:\"|')(?P<index>\d+)(?:\"|')\s*>"
+        r"(?P<body>.*?)</translathor-segment\s*>"
+    )
     _SENTENCE_ABBREVIATIONS = {
         "al",
         "approx",
@@ -188,6 +193,10 @@ class MlxTranslator:
                 text_parts = [unit.text]
             elif unit.block_type == BlockType.TABLE and self._is_table_heavy_markup(unit.text):
                 text_parts = [unit.text]
+            elif len(unit.block_ids) > 1:
+                # Physical block boundaries must survive token-budget handling.
+                # _translate_physical_segments() batches whole regions safely.
+                text_parts = [unit.text]
             else:
                 text_parts = self._split_to_token_budget(unit.text)
             for text_part in text_parts:
@@ -220,6 +229,10 @@ class MlxTranslator:
             if block_type == BlockType.FIGURE:
                 continue
             if block_type == BlockType.TABLE and self._is_table_heavy_markup(chunk.source_text):
+                text_parts = [chunk.source_text]
+            elif len(chunk.block_ids) > 1:
+                # Repeating the full block-id list on every token-budget part
+                # would translate and apply each physical region more than once.
                 text_parts = [chunk.source_text]
             else:
                 text_parts = self._split_to_token_budget(chunk.source_text)
@@ -273,7 +286,7 @@ class MlxTranslator:
         translated_md = markdown
         block_by_id = {block.id: block for block in document.blocks}
         table_by_id = {table.id: table for table in document.tables}
-        translated_chunks: list[TranslationChunk] = []
+        application_chunks: list[TranslationChunk] = []
         table_like_chunks = [chunk for chunk in chunks if self._is_table_heavy_markup(chunk.source_text)]
         table_chunk_index: dict[int, int] = {id(chunk): idx for idx, chunk in enumerate(table_like_chunks, start=1)}
 
@@ -294,13 +307,37 @@ class MlxTranslator:
                     f"chunk-{index}",
                 )
 
+            physical_segments = self._physical_translation_segments(chunk, block_by_id)
             if not loaded or is_english:
                 translated = chunk.source_text
+                if physical_segments:
+                    application_chunks.extend(
+                        self._segment_application_chunks(
+                            chunk,
+                            physical_segments,
+                            [source_text for _, source_text, _ in physical_segments],
+                        )
+                    )
             elif is_table_like:
                 translated = self._translate_table_markup_chunk(
                     chunk.source_text,
                     effective_context,
                     chunk.source_language,
+                )
+            elif physical_segments:
+                segment_targets = self._translate_physical_segments(
+                    physical_segments,
+                    effective_context,
+                    chunk.source_language,
+                    chunk.source_text,
+                )
+                translated = "\n\n".join(segment_targets)
+                application_chunks.extend(
+                    self._segment_application_chunks(
+                        chunk,
+                        physical_segments,
+                        segment_targets,
+                    )
                 )
             else:
                 translated = self._translate_chunk_with_validation(
@@ -310,15 +347,213 @@ class MlxTranslator:
                     block_type,
                 )
             chunk.translated_text = translated
-            translated_chunks.append(chunk)
+            if not physical_segments:
+                application_chunks.append(chunk)
             if on_chunk_translated is not None:
                 preview = translated.replace("\n", " ").strip()
                 on_chunk_translated(index, total_chunks, preview[:160])
 
-        for chunk in self._coalesce_translated_chunks(translated_chunks):
+        application_chunks = self._coalesce_translated_chunks(application_chunks)
+        document.translation_chunks = application_chunks
+        for chunk in application_chunks:
             self._apply_translation_to_target(chunk, block_by_id, table_by_id)
 
         return document, translated_md
+
+    def _physical_translation_segments(
+        self,
+        chunk: TranslationChunk,
+        block_by_id: dict[str, Block],
+    ) -> list[tuple[str, str, BlockType]]:
+        """Return source text for each independently placeable block in a grouped chunk."""
+        if len(chunk.block_ids) <= 1 or self._is_table_heavy_markup(chunk.source_text):
+            return []
+
+        segments: list[tuple[str, str, BlockType]] = []
+        seen: set[str] = set()
+        for block_id in chunk.block_ids:
+            if block_id in seen:
+                return []
+            block = block_by_id.get(block_id)
+            if block is None:
+                return []
+            source_text = str(block.metadata.get("source_text", block.text)).strip()
+            if not source_text:
+                return []
+            segments.append((block_id, source_text, block.block_type))
+            seen.add(block_id)
+        return segments
+
+    def _translate_physical_segments(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+        context: str,
+        source_language: str | None,
+        logical_source_text: str,
+    ) -> list[str]:
+        targets: list[str] = []
+        shared_context = (
+            f"{context}\n"
+            "Translate only TEXT below. It belongs to the following continuous source passage; use that "
+            f"passage only for terminology and grammatical context:\n{logical_source_text}"
+        ).strip()
+        for batch in self._physical_segment_batches(segments):
+            if len(batch) == 1:
+                _, source_text, block_type = batch[0]
+                targets.append(
+                    self._translate_single_physical_segment(
+                        source_text,
+                        shared_context,
+                        source_language,
+                        block_type,
+                    )
+                )
+                continue
+            targets.extend(
+                self._translate_tagged_physical_segments(
+                    batch,
+                    context,
+                    source_language,
+                    shared_context,
+                )
+            )
+        return targets
+
+    def _physical_segment_batches(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> list[list[tuple[str, str, BlockType]]]:
+        token_budget = max(128, int(self.settings.chunk_size or DEFAULT_CHUNK_SIZE))
+        token_budget = min(token_budget, self.PROSE_CHUNK_TOKEN_CAP)
+        token_budget = min(token_budget, max(128, int(self.settings.max_tokens * 0.75)))
+        batches: list[list[tuple[str, str, BlockType]]] = []
+        current: list[tuple[str, str, BlockType]] = []
+        current_tokens = 0
+        for segment in segments:
+            segment_tokens = self._token_count(segment[1]) + 8
+            if current and current_tokens + segment_tokens > token_budget:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(segment)
+            current_tokens += segment_tokens
+        if current:
+            batches.append(current)
+        return batches
+
+    def _translate_single_physical_segment(
+        self,
+        source_text: str,
+        context: str,
+        source_language: str | None,
+        block_type: BlockType,
+    ) -> str:
+        return "\n\n".join(
+            self._translate_chunk_with_validation(
+                part,
+                context,
+                source_language,
+                block_type,
+            )
+            for part in self._split_to_token_budget(source_text)
+        )
+
+    def _translate_tagged_physical_segments(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+        context: str,
+        source_language: str | None,
+        shared_context: str,
+    ) -> list[str]:
+        tagged_source = self._tagged_segment_text(segments)
+        segment_instruction = (
+            f"TEXT contains {len(segments)} ordered <{self._SEGMENT_TAG}> elements from one "
+            "continuous document passage. First translate the complete passage mentally, then distribute "
+            "that translation across the same ordered elements. Their concatenated contents must read as "
+            "one fluent, grammatical English passage even when a boundary falls in the middle of a "
+            "sentence. The tags are placement boundaries, not word-for-word constraints, so adjust English "
+            "word order around adjacent boundaries when needed. Preserve every opening tag, closing tag, "
+            "index, order, and boundary marker exactly. Return no text outside the elements."
+        )
+        strict_context = f"{context}\n{segment_instruction}".strip()
+        translated = self._translate_chunk(tagged_source, strict_context, source_language)
+        parsed = self._parse_segment_translation(translated, segments)
+        if parsed is not None:
+            return parsed
+
+        retry_context = (
+            f"{strict_context}\n"
+            "The prior result did not preserve the segment mapping. Each input index must occur exactly "
+            "once in the output. Do not omit or duplicate content; neighboring wording may shift only as "
+            "needed to keep their concatenation grammatical."
+        )
+        retried = self._translate_chunk(tagged_source, retry_context, source_language)
+        parsed = self._parse_segment_translation(retried, segments)
+        if parsed is not None:
+            return parsed
+
+        logger.warning(
+            "Grouped translation did not preserve physical block boundaries; retrying blocks separately."
+        )
+        return [
+            self._translate_single_physical_segment(
+                source_text,
+                shared_context,
+                source_language,
+                block_type,
+            )
+            for _, source_text, block_type in segments
+        ]
+
+    def _tagged_segment_text(self, segments: list[tuple[str, str, BlockType]]) -> str:
+        return "\n".join(
+            f'<{self._SEGMENT_TAG} index="{index}">{source_text}</{self._SEGMENT_TAG}>'
+            for index, (_, source_text, _) in enumerate(segments)
+        )
+
+    def _parse_segment_translation(
+        self,
+        translated: str,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> list[str] | None:
+        matches = list(self._SEGMENT_RE.finditer(translated.strip()))
+        if len(matches) != len(segments):
+            return None
+        if [int(match.group("index")) for match in matches] != list(range(len(segments))):
+            return None
+
+        remainder = self._SEGMENT_RE.sub("", translated).strip()
+        if remainder:
+            return None
+
+        targets = [match.group("body").strip() for match in matches]
+        if any(
+            not self._is_valid_chunk_translation_structure(source_text, target, block_type)
+            for (_, source_text, block_type), target in zip(segments, targets, strict=True)
+        ):
+            return None
+        return targets
+
+    def _segment_application_chunks(
+        self,
+        chunk: TranslationChunk,
+        segments: list[tuple[str, str, BlockType]],
+        targets: list[str],
+    ) -> list[TranslationChunk]:
+        return [
+            chunk.model_copy(
+                update={
+                    "id": f"{chunk.id}-block{index + 1:02d}",
+                    "block_ids": [block_id],
+                    "source_text": source_text,
+                    "translated_text": target,
+                    "source_token_count": self._token_count(source_text),
+                }
+            )
+            for index, ((block_id, source_text, _), target) in enumerate(
+                zip(segments, targets, strict=True)
+            )
+        ]
 
     def cleanup(self) -> None:
         self._model = None
@@ -1179,9 +1414,17 @@ class MlxTranslator:
         return bool(re.search(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ]", stripped))
 
     def _build_prompt(self, text: str, context: str = "", source_language: str | None = None) -> str:
-        
         system = self._system_prompt()
-        user = f"\nTEXT:\n{text}"
+        details: list[str] = []
+        if source_language:
+            details.append(f"SOURCE LANGUAGE: {source_language}")
+        if context.strip():
+            details.append(
+                "CONTEXT AND OUTPUT INSTRUCTIONS (use for consistency; do not reproduce unless explicitly "
+                f"requested):\n{context.strip()}"
+            )
+        details.append(f"TEXT:\n{text}")
+        user = "\n\n".join(details)
         return self._format_chat_prompt(system, user)
 
     def _system_prompt(self) -> str:
