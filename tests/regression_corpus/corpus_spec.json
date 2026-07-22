@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "description": "Five paired non-English digital and scan-only PDF reconstruction cases.",
+  "render_dpi": 180,
+  "jpeg_quality": 88,
+  "cases": [
+    {
+      "id": "es-chile-frontmatter-chart",
+      "language": "es",
+      "language_profile": "non_english_pages",
+      "source_collection": "included",
+      "source_filename": "122709257.pdf",
+      "source_sha256": "4eee3a418ef260165aa31bab2817d4667641ff262b1c4cbac20a2225329072b5",
+      "source_pages": [1, 3, 4],
+      "minimum_embedded_characters": 8000,
+      "features": ["front_matter", "multi_column", "chart", "caption"]
+    },
+    {
+      "id": "es-chile-tables",
+      "language": "es",
+      "language_profile": "non_english_pages",
+      "source_collection": "included",
+      "source_filename": "122709257.pdf",
+      "source_sha256": "4eee3a418ef260165aa31bab2817d4667641ff262b1c4cbac20a2225329072b5",
+      "source_pages": [5, 6, 7, 8, 9],
+      "minimum_embedded_characters": 8000,
+      "features": ["multi_column", "dense_tables", "table_captions"]
+    },
+    {
+      "id": "fr-clinical-frontmatter-prose",
+      "language": "fr",
+      "language_profile": "non_english_pages",
+      "source_collection": "included_2",
+      "source_filename": "122709778.pdf",
+      "source_sha256": "25d9c748bb77f00fc83e42c817ac181c7b176225acd5341a069ff6f52470bc4a",
+      "source_pages": [1, 2, 3, 4],
+      "minimum_embedded_characters": 25000,
+      "features": ["front_matter", "multi_column", "dense_prose", "footnotes"]
+    },
+    {
+      "id": "fr-clinical-tables-figures",
+      "language": "fr",
+      "language_profile": "non_english_pages",
+      "source_collection": "included_2",
+      "source_filename": "122709778.pdf",
+      "source_sha256": "25d9c748bb77f00fc83e42c817ac181c7b176225acd5341a069ff6f52470bc4a",
+      "source_pages": [5, 6, 7],
+      "minimum_embedded_characters": 14000,
+      "features": ["tables", "flowchart", "graph", "figure_captions"]
+    },
+    {
+      "id": "es-self-harm-article-tables",
+      "language": "es",
+      "language_profile": "non_english_pages",
+      "source_collection": "included_2",
+      "source_filename": "122709995.pdf",
+      "source_sha256": "c80c47f9dd223338295c5e031c5ddec44e3102cb3cfd29f5670db3ea47912f10",
+      "source_pages": [1, 3, 4, 5, 6],
+      "minimum_embedded_characters": 24000,
+      "features": ["front_matter", "multi_column", "tables", "accented_text"]
+    }
+  ]
+}

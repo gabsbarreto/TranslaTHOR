@@ -180,6 +180,28 @@ to test source-page reconstruction. If original-layout reconstruction is partial
 **View details** to inspect its warning and reconstruction report, and use the readable PDF as the
 safe translated fallback.
 
+## PDF Regression Corpus
+
+The local regression corpus contains five compact non-English digital cases and five paired
+scan-only counterparts. Its Spanish and French pages cover front matter, multi-column prose,
+tables, charts, a flowchart, captions, and accented text. Each scanned PDF is rendered from the
+corresponding digital fixture with identical page dimensions and no OCR layer, providing a known
+visual baseline for comparing both extraction paths.
+
+The source publications and generated PDFs are kept under the ignored local `workspace/` tree
+rather than redistributed through this public repository. The tracked corpus specification records
+their source hashes and original page numbers, and the builder refuses a source whose contents have
+changed.
+
+```bash
+PYTHONPATH=backend .venv/bin/python scripts/build_pdf_regression_corpus.py
+PYTHONPATH=backend .venv/bin/pytest -q tests/test_pdf_regression_corpus.py
+```
+
+See `tests/regression_corpus/README.md` for provenance, storage, and source-root overrides. The
+artifact validation test skips on machines where the private corpus has not been built; the tracked
+five-case specification is always tested.
+
 ## Reconstruction Limitations
 
 - Scanned and image-only pages without a reliable hidden text layer are retained unchanged. This
