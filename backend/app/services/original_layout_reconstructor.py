@@ -93,6 +93,7 @@ class OriginalLayoutReconstructor:
     """Conservatively replace translated text while retaining the source PDF page art."""
 
     minimum_scale = 0.6
+    locked_redaction_guard = 1.0
     locked_block_types = {BlockType.FIGURE, BlockType.EQUATION}
     conservative_skip_types = {BlockType.TABLE}
 
@@ -114,9 +115,7 @@ class OriginalLayoutReconstructor:
         tables_by_block_id: dict[str, TableModel] = {}
         for table in document.tables:
             source_block_id = str(
-                table.debug.get("source_block_id")
-                or table.debug.get("marker_block_id")
-                or ""
+                table.debug.get("source_block_id") or table.debug.get("marker_block_id") or ""
             )
             if source_block_id and source_block_id not in tables_by_block_id:
                 tables_by_block_id[source_block_id] = table
@@ -147,6 +146,7 @@ class OriginalLayoutReconstructor:
                     "reconstruction_strategy": "none",
                     "regions_replaced": 0,
                     "regions_skipped": 0,
+                    "regions_retained": 0,
                     "fallback_required": False,
                     "warnings": [],
                 }
@@ -188,6 +188,35 @@ class OriginalLayoutReconstructor:
                     scan_overlay=scan_overlay,
                     scan_table_only=scan_table_only,
                 )
+                guarded_replacements: list[_ReplacementRegion] = []
+                for region in replacements:
+                    region.redaction_bboxes = self._redaction_bboxes_avoiding_locked_regions(
+                        self._redaction_bboxes(region),
+                        locked_by_page.get(page_number, []),
+                        page_width=float(page.rect.width),
+                        page_height=float(page.rect.height),
+                    )
+                    if region.redaction_bboxes:
+                        guarded_replacements.append(region)
+                        continue
+                    page_report["regions_skipped"] += 1
+                    page_report["fallback_required"] = True
+                    self._skipped_region(
+                        report,
+                        region,
+                        reason="redaction_region_consumed_by_locked_visual_guard",
+                        scale=1.0,
+                    )
+                    self._warning(
+                        report,
+                        page_number=page_number,
+                        code="locked_visual_redaction_guard",
+                        reason=(
+                            f"Region {', '.join(region.block_ids)} could not be safely redacted "
+                            "without touching a locked figure or equation."
+                        ),
+                    )
+                replacements = guarded_replacements
                 approved: list[tuple[_ReplacementRegion, str, str, float]] = []
                 for region in replacements:
                     html_text, css = self._region_html_and_css(region, page)
@@ -242,7 +271,7 @@ class OriginalLayoutReconstructor:
                 transaction_error: str | None = None
                 try:
                     for region, _html_text, _css, _scale in approved:
-                        redaction_bboxes = region.redaction_bboxes or [region.bbox]
+                        redaction_bboxes = self._redaction_bboxes(region)
                         for redaction_bbox in redaction_bboxes:
                             page.add_redact_annot(
                                 self._fitz_rect(redaction_bbox),
@@ -271,10 +300,15 @@ class OriginalLayoutReconstructor:
                             "block_type": region.block_type.value,
                             "bbox": region.bbox.model_dump(),
                             "reconstruction_strategy": region.reconstruction_strategy,
+                            "source_character_count": self._source_character_count(
+                                region.source_text
+                            ),
                             "source_text_mask_count": len(region.redaction_bboxes or []),
                             "source_text_masks": [
-                                bbox.model_dump()
-                                for bbox in (region.redaction_bboxes or [])
+                                bbox.model_dump() for bbox in (region.redaction_bboxes or [])
+                            ],
+                            "applied_redaction_bboxes": [
+                                bbox.model_dump() for bbox in self._redaction_bboxes(region)
                             ],
                             "coordinate_metadata": region.coordinate_metadata,
                             "scale": round(float(scale), 6),
@@ -359,15 +393,23 @@ class OriginalLayoutReconstructor:
             pdf.save(temporary_path, garbage=3, deflate=True)
 
         temporary_path.replace(output_pdf_path)
-        report["status"] = (
-            "partial" if report["pages_using_fallback_behavior"] else "complete"
-        )
+        report["status"] = "partial" if report["pages_using_fallback_behavior"] else "complete"
         report["output_pdf"] = str(output_pdf_path.resolve())
         report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
         return report
 
     def _initial_report(self, document: DocumentModel) -> dict[str, Any]:
-        valid_figures = [figure for figure in document.figures if figure.bbox is not None]
+        page_dimensions = {
+            page.page_number: (float(page.width), float(page.height)) for page in document.pages
+        }
+        valid_figures = [
+            figure
+            for figure in document.figures
+            if self._figure_bbox_is_valid(
+                figure.bbox,
+                page_dimensions.get(figure.page_number),
+            )
+        ]
         raster_fallbacks = [
             {
                 "figure_id": figure.id,
@@ -385,8 +427,7 @@ class OriginalLayoutReconstructor:
             caption_details = figure.extraction_metadata.get("caption_association") or {}
             caption_confidence = caption_details.get("confidence")
             detection_low = (
-                figure.detection_confidence is not None
-                and figure.detection_confidence < 0.6
+                figure.detection_confidence is not None and figure.detection_confidence < 0.6
             )
             caption_low = (
                 figure.caption_block_id
@@ -409,9 +450,10 @@ class OriginalLayoutReconstructor:
             "total_pages": 0,
             "pages_successfully_reconstructed": 0,
             "pages_using_fallback_behavior": 0,
-            "figures_preserved": len(valid_figures),
+            "figures_preserved": 0,
             "regions_replaced": 0,
             "regions_skipped": 0,
+            "regions_retained": 0,
             "regions_missing_or_invalid_bboxes": 0,
             "text_boxes_did_not_fit": 0,
             "scaling_applied": [],
@@ -430,6 +472,25 @@ class OriginalLayoutReconstructor:
             "internal_figure_text_policy": "preserve_source_language",
         }
 
+    def _figure_bbox_is_valid(
+        self,
+        bbox: BoundingBox | None,
+        page_dimensions: tuple[float, float] | None,
+    ) -> bool:
+        if bbox is None or page_dimensions is None or bbox_area(bbox) < 1.0:
+            return False
+        width, height = page_dimensions
+        values = (bbox.x0, bbox.y0, bbox.x1, bbox.y1, width, height)
+        if not all(math.isfinite(float(value)) for value in values):
+            return False
+        tolerance = 0.5
+        return (
+            bbox.x0 >= -tolerance
+            and bbox.y0 >= -tolerance
+            and bbox.x1 <= width + tolerance
+            and bbox.y1 <= height + tolerance
+        )
+
     def _page_strategy(
         self,
         page: fitz.Page,
@@ -437,14 +498,17 @@ class OriginalLayoutReconstructor:
         blocks: list[Block],
     ) -> tuple[str, str]:
         if page.rotation:
-            return "unsupported", "Rotated pages are retained unchanged in this first original-layout implementation."
+            return (
+                "unsupported",
+                "Rotated pages are retained unchanged in this first original-layout implementation.",
+            )
         if metadata is None:
-            return "unsupported", "Structured page metadata is missing; the source page was retained unchanged."
+            return (
+                "unsupported",
+                "Structured page metadata is missing; the source page was retained unchanged.",
+            )
         if metadata.extraction_mode == SourceType.OCR:
-            if (
-                metadata.has_embedded_text
-                and len(page.get_text("words")) >= 5
-            ):
+            if metadata.has_embedded_text and len(page.get_text("words")) >= 5:
                 translated_tables = {
                     block.id
                     for block in blocks
@@ -470,7 +534,10 @@ class OriginalLayoutReconstructor:
                 "The page is scanned, image-only, hidden-OCR, or has unreliable embedded text; it was retained unchanged.",
             )
         if len(page.get_text("text").strip()) < 5:
-            return "unsupported", "The page has no reliable removable PDF text and was retained unchanged."
+            return (
+                "unsupported",
+                "The page has no reliable removable PDF text and was retained unchanged.",
+            )
         return "embedded_text_replacement", ""
 
     def _locked_regions(
@@ -482,28 +549,51 @@ class OriginalLayoutReconstructor:
         locked: dict[int, list[BoundingBox]] = {}
         represented_figure_blocks: set[str] = set()
         for figure in document.figures:
-            if figure.bbox is None or not (1 <= figure.page_number <= pdf.page_count):
+            if not (1 <= figure.page_number <= pdf.page_count):
+                report["regions_missing_or_invalid_bboxes"] += 1
+                self._warning(
+                    report,
+                    page_number=figure.page_number,
+                    code="figure_lock_region_invalid",
+                    reason=f"Figure {figure.id} refers to a source page that does not exist.",
+                )
                 continue
-            represented_figure_blocks.update(figure.source_block_ids)
             page = pdf[figure.page_number - 1]
+            bbox_valid = self._figure_bbox_is_valid(
+                figure.bbox,
+                (float(page.rect.width), float(page.rect.height)),
+            )
             conversion = convert_bbox_to_pdf(
                 figure.bbox,
                 page_width=page.rect.width,
                 page_height=page.rect.height,
-                metadata={"source_page_width": page.rect.width, "source_page_height": page.rect.height},
+                metadata={
+                    "source_page_width": page.rect.width,
+                    "source_page_height": page.rect.height,
+                },
             )
             if conversion.bbox is not None:
+                represented_figure_blocks.update(figure.source_block_ids)
                 locked.setdefault(figure.page_number, []).append(conversion.bbox)
+                if bbox_valid:
+                    report["figures_preserved"] += 1
+            if not bbox_valid or conversion.bbox is None:
+                report["regions_missing_or_invalid_bboxes"] += 1
+                self._warning(
+                    report,
+                    page_number=figure.page_number,
+                    code="figure_lock_region_invalid",
+                    reason=(
+                        f"Figure {figure.id} has a missing, empty, or out-of-page bounding box; "
+                        "it was not counted as a validated preserved figure."
+                    ),
+                )
         for block in document.blocks:
-            if (
-                block.block_type not in self.locked_block_types
-                or not (1 <= block.page_number <= pdf.page_count)
+            if block.block_type not in self.locked_block_types or not (
+                1 <= block.page_number <= pdf.page_count
             ):
                 continue
-            if (
-                block.block_type == BlockType.FIGURE
-                and block.id in represented_figure_blocks
-            ):
+            if block.block_type == BlockType.FIGURE and block.id in represented_figure_blocks:
                 # Canonical figure assets have already deduplicated nested Marker
                 # FigureGroup/Figure boxes and excluded any associated caption.
                 continue
@@ -545,6 +635,11 @@ class OriginalLayoutReconstructor:
             else []
         )
         scan_caption_ids: set[str] = set()
+        scan_table_blocks = {
+            block.id: block for block in blocks if block.block_type == BlockType.TABLE
+        }
+        successful_scan_table_regions: dict[str, list[_ReplacementRegion]] = {}
+        failed_scan_table_ids: set[str] = set()
         if scan_table_only:
             ordered = sorted(blocks, key=lambda item: item.reading_order_index)
             for index, candidate in enumerate(ordered[:-1]):
@@ -556,13 +651,20 @@ class OriginalLayoutReconstructor:
                 ):
                     scan_caption_ids.add(following.id)
         for block in blocks:
-            if (
-                scan_table_only
-                and block.block_type != BlockType.TABLE
-                and block.id not in scan_caption_ids
-            ):
-                continue
             if block.id in consumed:
+                continue
+            if block.metadata.get("excluded_from_translation"):
+                exclusion_reason = str(
+                    block.metadata.get("translation_exclusion_reason")
+                    or "excluded_from_translation"
+                )
+                self._retain_block(
+                    report,
+                    page_report,
+                    block,
+                    reason=exclusion_reason,
+                    bbox=self._block_pdf_bbox(page, block),
+                )
                 continue
             recovered_text = recovered_translations.get(block.id)
             if recovered_text is None and not block.text.strip():
@@ -575,26 +677,47 @@ class OriginalLayoutReconstructor:
                     )
                 continue
             if block.block_type in self.locked_block_types:
-                self._skip_block(
+                self._retain_block(
                     report,
                     page_report,
                     block,
                     reason="locked_visual_region",
-                    fallback_required=False,
+                    bbox=self._block_pdf_bbox(page, block),
                 )
                 continue
             if block.block_type == BlockType.TABLE:
-                replacements.extend(
-                    self._table_replacement_regions(
-                        page=page,
-                        block=block,
-                        table_model=tables_by_block_id.get(block.id),
-                        locked_regions=locked_regions,
-                        report=report,
-                        page_report=page_report,
-                        scan_overlay=scan_overlay,
+                validation = block.metadata.get("translation_validation")
+                if (
+                    isinstance(validation, dict)
+                    and validation.get("status") == "translation_failed"
+                ):
+                    if scan_overlay:
+                        failed_scan_table_ids.add(block.id)
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason=str(
+                            validation.get("reason")
+                            or "translation_target_language_validation_failed"
+                        ),
                     )
+                    continue
+                skipped_before = page_report["regions_skipped"]
+                table_regions = self._table_replacement_regions(
+                    page=page,
+                    block=block,
+                    table_model=tables_by_block_id.get(block.id),
+                    locked_regions=locked_regions,
+                    report=report,
+                    page_report=page_report,
+                    scan_overlay=scan_overlay,
                 )
+                replacements.extend(table_regions)
+                if scan_overlay and table_regions:
+                    successful_scan_table_regions[block.id] = table_regions
+                elif scan_overlay and page_report["regions_skipped"] > skipped_before:
+                    failed_scan_table_ids.add(block.id)
                 continue
             if block.block_type in self.conservative_skip_types:
                 self._skip_block(
@@ -616,15 +739,21 @@ class OriginalLayoutReconstructor:
                         report,
                         page_report,
                         block,
-                        reason="translation_not_confirmed_for_region",
+                        reason=(
+                            "scan_table_only_non_table_translation_unavailable"
+                            if scan_table_only
+                            and block.block_type != BlockType.TABLE
+                            and block.id not in scan_caption_ids
+                            else "translation_not_confirmed_for_region"
+                        ),
                     )
                     continue
                 source_blocks = [
-                    block_by_id[block_id]
-                    for block_id in translated_from
-                    if block_id in block_by_id
+                    block_by_id[block_id] for block_id in translated_from if block_id in block_by_id
                 ]
-                if not source_blocks or any(item.page_number != page_number for item in source_blocks):
+                if not source_blocks or any(
+                    item.page_number != page_number for item in source_blocks
+                ):
                     self._skip_block(
                         report,
                         page_report,
@@ -648,7 +777,9 @@ class OriginalLayoutReconstructor:
                 if conversion.bbox is not None:
                     converted.append(conversion.bbox)
             consumed.update(item.id for item in source_blocks)
-            if len(converted) != len(source_blocks):
+            source_bbox_missing = len(converted) != len(source_blocks)
+            recover_bbox_from_hidden_ocr = scan_overlay and source_bbox_missing
+            if source_bbox_missing and not recover_bbox_from_hidden_ocr:
                 report["regions_missing_or_invalid_bboxes"] += 1
                 self._skip_block(
                     report,
@@ -658,23 +789,72 @@ class OriginalLayoutReconstructor:
                 )
                 continue
 
-            bbox = self._union_bbox(converted)
+            global_search_bbox = BoundingBox(
+                x0=0.0,
+                y0=0.0,
+                x1=float(page.rect.width),
+                y1=float(page.rect.height),
+            )
+            bbox = (
+                global_search_bbox
+                if recover_bbox_from_hidden_ocr
+                else self._union_bbox(converted)
+            )
 
             source_text = " ".join(
                 str(item.metadata.get("source_text", "")).strip()
                 for item in source_blocks
                 if str(item.metadata.get("source_text", "")).strip()
             )
-            if source_text and self._normalized_text(source_text) == self._normalized_text(translated_text):
+            validation = block.metadata.get("translation_validation")
+            if isinstance(validation, dict) and validation.get("status") == "translation_failed":
+                self._skip_block(
+                    report,
+                    page_report,
+                    block,
+                    reason=str(
+                        validation.get("reason") or "translation_target_language_validation_failed"
+                    ),
+                    bbox=None if recover_bbox_from_hidden_ocr else bbox,
+                )
+                continue
+            if source_text and self._normalized_text(source_text) == self._normalized_text(
+                translated_text
+            ):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
+            if not scan_overlay:
+                source_validation = self._embedded_source_text_validation(
+                    page,
+                    bbox,
+                    source_text,
+                )
+                if not source_validation["safe"]:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason=str(source_validation["reason"]),
+                        bbox=bbox,
+                        alignment_diagnostics={
+                            "source_text_validation": source_validation,
+                        },
+                    )
+                    continue
+                conversions.append(
+                    {
+                        "geometry_source": "embedded_pdf_text_validation",
+                        "coordinate_space": "pdf_points",
+                        "source_text_validation": source_validation,
+                    }
+                )
             if scan_overlay and not source_text:
                 self._skip_block(
                     report,
                     page_report,
                     block,
                     reason="scan_source_text_missing",
-                    bbox=bbox,
+                    bbox=None if recover_bbox_from_hidden_ocr else bbox,
                 )
                 continue
             scan_match: _HiddenOCRMatch | None = None
@@ -690,7 +870,7 @@ class OriginalLayoutReconstructor:
                         page_report,
                         block,
                         reason="translated_text_script_incompatible_with_english_output",
-                        bbox=bbox,
+                        bbox=None if recover_bbox_from_hidden_ocr else bbox,
                     )
                     continue
                 scan_match, match_metadata = self._match_hidden_ocr_lines(
@@ -700,7 +880,15 @@ class OriginalLayoutReconstructor:
                     unavailable_line_keys=claimed_scan_lines,
                     text_sequences=scan_text_sequences,
                 )
+                if recover_bbox_from_hidden_ocr:
+                    match_metadata = {
+                        **match_metadata,
+                        "geometry_source": "global_hidden_ocr_alignment_recovered_bbox",
+                        "preferred_search_extent_pdf": global_search_bbox.model_dump(),
+                    }
                 if scan_match is None:
+                    if recover_bbox_from_hidden_ocr:
+                        report["regions_missing_or_invalid_bboxes"] += 1
                     report["scan_text_regions_alignment_failed"] += 1
                     failure_reason = str(
                         match_metadata.get("reason", "hidden_ocr_text_alignment_failed")
@@ -712,14 +900,14 @@ class OriginalLayoutReconstructor:
                         page_report,
                         block,
                         reason=failure_reason,
-                        bbox=bbox,
+                        bbox=None if recover_bbox_from_hidden_ocr else bbox,
                         alignment_diagnostics=match_metadata,
                     )
                     continue
-                if (
-                    block.block_type not in {BlockType.TABLE, BlockType.CAPTION}
-                    and self._scan_match_has_multicolumn_text(page, scan_match.lines)
-                ):
+                if block.block_type not in {
+                    BlockType.TABLE,
+                    BlockType.CAPTION,
+                } and self._scan_match_has_multicolumn_text(page, scan_match.lines):
                     self._skip_block(
                         report,
                         page_report,
@@ -764,27 +952,81 @@ class OriginalLayoutReconstructor:
                 replacement.redaction_bboxes = masks
                 replacement.redaction_fill = fill
                 replacement.reconstruction_strategy = "ocr_hidden_text_overlay"
-                replacement.coordinate_metadata.append(
-                    {
-                        "geometry_source": "hidden_ocr_contiguous_line_alignment",
-                        "coordinate_space": "pdf_points",
-                        "surya_region_bbox_pdf": converted[0].model_dump()
+                alignment_metadata: dict[str, Any] = {
+                    "geometry_source": "hidden_ocr_contiguous_line_alignment",
+                    "coordinate_space": "pdf_points",
+                    "matched_hidden_ocr_bbox_pdf": scan_match.bbox.model_dump(),
+                    "matched_hidden_ocr_text": scan_match.text,
+                    "source_text_similarity": {
+                        "score": round(scan_match.score, 6),
+                        "competing_score": round(scan_match.competing_score, 6),
+                        "minimum_score": scan_match.minimum_score,
+                    },
+                    "mask_source": "matched_hidden_ocr_line_geometry",
+                    "scan_background": background_metadata,
+                }
+                if recover_bbox_from_hidden_ocr:
+                    alignment_metadata.update(
+                        {
+                            "geometry_source": "global_hidden_ocr_alignment_recovered_bbox",
+                            "bbox_recovered_by_global_hidden_ocr_alignment": True,
+                            "preferred_search_extent_pdf": global_search_bbox.model_dump(),
+                        }
+                    )
+                else:
+                    alignment_metadata["surya_region_bbox_pdf"] = (
+                        converted[0].model_dump()
                         if len(converted) == 1
-                        else self._union_bbox(converted).model_dump(),
-                        "matched_hidden_ocr_bbox_pdf": scan_match.bbox.model_dump(),
-                        "matched_hidden_ocr_text": scan_match.text,
-                        "source_text_similarity": {
-                            "score": round(scan_match.score, 6),
-                            "competing_score": round(scan_match.competing_score, 6),
-                            "minimum_score": scan_match.minimum_score,
-                        },
-                        "mask_source": "matched_hidden_ocr_line_geometry",
-                        "scan_background": background_metadata,
-                    }
+                        else self._union_bbox(converted).model_dump()
+                    )
+                replacement.coordinate_metadata.append(
+                    alignment_metadata
                 )
                 claimed_scan_lines.update(scan_match.keys)
                 report["scan_text_regions_aligned"] += 1
             replacements.append(replacement)
+
+        if (
+            scan_overlay
+            and len(scan_table_blocks) > 1
+            and successful_scan_table_regions
+            and failed_scan_table_ids
+        ):
+            # OCR table segmentation does not currently expose a trustworthy
+            # higher-level group ID. Treat all reconstructed tables on the same
+            # scan page as one conservative visual group: a failed sibling must
+            # not leave the page with a mixture of translated and source tables.
+            # Non-table replacements remain eligible and are committed normally.
+            retained_region_ids = {
+                id(region)
+                for regions in successful_scan_table_regions.values()
+                for region in regions
+            }
+            replacements = [
+                region for region in replacements if id(region) not in retained_region_ids
+            ]
+            retained_table_ids = sorted(successful_scan_table_regions)
+            for table_id in retained_table_ids:
+                table_block = scan_table_blocks[table_id]
+                self._skip_block(
+                    report,
+                    page_report,
+                    table_block,
+                    reason="scan_table_group_retained_after_sibling_failure",
+                    bbox=self._block_pdf_bbox(page, table_block),
+                )
+            failed_ids = sorted(failed_scan_table_ids)
+            self._warning(
+                report,
+                page_number=page_number,
+                code="scan_table_group_atomic_fallback",
+                reason=(
+                    "Multiple table regions form a conservative scan-page table group. "
+                    f"Table overlay failed for {', '.join(failed_ids)}, so translated overlays "
+                    f"for {', '.join(retained_table_ids)} were also retained in the source "
+                    "language; non-table regions remain eligible for reconstruction."
+                ),
+            )
         return replacements
 
     def _recover_per_block_translations(self, document: DocumentModel) -> dict[str, str]:
@@ -795,17 +1037,13 @@ class OriginalLayoutReconstructor:
                 continue
             source_parts = self._paragraph_parts(chunk.source_text)
             translated_parts = self._paragraph_parts(chunk.translated_text)
-            if not (
-                len(source_parts) == len(translated_parts) == len(chunk.block_ids)
-            ):
+            if not (len(source_parts) == len(translated_parts) == len(chunk.block_ids)):
                 continue
             source_blocks = [block_by_id.get(block_id) for block_id in chunk.block_ids]
             if any(block is None for block in source_blocks):
                 continue
             if not all(
-                self._normalized_text(
-                    str(block.metadata.get("source_text", block.text))
-                )
+                self._normalized_text(str(block.metadata.get("source_text", block.text)))
                 == self._normalized_text(source_part)
                 for block, source_part in zip(source_blocks, source_parts, strict=True)
                 if block is not None
@@ -902,7 +1140,13 @@ class OriginalLayoutReconstructor:
             )
             return []
 
-        expected_columns = len(source_rows[0]) if source_rows else 0
+        expected_columns = max(
+            (
+                sum(max(1, int(cell.colspan or 1)) for cell in row)
+                for row in source_rows
+            ),
+            default=0,
+        )
         grid_rows, grid_strategy = self._stored_table_grid_rows(
             page=page,
             block=block,
@@ -924,7 +1168,7 @@ class OriginalLayoutReconstructor:
             translated_rows,
             grid_rows,
         )
-        if aligned is None:
+        if aligned is None or not self._table_alignment_has_full_cell_coverage(page, aligned):
             self._skip_block(
                 report,
                 page_report,
@@ -972,8 +1216,7 @@ class OriginalLayoutReconstructor:
                     # Leaving them untouched is part of the atomic table policy.
                     continue
                 if any(
-                    self._overlaps_locked_region(cell_bbox, locked)
-                    for locked in locked_regions
+                    self._overlaps_locked_region(cell_bbox, locked) for locked in locked_regions
                 ):
                     self._skip_block(
                         report,
@@ -984,9 +1227,7 @@ class OriginalLayoutReconstructor:
                     )
                     return []
                 horizontal_inset = (
-                    4.0
-                    if grid_strategy == "pymupdf_text_lattice_semantic_alignment"
-                    else 2.0
+                    4.0 if grid_strategy == "pymupdf_text_lattice_semantic_alignment" else 2.0
                 )
                 bbox = self._inset_bbox(
                     cell_bbox,
@@ -1037,9 +1278,7 @@ class OriginalLayoutReconstructor:
                 replacements.append(
                     _ReplacementRegion(
                         page_number=block.page_number,
-                        block_ids=[
-                            f"{block.id}#cell-r{row_index + 1:03d}-c{column_index + 1:03d}"
-                        ],
+                        block_ids=[f"{block.id}#cell-r{row_index + 1:03d}-c{column_index + 1:03d}"],
                         block_type=BlockType.TABLE,
                         bbox=bbox,
                         translated_text=translated_text,
@@ -1238,26 +1477,22 @@ class OriginalLayoutReconstructor:
             for other_placement in placements[index + 1 :]:
                 other_row, other_column, other_rowspan, other_colspan, other = other_placement
                 intersection = fitz.Rect(rectangle & other)
-                if intersection.get_area() > 0.75:
+                if (
+                    intersection.get_area() > 0.75
+                    and intersection.width > 1.5
+                    and intersection.height > 1.5
+                ):
                     return [], "unavailable"
                 rectangle_mid_x = (rectangle.x0 + rectangle.x1) / 2
                 other_mid_x = (other.x0 + other.x1) / 2
                 rectangle_mid_y = (rectangle.y0 + rectangle.y1) / 2
                 other_mid_y = (other.y0 + other.y1) / 2
-                if (
-                    column_index + colspan <= other_column
-                    and rectangle_mid_x >= other_mid_x
-                ) or (
-                    other_column + other_colspan <= column_index
-                    and other_mid_x >= rectangle_mid_x
+                if (column_index + colspan <= other_column and rectangle_mid_x >= other_mid_x) or (
+                    other_column + other_colspan <= column_index and other_mid_x >= rectangle_mid_x
                 ):
                     return [], "unavailable"
-                if (
-                    row_index + rowspan <= other_row
-                    and rectangle_mid_y >= other_mid_y
-                ) or (
-                    other_row + other_rowspan <= row_index
-                    and other_mid_y >= rectangle_mid_y
+                if (row_index + rowspan <= other_row and rectangle_mid_y >= other_mid_y) or (
+                    other_row + other_rowspan <= row_index and other_mid_y >= rectangle_mid_y
                 ):
                     return [], "unavailable"
 
@@ -1287,27 +1522,37 @@ class OriginalLayoutReconstructor:
         expected_columns: int,
     ) -> tuple[list[list[fitz.Rect]], str]:
         table_rect = self._fitz_rect(bbox)
-        search_rect = fitz.Rect(
-            table_rect.x0 - 3.0,
-            table_rect.y0 - 3.0,
-            table_rect.x1 + 3.0,
-            table_rect.y1 + 3.0,
-        ) & page.rect
+        search_rect = (
+            fitz.Rect(
+                table_rect.x0 - 3.0,
+                table_rect.y0 - 3.0,
+                table_rect.x1 + 3.0,
+                table_rect.y1 + 3.0,
+            )
+            & page.rect
+        )
         try:
             finder = page.find_tables(clip=search_rect, strategy="lines_strict")
             candidates = []
             for table in finder.tables:
+                candidate_rect = fitz.Rect(table.bbox)
+                overlap = fitz.Rect(candidate_rect & table_rect).get_area()
+                union_area = candidate_rect.get_area() + table_rect.get_area() - overlap
                 rows = [
                     [fitz.Rect(cell) for cell in row.cells if cell is not None]
                     for row in table.rows
                 ]
+                alignment = self._align_table_rows(page, source_rows, source_rows, rows)
                 if (
-                    len(rows) == expected_rows
-                    and all(len(row) == expected_columns for row in rows)
+                    not rows
+                    or int(table.col_count) != expected_columns
+                    or len(rows) > expected_rows
+                    or overlap / max(1.0, union_area) < 0.65
+                    or alignment is None
+                    or not self._table_alignment_has_full_cell_coverage(page, alignment)
                 ):
-                    candidate_rect = fitz.Rect(table.bbox)
-                    overlap = fitz.Rect(candidate_rect & table_rect).get_area()
-                    candidates.append((overlap, rows))
+                    continue
+                candidates.append((overlap, rows))
             if candidates:
                 _overlap, rows = max(candidates, key=lambda item: item[0])
                 return rows, "pymupdf_find_tables_lines_strict"
@@ -1378,7 +1623,13 @@ class OriginalLayoutReconstructor:
                 rows[-1].append(rectangle)
         for row in rows:
             row.sort(key=lambda value: value.x0)
-        if len(rows) == expected_rows and all(len(row) == expected_columns for row in rows):
+        rectangle_alignment = self._align_table_rows(page, source_rows, source_rows, rows)
+        if (
+            rows
+            and len(rows) <= expected_rows
+            and rectangle_alignment is not None
+            and self._table_alignment_has_full_cell_coverage(page, rectangle_alignment)
+        ):
             return rows, "pdf_vector_cell_rectangles"
 
         xs = self._cluster_coordinates(verticals)
@@ -1391,7 +1642,17 @@ class OriginalLayoutReconstructor:
                 ]
                 for row in range(expected_rows)
             ]
-            return line_rows, "pdf_vector_line_grid"
+            line_alignment = self._align_table_rows(
+                page,
+                source_rows,
+                source_rows,
+                line_rows,
+            )
+            if line_alignment is not None and self._table_alignment_has_full_cell_coverage(
+                page,
+                line_alignment,
+            ):
+                return line_rows, "pdf_vector_line_grid"
 
         semantic_rows = self._semantic_text_table_grid_rows(
             page=page,
@@ -1443,12 +1704,14 @@ class OriginalLayoutReconstructor:
             for table in finder.tables:
                 candidate_rect = fitz.Rect(table.bbox)
                 intersection = fitz.Rect(candidate_rect & table_rect).get_area()
-                if intersection / max(1.0, min(candidate_rect.get_area(), table_rect.get_area())) < 0.55:
+                if (
+                    intersection / max(1.0, min(candidate_rect.get_area(), table_rect.get_area()))
+                    < 0.55
+                ):
                     continue
                 physical_columns = int(table.col_count)
-                if (
-                    physical_columns < logical_columns
-                    or physical_columns > min(12, logical_columns + 6)
+                if physical_columns < logical_columns or physical_columns > min(
+                    12, logical_columns + 6
                 ):
                     continue
                 x_values = [
@@ -1474,9 +1737,8 @@ class OriginalLayoutReconstructor:
 
         unique_boundaries: dict[tuple[float, ...], tuple[float, ...]] = {}
         for boundaries in boundary_candidates:
-            if (
-                len(boundaries) != logical_columns + 1
-                or any(right - left < 3.0 for left, right in zip(boundaries, boundaries[1:]))
+            if len(boundaries) != logical_columns + 1 or any(
+                right - left < 3.0 for left, right in zip(boundaries, boundaries[1:])
             ):
                 continue
             key = tuple(round(value, 2) for value in boundaries)
@@ -1505,12 +1767,9 @@ class OriginalLayoutReconstructor:
             key=lambda item: item.score,
             reverse=True,
         )
-        if (
-            len(ranked_assignments) > 1
-            and self._semantic_scores_are_ambiguous(
-                ranked_assignments[0].score,
-                ranked_assignments[1].score,
-            )
+        if len(ranked_assignments) > 1 and self._semantic_scores_are_ambiguous(
+            ranked_assignments[0].score,
+            ranked_assignments[1].score,
         ):
             logger.debug("Rejected ambiguous semantic table geometry with near-tied layouts")
             return []
@@ -1558,9 +1817,7 @@ class OriginalLayoutReconstructor:
                 continue
             if edges[-1] - edges[0] < table_rect.width * 0.65:
                 continue
-            candidates.append(
-                (float(table_rect.x0), *edges[1:-1], float(table_rect.x1))
-            )
+            candidates.append((float(table_rect.x0), *edges[1:-1], float(table_rect.x1)))
         return candidates
 
     def _semantic_grid_candidate(
@@ -1609,9 +1866,7 @@ class OriginalLayoutReconstructor:
                 if score < 0.68:
                     continue
                 for tail_score, tail_ranges in solve(logical_index + 1, end):
-                    candidates.append(
-                        (score + tail_score, ((physical_index, end), *tail_ranges))
-                    )
+                    candidates.append((score + tail_score, ((physical_index, end), *tail_ranges)))
             candidates.sort(key=lambda item: item[0], reverse=True)
             unique: dict[tuple[tuple[int, int], ...], float] = {}
             for score, ranges in candidates:
@@ -1821,9 +2076,7 @@ class OriginalLayoutReconstructor:
                 column = next(
                     (
                         index
-                        for index, (left, right) in enumerate(
-                            zip(column_edges, column_edges[1:])
-                        )
+                        for index, (left, right) in enumerate(zip(column_edges, column_edges[1:]))
                         if left <= center < right
                         or (index == len(column_edges) - 2 and center == right)
                     ),
@@ -1996,12 +2249,7 @@ class OriginalLayoutReconstructor:
             default=0.0,
         )
         minimum_score = 0.96 if len(expected) < 8 else 0.9 if len(expected) < 20 else 0.84
-        if (
-            best[0] < minimum_score
-            or best[5] < 0.88
-            or best[6] < 0.55
-            or best[7] < 0.55
-        ):
+        if best[0] < minimum_score or best[5] < 0.88 or best[6] < 0.55 or best[7] < 0.55:
             return None, {
                 "reason": "hidden_ocr_text_alignment_low_confidence",
                 "score": round(best[0], 6),
@@ -2279,9 +2527,7 @@ class OriginalLayoutReconstructor:
                     if other_line == candidate_line:
                         continue
                     if any(
-                        min(candidate_right, other_right)
-                        - max(candidate_left, other_left)
-                        >= 8.0
+                        min(candidate_right, other_right) - max(candidate_left, other_left) >= 8.0
                         for other_left, other_right in other_gaps
                     ):
                         supporting_lines += 1
@@ -2305,13 +2551,11 @@ class OriginalLayoutReconstructor:
             return False
         horizontal_overlap = max(
             0.0,
-            min(word_rectangle.x1, line_rectangle.x1)
-            - max(word_rectangle.x0, line_rectangle.x0),
+            min(word_rectangle.x1, line_rectangle.x1) - max(word_rectangle.x0, line_rectangle.x0),
         )
         vertical_overlap = max(
             0.0,
-            min(word_rectangle.y1, line_rectangle.y1)
-            - max(word_rectangle.y0, line_rectangle.y0),
+            min(word_rectangle.y1, line_rectangle.y1) - max(word_rectangle.y0, line_rectangle.y0),
         )
         if horizontal_overlap <= 0.0 or vertical_overlap <= 0.0:
             return False
@@ -2403,8 +2647,7 @@ class OriginalLayoutReconstructor:
         pixels = [tuple(samples[index : index + 3]) for index in range(0, len(samples), 3)]
         total = len(pixels)
         pixel_luminances = [
-            round(0.2126 * red + 0.7152 * green + 0.0722 * blue)
-            for red, green, blue in pixels
+            round(0.2126 * red + 0.7152 * green + 0.0722 * blue) for red, green, blue in pixels
         ]
         luminances = sorted(pixel_luminances)
         median = luminances[len(luminances) // 2]
@@ -2429,11 +2672,7 @@ class OriginalLayoutReconstructor:
         bucket_pixels = [
             pixel
             for pixel in background_candidates
-            if tuple(
-                min(255, int(round(channel / 8.0) * 8))
-                for channel in pixel
-            )
-            == mode_bucket
+            if tuple(min(255, int(round(channel / 8.0) * 8)) for channel in pixel) == mode_bucket
         ]
         mode = tuple(
             sorted(pixel[channel] for pixel in bucket_pixels)[len(bucket_pixels) // 2]
@@ -2443,9 +2682,7 @@ class OriginalLayoutReconstructor:
             max(abs(red - mode[0]), abs(green - mode[1]), abs(blue - mode[2])) <= 18
             for red, green, blue in background_candidates
         ) / len(background_candidates)
-        mode_luminance = round(
-            0.2126 * mode[0] + 0.7152 * mode[1] + 0.0722 * mode[2]
-        )
+        mode_luminance = round(0.2126 * mode[0] + 0.7152 * mode[1] + 0.0722 * mode[2])
         metadata = {
             "light_pixel_ratio": round(light_ratio, 6),
             "median_luminance": median,
@@ -2517,6 +2754,108 @@ class OriginalLayoutReconstructor:
             "minimum_score": 0.62,
         }
 
+    def _embedded_source_text_validation(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+        expected_text: str,
+    ) -> dict[str, Any]:
+        """Verify that an ordinary digital-text box contains only its source text.
+
+        Marker and Surya boxes are useful placement hints, but a stale or merged
+        box can include text from another paragraph or column. Redacting that
+        complete rectangle would silently erase the neighbour. Normalising away
+        markup, whitespace, and punctuation handles line wrapping and PDF
+        hyphenation; the bounded character comparison then permits only tiny
+        extraction differences and rejects every substantive unexplained run in
+        the visible PDF text.
+        """
+
+        visible_expected = re.sub(
+            r"(?is)<[^>]+>",
+            " ",
+            html.unescape(expected_text),
+        )
+        expected = self._comparison_text(visible_expected)
+        if not expected:
+            return {
+                "safe": False,
+                "reason": "embedded_source_text_missing",
+                "expected_characters": 0,
+                "actual_characters": 0,
+            }
+
+        try:
+            actual_text = page.get_text("text", clip=self._fitz_rect(bbox))
+        except Exception as exc:
+            return {
+                "safe": False,
+                "reason": "embedded_source_text_read_failed",
+                "error": type(exc).__name__,
+                "expected_characters": len(expected),
+                "actual_characters": 0,
+            }
+        actual = self._comparison_text(actual_text)
+        if not actual:
+            return {
+                "safe": False,
+                "reason": "embedded_source_text_not_found_in_bbox",
+                "expected_characters": len(expected),
+                "actual_characters": 0,
+            }
+
+        matcher = SequenceMatcher(None, expected, actual, autojunk=False)
+        matching_characters = sum(match.size for match in matcher.get_matching_blocks())
+        opcodes = matcher.get_opcodes()
+        actual_unexplained_runs = [
+            j2 - j1
+            for tag, _i1, _i2, j1, j2 in opcodes
+            if tag in {"insert", "replace"} and j2 > j1
+        ]
+        expected_unmatched_runs = [
+            i2 - i1
+            for tag, i1, i2, _j1, _j2 in opcodes
+            if tag in {"delete", "replace"} and i2 > i1
+        ]
+        actual_unexplained = len(actual) - matching_characters
+        expected_unmatched = len(expected) - matching_characters
+        maximum_actual_unexplained = max(2, min(4, math.ceil(len(actual) * 0.01)))
+        maximum_expected_unmatched = max(2, min(6, math.ceil(len(expected) * 0.02)))
+        ratio = matcher.ratio()
+        diagnostics: dict[str, Any] = {
+            "safe": False,
+            "expected_characters": len(expected),
+            "actual_characters": len(actual),
+            "matching_characters": matching_characters,
+            "similarity": round(float(ratio), 6),
+            "unexplained_actual_characters": actual_unexplained,
+            "unmatched_expected_characters": expected_unmatched,
+            "largest_unexplained_actual_run": max(actual_unexplained_runs, default=0),
+            "largest_unmatched_expected_run": max(expected_unmatched_runs, default=0),
+            "thresholds": {
+                "minimum_similarity": 0.92,
+                "maximum_unexplained_actual_characters": maximum_actual_unexplained,
+                "maximum_unmatched_expected_characters": maximum_expected_unmatched,
+                "maximum_unexplained_actual_run": 2,
+            },
+        }
+        if (
+            actual_unexplained > maximum_actual_unexplained
+            or max(actual_unexplained_runs, default=0) > 2
+        ):
+            diagnostics["reason"] = "embedded_source_bbox_contains_unexplained_text"
+            return diagnostics
+        if (
+            expected_unmatched > maximum_expected_unmatched
+            or ratio < 0.92
+        ):
+            diagnostics["reason"] = "embedded_source_text_does_not_match_bbox"
+            return diagnostics
+
+        diagnostics["safe"] = True
+        diagnostics["reason"] = "embedded_source_text_verified"
+        return diagnostics
+
     def _scan_text_line_masks(
         self,
         page: fitz.Page,
@@ -2527,12 +2866,15 @@ class OriginalLayoutReconstructor:
         vertical_expansion: float = 1.8,
     ) -> list[BoundingBox]:
         rectangle = self._fitz_rect(bbox)
-        search_rectangle = fitz.Rect(
-            rectangle.x0 - padding,
-            rectangle.y0 - padding,
-            rectangle.x1 + padding,
-            rectangle.y1 + padding,
-        ) & page.rect
+        search_rectangle = (
+            fitz.Rect(
+                rectangle.x0 - padding,
+                rectangle.y0 - padding,
+                rectangle.x1 + padding,
+                rectangle.y1 + padding,
+            )
+            & page.rect
+        )
         try:
             words = page.get_text("words", clip=search_rectangle, sort=True)
         except Exception:
@@ -2629,10 +2971,13 @@ class OriginalLayoutReconstructor:
         def solve(
             grid_index: int,
             logical_index: int,
-        ) -> tuple[
-            float,
-            tuple[tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]], ...],
-        ] | None:
+        ) -> (
+            tuple[
+                float,
+                tuple[tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]], ...],
+            ]
+            | None
+        ):
             if grid_index == len(grid_rows) and logical_index == len(source_rows):
                 return 0.0, ()
             if grid_index >= len(grid_rows) or logical_index >= len(source_rows):
@@ -2674,6 +3019,87 @@ class OriginalLayoutReconstructor:
         result = solve(0, 0)
         return list(result[1]) if result is not None else None
 
+    def _table_alignment_has_full_cell_coverage(
+        self,
+        page: fitz.Page,
+        alignment: list[
+            tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]]
+        ],
+    ) -> bool:
+        """Reject grids whose cells contain source text absent from the table model.
+
+        The ordinary row scorer deliberately tolerates a neighbouring line that
+        bleeds across a PDF clipping boundary. That tolerance is useful while
+        locating tables, but is not sufficient before redacting a complete cell:
+        an exact expected line must not make unrelated text in the same rectangle
+        disappear. Full-cell equality is preferred; small OCR differences and
+        boundary bleed are accepted only when every visible line can be explained
+        by one of the logical cells in the aligned row.
+        """
+
+        for source_row, _translated_row, rectangles in alignment:
+            source_lines = [
+                normalized
+                for cell in source_row
+                for line in cell.text.splitlines()
+                if (normalized := self._comparison_text(line))
+            ]
+            for source_cell, rectangle in zip(source_row, rectangles, strict=True):
+                expected = self._comparison_text(source_cell.text)
+                actual_text = page.get_text("text", clip=rectangle)
+                actual = self._comparison_text(actual_text)
+                if expected == actual:
+                    continue
+
+                expected_lines = [
+                    normalized
+                    for line in source_cell.text.splitlines()
+                    if (normalized := self._comparison_text(line))
+                ]
+                actual_lines = [
+                    normalized
+                    for line in actual_text.splitlines()
+                    if (normalized := self._comparison_text(line))
+                ]
+                if (
+                    expected
+                    and len(actual_lines) <= max(1, len(expected_lines))
+                    and self._text_matches_with_bounded_variation(expected, actual)
+                ):
+                    continue
+                if expected_lines and not all(
+                    any(
+                        self._text_matches_with_bounded_variation(expected_line, actual_line)
+                        for actual_line in actual_lines
+                    )
+                    for expected_line in expected_lines
+                ):
+                    return False
+                if any(
+                    not any(
+                        self._text_matches_with_bounded_variation(actual_line, source_line)
+                        for source_line in source_lines
+                    )
+                    for actual_line in actual_lines
+                ):
+                    return False
+        return True
+
+    def _text_matches_with_bounded_variation(self, expected: str, actual: str) -> bool:
+        if expected == actual:
+            return True
+        if not expected or not actual:
+            return False
+        longest = max(len(expected), len(actual))
+        shortest = min(len(expected), len(actual))
+        if shortest <= 3:
+            return False
+        allowed_length_delta = max(2, math.ceil(longest * 0.08))
+        if longest - shortest > allowed_length_delta:
+            return False
+        minimum_similarity = 0.9 if longest < 12 else 0.84
+        return SequenceMatcher(None, expected, actual).ratio() >= minimum_similarity
+
     def _combine_table_rows(
         self,
         rows: list[list[ParsedTableCell]],
@@ -2700,25 +3126,70 @@ class OriginalLayoutReconstructor:
         nonempty_cell_scores: list[float] = []
         for cell, rectangle in zip(source_row, rectangles, strict=True):
             expected = self._comparison_text(cell.text)
-            actual = self._comparison_text(page.get_text("text", clip=rectangle))
-            weight = float(max(2, len(expected), len(actual)))
+            actual_text = page.get_text("text", clip=rectangle)
+            actual = self._comparison_text(actual_text)
+            if not expected:
+                # Empty logical cells are never redacted. PDF glyph boxes from a
+                # neighbouring row often cross a predicted cell boundary, so
+                # incidental clipped text here is not evidence of unsafe
+                # geometry and must not reject an otherwise aligned table.
+                continue
+            weight = float(max(2, len(expected)))
             total_weight += weight
-            if not expected and not actual:
-                score = 1.0
-            elif not expected or not actual:
+            if not actual:
                 score = 0.0
             else:
-                score = SequenceMatcher(None, expected, actual).ratio()
-                if expected in actual or actual in expected:
-                    score = max(score, min(len(expected), len(actual)) / max(len(expected), len(actual)))
-            if expected or actual:
-                nonempty_cell_scores.append(score)
+                score = self._table_cell_text_similarity(expected, actual_text)
+            nonempty_cell_scores.append(score)
             weighted_score += score * weight
         # A long correct cell must not outweigh a short cell mapped to the
         # wrong box: every nonempty source/visual cell needs plausible text.
         if any(score < 0.42 for score in nonempty_cell_scores):
             return 0.0
+        if not nonempty_cell_scores:
+            return 1.0
         return weighted_score / max(1.0, total_weight)
+
+    def _table_cell_text_similarity(self, expected: str, actual_text: str) -> float:
+        """Compare a logical cell with clipped PDF text without trusting substrings.
+
+        PyMuPDF can return a neighbouring line when a glyph box touches the cell
+        boundary.  Comparing individual lines lets the intended cell still match,
+        while a short header such as ``N`` cannot validate an unrelated paragraph
+        merely because that character occurs somewhere inside it.
+        """
+
+        candidates = [
+            candidate
+            for candidate in {
+                self._comparison_text(actual_text),
+                *(self._comparison_text(line) for line in actual_text.splitlines()),
+            }
+            if candidate
+        ]
+        if not candidates:
+            return 0.0
+        if expected in candidates:
+            return 1.0
+        if len(expected) <= 3:
+            tokens = {
+                self._comparison_text(token)
+                for token in re.findall(r"\w+", actual_text, flags=re.UNICODE)
+            }
+            return 1.0 if expected in tokens else 0.0
+
+        best = 0.0
+        for actual in candidates:
+            score = SequenceMatcher(None, expected, actual).ratio()
+            if actual in expected:
+                score = max(score, len(actual) / len(expected))
+            elif expected in actual:
+                extra = len(actual) - len(expected)
+                allowed_extra = max(2, math.ceil(len(expected) * 0.35))
+                if extra <= allowed_extra:
+                    score = max(score, len(expected) / len(actual))
+            best = max(best, score)
+        return best
 
     def _comparison_text(self, text: str) -> str:
         normalized = unicodedata.normalize("NFKC", text).casefold()
@@ -2749,7 +3220,11 @@ class OriginalLayoutReconstructor:
         )
         style = str(
             style_hints.get("font_style")
-            or ("italic" if region.block_type in {BlockType.CAPTION, BlockType.FOOTNOTE} else "normal")
+            or (
+                "italic"
+                if region.block_type in {BlockType.CAPTION, BlockType.FOOTNOTE}
+                else "normal"
+            )
         )
         default_align = (
             "center"
@@ -2869,8 +3344,7 @@ class OriginalLayoutReconstructor:
             ]
             tolerance = max(2.0, rectangle.width * 0.08)
             centered_lines = sum(
-                abs(left_gap - right_gap) <= tolerance
-                for left_gap, right_gap in gaps
+                abs(left_gap - right_gap) <= tolerance for left_gap, right_gap in gaps
             )
             sorted_left = sorted(left_gap for left_gap, _right_gap in gaps)
             sorted_right = sorted(right_gap for _left_gap, right_gap in gaps)
@@ -2960,6 +3434,7 @@ class OriginalLayoutReconstructor:
             "block_ids": [block.id],
             "block_type": block.block_type.value,
             "bbox": bbox.model_dump() if bbox is not None else None,
+            "source_character_count": self._source_character_count(self._block_source_text(block)),
             "status": "skipped",
             "reason": reason,
         }
@@ -2971,6 +3446,33 @@ class OriginalLayoutReconstructor:
             page_number=block.page_number,
             code="region_skipped",
             reason=f"Region {block.id} was skipped: {reason}.",
+        )
+
+    def _retain_block(
+        self,
+        report: dict[str, Any],
+        page_report: dict[str, Any],
+        block: Block,
+        *,
+        reason: str,
+        bbox: BoundingBox | None = None,
+    ) -> None:
+        """Record an intentional, successful source-region preservation."""
+
+        report["regions_retained"] += 1
+        page_report["regions_retained"] += 1
+        report["regions"].append(
+            {
+                "page_number": block.page_number,
+                "block_ids": [block.id],
+                "block_type": block.block_type.value,
+                "bbox": bbox.model_dump() if bbox is not None else None,
+                "source_character_count": self._source_character_count(
+                    self._block_source_text(block)
+                ),
+                "status": "retained",
+                "reason": reason,
+            }
         )
 
     def _skipped_region(
@@ -2988,6 +3490,7 @@ class OriginalLayoutReconstructor:
                 "block_ids": region.block_ids,
                 "block_type": region.block_type.value,
                 "bbox": region.bbox.model_dump(),
+                "source_character_count": self._source_character_count(region.source_text),
                 "status": "skipped",
                 "reason": reason,
                 "scale": round(float(scale), 6),
@@ -3011,10 +3514,57 @@ class OriginalLayoutReconstructor:
         )
 
     def _overlaps_locked_region(self, region: BoundingBox, locked: BoundingBox) -> bool:
-        intersection = bbox_intersection_area(region, locked)
-        if intersection <= 0:
-            return False
-        return intersection / max(1.0, bbox_area(region)) > 0.08 or intersection > 36.0
+        return bbox_intersection_area(region, locked) > 0
+
+    def _redaction_bboxes_avoiding_locked_regions(
+        self,
+        bboxes: list[BoundingBox],
+        locked_regions: list[BoundingBox],
+        *,
+        page_width: float,
+        page_height: float,
+    ) -> list[BoundingBox]:
+        """Keep redaction fills and antialiasing away from locked visuals."""
+
+        guarded = list(bboxes)
+        for locked in locked_regions:
+            obstacle = BoundingBox(
+                x0=max(0.0, locked.x0 - self.locked_redaction_guard),
+                y0=max(0.0, locked.y0 - self.locked_redaction_guard),
+                x1=min(page_width, locked.x1 + self.locked_redaction_guard),
+                y1=min(page_height, locked.y1 + self.locked_redaction_guard),
+            )
+            next_guarded: list[BoundingBox] = []
+            for bbox in guarded:
+                next_guarded.extend(self._subtract_bbox(bbox, obstacle))
+            guarded = next_guarded
+            if not guarded:
+                break
+        return guarded
+
+    def _subtract_bbox(
+        self,
+        source: BoundingBox,
+        obstacle: BoundingBox,
+    ) -> list[BoundingBox]:
+        x0 = max(source.x0, obstacle.x0)
+        y0 = max(source.y0, obstacle.y0)
+        x1 = min(source.x1, obstacle.x1)
+        y1 = min(source.y1, obstacle.y1)
+        if x0 >= x1 or y0 >= y1:
+            return [source]
+
+        candidates = (
+            (source.x0, source.y0, source.x1, y0),
+            (source.x0, y1, source.x1, source.y1),
+            (source.x0, y0, x0, y1),
+            (x1, y0, source.x1, y1),
+        )
+        return [
+            BoundingBox(x0=left, y0=top, x1=right, y1=bottom)
+            for left, top, right, bottom in candidates
+            if right - left >= 0.25 and bottom - top >= 0.25
+        ]
 
     def _union_bbox(self, bboxes: list[BoundingBox]) -> BoundingBox:
         return BoundingBox(
@@ -3026,6 +3576,31 @@ class OriginalLayoutReconstructor:
 
     def _fitz_rect(self, bbox: BoundingBox) -> fitz.Rect:
         return fitz.Rect(bbox.x0, bbox.y0, bbox.x1, bbox.y1)
+
+    def _redaction_bboxes(self, region: _ReplacementRegion) -> list[BoundingBox]:
+        """Return the exact rectangles passed to PyMuPDF redaction."""
+
+        return region.redaction_bboxes if region.redaction_bboxes is not None else [region.bbox]
+
+    def _block_pdf_bbox(self, page: fitz.Page, block: Block) -> BoundingBox | None:
+        """Return a validated block rectangle in PDF-page coordinates for reporting."""
+
+        return convert_bbox_to_pdf(
+            block.bbox,
+            page_width=page.rect.width,
+            page_height=page.rect.height,
+            metadata=block.metadata,
+        ).bbox
+
+    def _block_source_text(self, block: Block) -> str:
+        source_text = block.metadata.get("source_text")
+        if source_text is None:
+            source_text = block.text
+        return str(source_text)
+
+    def _source_character_count(self, source_text: str) -> int:
+        visible = re.sub(r"(?is)<[^>]+>", " ", html.unescape(source_text))
+        return len(self._normalized_text(visible))
 
     def _normalized_text(self, text: str) -> str:
         return re.sub(r"\s+", " ", text).strip()

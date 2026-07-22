@@ -9,6 +9,13 @@ from app.models.schema import Block, BlockType, DocumentModel, FigureAsset, Tabl
 from app.services.table_markup import parse_table_rows, rows_have_consistent_shape
 
 
+QWEN_REMOTE_MARKDOWN_IMAGE_PATTERN = re.compile(
+    r"!\[(?P<alt>[^\]]*)\]\(\s*<?(?:https?|ftp)://[^)>\s]+>?"
+    r"(?:\s+[\"'][^\"']*[\"'])?\s*\)",
+    flags=re.IGNORECASE,
+)
+
+
 @dataclass
 class _CaptionFlowEdge:
     to: int
@@ -19,6 +26,8 @@ class _CaptionFlowEdge:
 
 
 class MarkdownBuilder:
+    LONG_TABLE_ROW_THRESHOLD = 18
+
     def build(self, document: DocumentModel, marker_markdown: str | None = None) -> str:
         if marker_markdown and marker_markdown.strip() and not document.blocks:
             return marker_markdown.strip()
@@ -40,6 +49,7 @@ class MarkdownBuilder:
             caption.id for caption in table_caption_by_id.values()
         )
         figure_anchors = self._figure_anchors(document, caption_by_id)
+        translation_flow_text = self._translation_flow_text(document)
         rendered_figures: set[str] = set()
         tables_by_page: dict[int, list[TableModel]] = {}
         for table in document.tables:
@@ -49,10 +59,14 @@ class MarkdownBuilder:
         for block in document.blocks:
             if self._is_marker_table_cell(block):
                 continue
+            block_text = translation_flow_text.get(
+                block.id,
+                self._readable_block_text(block, document.figures),
+            )
             anchored_figures = figure_anchors.get(block.id, [])
             if (
                 block.block_type not in {BlockType.TABLE, BlockType.FIGURE}
-                and not block.text.strip()
+                and not block_text.strip()
                 and not anchored_figures
             ):
                 continue
@@ -63,11 +77,17 @@ class MarkdownBuilder:
             if block.block_type == BlockType.FIGURE:
                 # Text detected inside a graph remains part of the captured visual and
                 # is deliberately not emitted as translatable body text.
-                pass
+                lines.extend(
+                    f"{fallback}\n"
+                    for fallback in self._missing_qwen_image_fallbacks(
+                        block,
+                        document.figures,
+                    )
+                )
             elif block.block_type == BlockType.HEADING:
-                lines.append(f"## {block.text}\n")
+                lines.append(f"## {block_text}\n")
             elif block.block_type == BlockType.LIST:
-                lines.append(self._list_markdown(block.text))
+                lines.append(self._list_markdown(block_text))
             elif block.block_type == BlockType.TABLE:
                 matched_table = self._table_for_block(
                     document,
@@ -88,19 +108,20 @@ class MarkdownBuilder:
                         )
                     )
                     rendered_tables.add(matched_table.id)
-                elif block.text.strip():
-                    lines.append(block.text.strip() + "\n")
+                elif block_text.strip():
+                    lines.append(block_text.strip() + "\n")
             elif block.block_type == BlockType.CAPTION:
                 if block.id not in associated_caption_ids:
-                    lines.append(f"*{block.text}*\n")
+                    lines.append(f"*{block_text}*\n")
             elif block.block_type == BlockType.FOOTNOTE:
-                lines.append(f"<small>[Footnote] {block.text}</small>\n")
+                lines.append(f"<small>[Footnote] {block_text}</small>\n")
             elif block.block_type == BlockType.REFERENCE:
-                lines.append(f"- {block.text}\n")
+                lines.append(f"- {block_text}\n")
             elif block.block_type in {BlockType.HEADER, BlockType.FOOTER}:
-                lines.append(f"<small>{block.text}</small>\n")
+                lines.append(f"<small>{block_text}</small>\n")
             else:
-                lines.append(block.text + "\n")
+                if block_text:
+                    lines.append(block_text + "\n")
 
             for figure in anchored_figures:
                 if figure.id in rendered_figures:
@@ -125,6 +146,130 @@ class MarkdownBuilder:
             rendered_tables.add(table.id)
 
         return "\n".join(lines)
+
+    def _translation_flow_text(self, document: DocumentModel) -> dict[str, str]:
+        groups: dict[str, list[Block]] = {}
+        for block in document.blocks:
+            group_id = str(
+                (block.metadata or {}).get("translation_placement_group_id") or ""
+            ).strip()
+            if group_id and block.block_type == BlockType.PARAGRAPH:
+                groups.setdefault(group_id, []).append(block)
+
+        rendered: dict[str, str] = {}
+        for blocks in groups.values():
+            try:
+                ordered = sorted(
+                    blocks,
+                    key=lambda block: int(
+                        block.metadata.get("translation_placement_index")
+                    ),
+                )
+                expected_count = int(
+                    ordered[0].metadata.get("translation_placement_count")
+                )
+                indexes = [
+                    int(block.metadata.get("translation_placement_index"))
+                    for block in ordered
+                ]
+            except (TypeError, ValueError):
+                continue
+            if expected_count != len(ordered) or indexes != list(range(expected_count)):
+                continue
+            parts = [
+                self._readable_block_text(block, document.figures).strip()
+                for block in ordered
+            ]
+            if not all(parts):
+                continue
+            text = ""
+            for part in parts:
+                if text.endswith("-"):
+                    text = f"{text[:-1]}{part}"
+                else:
+                    text = f"{text} {part}".strip()
+            rendered[ordered[0].id] = text
+            rendered.update({block.id: "" for block in ordered[1:]})
+        return rendered
+
+    def _readable_block_text(
+        self,
+        block: Block,
+        figures: list[FigureAsset],
+    ) -> str:
+        # Qwen can emit a generated remote image URL instead of source-page
+        # geometry. Suppress it only when each token can be replaced by a
+        # materialised job-local FigureAsset from the same source region.
+        # Otherwise retain its alt text as an explicit missing-asset warning.
+        matches = list(QWEN_REMOTE_MARKDOWN_IMAGE_PATTERN.finditer(block.text))
+        if not matches or not self._is_qwen_ocr_block(block):
+            return block.text
+
+        local_figures = iter(self._matching_materialized_figures(block, figures))
+
+        def replace(match: re.Match[str]) -> str:
+            if next(local_figures, None) is not None:
+                return ""
+            return self._missing_image_fallback(match)
+
+        return QWEN_REMOTE_MARKDOWN_IMAGE_PATTERN.sub(replace, block.text).strip()
+
+    def _missing_qwen_image_fallbacks(
+        self,
+        block: Block,
+        figures: list[FigureAsset],
+    ) -> list[str]:
+        if not self._is_qwen_ocr_block(block):
+            return []
+        remote_images = list(QWEN_REMOTE_MARKDOWN_IMAGE_PATTERN.finditer(block.text))
+        local_asset_count = len(self._matching_materialized_figures(block, figures))
+        return [
+            self._missing_image_fallback(match)
+            for match in remote_images[local_asset_count:]
+        ]
+
+    def _missing_image_fallback(self, match: re.Match[str]) -> str:
+        alt = re.sub(r"\s+", " ", match.group("alt")).strip()
+        return f"[Image unavailable: {alt}]" if alt else "[Image unavailable]"
+
+    def _is_qwen_ocr_block(self, block: Block) -> bool:
+        parser = str((block.metadata or {}).get("parser", ""))
+        return "qwen" in parser.casefold()
+
+    def _matching_materialized_figures(
+        self,
+        block: Block,
+        figures: list[FigureAsset],
+    ) -> list[FigureAsset]:
+        block_region_ids = {
+            str(region_id)
+            for region_id in (block.metadata or {}).get("source_region_ids", [])
+            if region_id is not None
+        }
+        matched: list[FigureAsset] = []
+        for figure in figures:
+            if figure.page_number != block.page_number:
+                continue
+            if not self._has_materialized_local_asset(figure):
+                continue
+            source_block_match = block.id in figure.source_block_ids
+            source_region_match = bool(
+                block_region_ids
+                and block_region_ids.intersection(map(str, figure.source_region_ids))
+            )
+            if source_block_match or source_region_match:
+                matched.append(figure)
+        return matched
+
+    def _has_materialized_local_asset(self, figure: FigureAsset) -> bool:
+        for value in (figure.vector_path, figure.image_path):
+            if not value:
+                continue
+            if re.match(r"^[a-z][a-z0-9+.-]*://", value, flags=re.IGNORECASE):
+                continue
+            if Path(value).expanduser().is_file():
+                return True
+        return False
 
     def _list_markdown(self, text: str) -> str:
         stripped = self._clean_list_text(text)
@@ -207,7 +352,12 @@ class MarkdownBuilder:
         if not caption:
             caption = f"Table {ordinal}"
 
-        parts = ['<figure class="document-table">']
+        parsed_rows = parse_table_rows(table_markup)
+        row_count = len(parsed_rows) or len(rendered_table.rows) + bool(rendered_table.headers)
+        figure_class = "document-table"
+        if row_count >= self.LONG_TABLE_ROW_THRESHOLD:
+            figure_class += " document-table--long"
+        parts = [f'<figure class="{figure_class}">']
         if table_markup.strip():
             parts.append(table_markup)
         elif table.fallback_image_path:

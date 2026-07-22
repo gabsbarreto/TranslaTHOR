@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import fitz
@@ -186,15 +187,25 @@ def test_original_layout_preserves_page_and_pixels_outside_text_regions(tmp_path
     assert report["pages_successfully_reconstructed"] == 1
     assert report["figures_preserved"] == 1
     assert report["regions_replaced"] == 3
+    assert report["regions_retained"] == 2
     assert report["text_boxes_did_not_fit"] == 0
     assert len(report["scaling_applied"]) == 3
     assert len(report["raster_figure_fallbacks"]) == 1
     assert "low_confidence_figure_or_caption_associations" in report
     assert report_path.is_file()
-    assert any(
-        region.get("reason") == "locked_visual_region"
-        for region in report["regions"]
+    locked_region = next(
+        region for region in report["regions"] if region.get("reason") == "locked_visual_region"
     )
+    assert locked_region["status"] == "retained"
+    assert locked_region["source_character_count"] == len("ACHSE QUELLE")
+    assert locked_region["bbox"] == {
+        "x0": 60.0,
+        "y0": 100.0,
+        "x1": 340.0,
+        "y1": 280.0,
+    }
+    persisted_report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert persisted_report["regions"] == report["regions"]
 
     source_image = _render_rgb(source)
     output_image = _render_rgb(output)
@@ -219,6 +230,62 @@ def test_original_layout_preserves_page_and_pixels_outside_text_regions(tmp_path
         )
     outside = Image.composite(difference, Image.new("RGB", difference.size), outside_mask)
     assert outside.getbbox() is None
+
+
+def test_embedded_text_bbox_with_unexplained_neighbor_is_retained(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "contaminated-paragraph-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=180)
+    page.insert_text((30, 50), "Texto fuente correcto", fontsize=10)
+    page.insert_text((30, 75), "DO NOT DELETE", fontsize=10)
+    pdf.save(source)
+    pdf.close()
+
+    block = _translated_block(
+        "oversized-paragraph",
+        BlockType.PARAGRAPH,
+        "Texto fuente correcto",
+        "Correct source text",
+        BoundingBox(x0=25, y0=30, x1=275, y1=85),
+        0,
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=180,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+    output = tmp_path / "contaminated-paragraph-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "contaminated-paragraph-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert report["regions_skipped"] == 1
+    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
+    assert skipped["reason"] == "embedded_source_bbox_contains_unexplained_text"
+    validation = skipped["alignment_diagnostics"]["source_text_validation"]
+    assert validation["safe"] is False
+    assert validation["unexplained_actual_characters"] >= len("DONOTDELETE")
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    with fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Texto fuente correcto" in text
+        assert "DO NOT DELETE" in text
+        assert "Correct source text" not in text
 
 
 def test_overflow_is_reported_and_source_text_is_retained(tmp_path: Path) -> None:
@@ -262,10 +329,12 @@ def test_overflow_is_reported_and_source_text_is_retained(tmp_path: Path) -> Non
     assert report["text_boxes_did_not_fit"] == 1
     assert report["regions_replaced"] == 0
     assert report["pages_using_fallback_behavior"] == 1
-    assert any(
-        region.get("reason") == "translated_text_did_not_fit_minimum_scale"
+    overflow_region = next(
+        region
         for region in report["regions"]
+        if region.get("reason") == "translated_text_did_not_fit_minimum_scale"
     )
+    assert overflow_region["source_character_count"] == len("SOURCE")
     with fitz.open(output) as output_pdf:
         assert "SOURCE" in output_pdf[0].get_text("text")
 
@@ -320,6 +389,241 @@ def test_scanned_page_is_retained_with_safe_warning(tmp_path: Path) -> None:
     assert report["pages_using_fallback_behavior"] == 1
     assert report["regions_replaced"] == 0
     assert any(warning["code"] == "page_not_safely_replaceable" for warning in report["warnings"])
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_intentional_exclusion_is_retained_without_marking_page_fallback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "excluded-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=200)
+    page.insert_textbox(fitz.Rect(30, 30, 270, 60), "JOURNAL HEADER", fontsize=10)
+    pdf.save(source)
+    pdf.close()
+
+    block = Block(
+        id="header",
+        page_number=1,
+        block_type=BlockType.HEADER,
+        text="JOURNAL HEADER",
+        bbox=BoundingBox(x0=60, y0=60, x1=540, y1=120),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "excluded_from_translation": True,
+            "translation_exclusion_reason": "page_header",
+            "surya_page_width": 600,
+            "surya_page_height": 400,
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=200,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=tmp_path / "excluded-output.pdf",
+        document=document,
+        report_path=tmp_path / "excluded-report.json",
+    )
+
+    assert report["status"] == "complete"
+    assert report["pages_successfully_reconstructed"] == 1
+    assert report["pages_using_fallback_behavior"] == 0
+    assert report["regions_skipped"] == 0
+    assert report["regions_retained"] == 1
+    assert report["regions"][0]["status"] == "retained"
+    assert report["regions"][0]["reason"] == "page_header"
+    assert report["regions"][0]["bbox"] == {
+        "x0": 30.0,
+        "y0": 30.0,
+        "x1": 270.0,
+        "y1": 60.0,
+    }
+    assert report["warnings"] == []
+
+
+def test_intentionally_retained_region_has_null_bbox_only_when_missing(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "excluded-missing-bbox-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=200)
+    page.insert_text((30, 50), "JOURNAL HEADER", fontsize=10)
+    pdf.save(source)
+    pdf.close()
+
+    block = Block(
+        id="header-without-bbox",
+        page_number=1,
+        block_type=BlockType.HEADER,
+        text="JOURNAL HEADER",
+        bbox=None,
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "excluded_from_translation": True,
+            "translation_exclusion_reason": "page_header",
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=200,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=tmp_path / "excluded-missing-bbox-output.pdf",
+        document=document,
+        report_path=tmp_path / "excluded-missing-bbox-report.json",
+    )
+
+    assert report["status"] == "complete"
+    assert report["regions_retained"] == 1
+    assert report["regions"][0]["status"] == "retained"
+    assert report["regions"][0]["bbox"] is None
+
+
+def test_failed_target_language_validation_is_reported_as_real_fallback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "validation-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=200)
+    page.insert_textbox(
+        fitz.Rect(30, 40, 270, 90),
+        "Los pacientes reciben tratamiento hormonal.",
+        fontsize=10,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    block = _translated_block(
+        "body",
+        BlockType.PARAGRAPH,
+        "Los pacientes reciben tratamiento hormonal.",
+        "Los pacientes reciben tratamiento hormonal.",
+        BoundingBox(x0=30, y0=40, x1=270, y1=90),
+        0,
+    )
+    block.metadata["translation_validation"] = {
+        "status": "translation_failed",
+        "reason": "translation_output_matches_source",
+    }
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=200,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=tmp_path / "validation-output.pdf",
+        document=document,
+        report_path=tmp_path / "validation-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["pages_using_fallback_behavior"] == 1
+    assert report["regions_skipped"] == 1
+    assert report["regions_retained"] == 0
+    assert report["regions"][0]["reason"] == "translation_output_matches_source"
+
+
+def test_failed_table_target_language_validation_is_reported_as_real_fallback(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "validation-table-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=200)
+    page.insert_textbox(
+        fitz.Rect(30, 40, 270, 90),
+        "Diagnostico N Depresion 15",
+        fontsize=10,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    source_table = (
+        "<table><tr><th>Diagnostico</th><th>N</th></tr>"
+        "<tr><td>Depresion</td><td>15</td></tr></table>"
+    )
+    block = Block(
+        id="failed-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=source_table,
+        bbox=BoundingBox(x0=30, y0=40, x1=270, y1=90),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_table,
+            "translated_from_block_ids": ["failed-table"],
+            "translation_validation": {
+                "status": "translation_failed",
+                "reason": "translation_output_matches_source",
+            },
+        },
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=300,
+                height=200,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=SourceType.EMBEDDED,
+            )
+        ],
+        blocks=[block],
+    )
+
+    output = tmp_path / "validation-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "validation-table-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["pages_using_fallback_behavior"] == 1
+    assert report["regions_replaced"] == 0
+    assert report["regions_skipped"] == 1
+    assert report["regions"][0]["reason"] == "translation_output_matches_source"
     assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
 
 
@@ -629,7 +933,9 @@ def _horizontal_rule_table_source(path: Path) -> tuple[str, str, Block, list[flo
     return source_markup, translated_markup, block, x_edges, y_edges
 
 
-def _single_page_table_document(block: Block, *, tables: list[TableModel] | None = None) -> DocumentModel:
+def _single_page_table_document(
+    block: Block, *, tables: list[TableModel] | None = None
+) -> DocumentModel:
     return DocumentModel(
         metadata=DocumentMetadata(filename="horizontal-table.pdf", page_count=1),
         pages=[
@@ -677,10 +983,7 @@ def _stored_horizontal_table(
         headers=[cell.text for cell in parsed_source[0]],
         header_cells=[table_cell(0, column) for column in range(3)],
         rows=[[cell.text for cell in row] for row in parsed_source[1:]],
-        cells=[
-            [table_cell(row, column) for column in range(3)]
-            for row in range(1, 3)
-        ],
+        cells=[[table_cell(row, column) for column in range(3)] for row in range(1, 3)],
         debug={
             "marker_block_id": block.id,
             "cell_geometry_source": "marker_table_cell_polygons",
@@ -721,8 +1024,7 @@ def test_horizontal_rule_table_is_semantically_coalesced(tmp_path: Path) -> None
     }
     assert "pymupdf_text_lattice_semantic_alignment" in strategies
     assert not any(
-        region.get("reason") == "table_cell_geometry_unreliable"
-        for region in report["regions"]
+        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
     )
 
     source_image = _render_rgb(source, scale=2)
@@ -730,9 +1032,10 @@ def test_horizontal_rule_table_is_semantically_coalesced(tmp_path: Path) -> None
     for y in y_edges:
         rule_strip = (60, round(y * 2) - 1, 780, round(y * 2) + 2)
         assert source_image.crop(rule_strip).tobytes() == output_image.crop(rule_strip).tobytes()
-    assert source_image.crop((60, 400, 780, 440)).tobytes() == output_image.crop(
-        (60, 400, 780, 440)
-    ).tobytes()
+    assert (
+        source_image.crop((60, 400, 780, 440)).tobytes()
+        == output_image.crop((60, 400, 780, 440)).tobytes()
+    )
 
 
 def test_marker_cell_polygons_are_preferred_for_table_geometry(tmp_path: Path) -> None:
@@ -760,6 +1063,228 @@ def test_marker_cell_polygons_are_preferred_for_table_geometry(tmp_path: Path) -
     }
     assert strategies == {"marker_table_cell_polygons"}
     assert report["regions_skipped"] == 0
+
+
+def test_overlapping_marker_cells_fall_back_to_ruled_colspan_grid(tmp_path: Path) -> None:
+    source = tmp_path / "ruled-colspan-source.pdf"
+    x_edges = [30.0, 120.0, 210.0, 300.0, 390.0]
+    y_edges = [30.0, 52.0, 76.0, 112.0, 145.0, 180.0, 215.0]
+    pdf = fitz.open()
+    page = pdf.new_page(width=420, height=230)
+    for y in y_edges:
+        page.draw_line((x_edges[0], y), (x_edges[-1], y), color=(0, 0, 0), width=0.6)
+    for x in (x_edges[0], x_edges[-1]):
+        page.draw_line((x, y_edges[0]), (x, y_edges[-1]), color=(0, 0, 0), width=0.6)
+    for x in x_edges[1:-1]:
+        page.draw_line((x, y_edges[1]), (x, y_edges[3]), color=(0, 0, 0), width=0.6)
+    page.draw_line((x_edges[3], y_edges[3]), (x_edges[3], y_edges[-1]), color=(0, 0, 0), width=0.6)
+
+    page.insert_text((34, 45), "Alter", fontsize=7)
+    for column, text in enumerate(("", "in Jahren", "bei Outing", "bei Diagnose")):
+        if text:
+            page.insert_text((x_edges[column] + 3, 69), text, fontsize=7)
+    for column, text in enumerate(("M (SD)", "26.8", "22.9", "23.2")):
+        page.insert_text((x_edges[column] + 3, 95), text, fontsize=7)
+    page.insert_text((34, 130), "Bei Geburt zugewiesenes Geschlecht", fontsize=7)
+    page.insert_text((304, 130), "10 (50)", fontsize=7)
+    page.insert_text((34, 164), "Wohnort (Bundesland)", fontsize=7)
+    page.insert_text((304, 164), "6 (30)", fontsize=7)
+    page.insert_text((34, 195), "Geschlechtsangleichende Maßnahmen", fontsize=7)
+    page.insert_text((34, 208), "abgeschlossen", fontsize=7)
+    page.insert_text((304, 195), "20 (100)", fontsize=7)
+    page.insert_text((304, 208), "8 (40)", fontsize=7)
+    pdf.save(source)
+    pdf.close()
+
+    source_markup = (
+        "<table><tr><th colspan=4>Alter</th></tr>"
+        "<tr><th></th><th>in Jahren</th><th>bei Outing</th><th>bei Diagnose</th></tr>"
+        "<tr><td>M (SD)</td><td>26.8</td><td>22.9</td><td>23.2</td></tr>"
+        "<tr><td colspan=3>Bei Geburt zugewiesenes Geschlecht</td><td>10 (50)</td></tr>"
+        "<tr><td colspan=3>Wohnort (Bundesland)</td><td>6 (30)</td></tr>"
+        "<tr><td colspan=3>Geschlechtsangleichende Maßnahmen</td><td>20 (100)</td></tr>"
+        "<tr><td colspan=3>abgeschlossen</td><td>8 (40)</td></tr></table>"
+    )
+    translated_markup = (
+        "<table><tr><th colspan=4>Age</th></tr>"
+        "<tr><th></th><th>in years</th><th>at outing</th><th>at diagnosis</th></tr>"
+        "<tr><td>M (SD)</td><td>26.8</td><td>22.9</td><td>23.2</td></tr>"
+        "<tr><td colspan=3>Assigned sex at birth</td><td>10 (50)</td></tr>"
+        "<tr><td colspan=3>Residence (federal state)</td><td>6 (30)</td></tr>"
+        "<tr><td colspan=3>Gender-affirming measures</td><td>20 (100)</td></tr>"
+        "<tr><td colspan=3>completed</td><td>8 (40)</td></tr></table>"
+    )
+    block = Block(
+        id="ruled-colspan-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=translated_markup,
+        bbox=BoundingBox(x0=x_edges[0], y0=y_edges[0], x1=x_edges[-1], y1=y_edges[-1]),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": source_markup,
+            "translated_from_block_ids": ["ruled-colspan-table"],
+            "marker_page_width": 420,
+            "marker_page_height": 230,
+        },
+    )
+    parsed = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+    marker_rows: list[list[TableModel.TableCell]] = []
+    for row_index, row in enumerate(parsed):
+        cells: list[TableModel.TableCell] = []
+        next_column = 0
+        for cell_index, cell in enumerate(row):
+            if row_index == 0:
+                bbox = BoundingBox(x0=30, y0=30, x1=390, y1=52)
+            elif row_index in {1, 2}:
+                bbox = BoundingBox(
+                    x0=x_edges[cell_index],
+                    y0=y_edges[row_index],
+                    x1=x_edges[cell_index + 1],
+                    y1=y_edges[row_index + 1],
+                )
+            else:
+                row_y0 = y_edges[min(row_index, 5)]
+                row_y1 = y_edges[min(row_index + 1, 6)]
+                bbox = (
+                    BoundingBox(x0=30, y0=row_y0, x1=330, y1=row_y1)
+                    if cell_index == 0
+                    else BoundingBox(x0=290, y0=row_y0, x1=390, y1=row_y1)
+                )
+            cells.append(
+                TableModel.TableCell(
+                    text=cell.text,
+                    rowspan=cell.rowspan,
+                    colspan=cell.colspan,
+                    bbox=bbox,
+                    row_index=row_index,
+                    column_index=next_column,
+                )
+            )
+            next_column += cell.colspan
+        marker_rows.append(cells)
+    table = TableModel(
+        id="ruled-colspan-table-model",
+        page_numbers=[1],
+        page=1,
+        bbox=block.bbox,
+        headers=[cell.text for cell in parsed[0]],
+        header_cells=marker_rows[0],
+        rows=[[cell.text for cell in row] for row in parsed[1:]],
+        cells=marker_rows[1:],
+        debug={
+            "marker_block_id": block.id,
+            "cell_coordinate_space": {
+                "name": "marker_page_coordinates",
+                "width": 420,
+                "height": 230,
+            },
+        },
+    )
+    output = tmp_path / "ruled-colspan-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_single_page_table_document(block, tables=[table]),
+        report_path=tmp_path / "ruled-colspan-report.json",
+    )
+
+    strategies = {
+        metadata.get("table_grid_detection")
+        for region in report["regions"]
+        for metadata in region.get("coordinate_metadata", [])
+    }
+    assert strategies == {"pymupdf_find_tables_lines_strict"}
+    assert report["regions_skipped"] == 0
+    with fitz.open(source) as original, fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Assigned sex at birth" in text
+        assert "measures" in text
+        assert "zugewiesenes Geschlecht" not in text
+        assert len(translated[0].get_drawings()) == len(original[0].get_drawings())
+
+    source_image = _render_rgb(source, scale=2)
+    output_image = _render_rgb(output, scale=2)
+    numeric_cells = (
+        round((x_edges[3] + 2) * 2),
+        round((y_edges[2] + 2) * 2),
+        round((x_edges[4] - 2) * 2),
+        round((y_edges[-1] - 2) * 2),
+    )
+    assert source_image.crop(numeric_cells).tobytes() == output_image.crop(
+        numeric_cells
+    ).tobytes()
+
+    difference = ImageChops.difference(source_image, output_image)
+    outside_mask = Image.new("L", difference.size, 255)
+    mask_draw = ImageDraw.Draw(outside_mask)
+    for region in report["regions"]:
+        if region.get("status") != "replaced" or not any(
+            block_id.startswith("ruled-colspan-table#")
+            for block_id in region.get("block_ids", [])
+        ):
+            continue
+        bbox = region["bbox"]
+        mask_draw.rectangle(
+            (
+                round(bbox["x0"] * 2) - 2,
+                round(bbox["y0"] * 2) - 2,
+                round(bbox["x1"] * 2) + 2,
+                round(bbox["y1"] * 2) + 2,
+            ),
+            fill=0,
+        )
+    outside = Image.composite(difference, Image.new("RGB", difference.size), outside_mask)
+    assert outside.getbbox() is None
+
+
+def test_ruled_table_grid_rejects_unexplained_extra_cell_text(tmp_path: Path) -> None:
+    source = tmp_path / "contaminated-table-source.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=150)
+    table_rect = fitz.Rect(30, 30, 270, 100)
+    page.draw_line(table_rect.tl, table_rect.tr, color=(0, 0, 0), width=0.6)
+    page.draw_line(table_rect.bl, table_rect.br, color=(0, 0, 0), width=0.6)
+    page.draw_line(table_rect.tl, table_rect.bl, color=(0, 0, 0), width=0.6)
+    page.draw_line(table_rect.tr, table_rect.br, color=(0, 0, 0), width=0.6)
+    page.insert_text((36, 52), "Kategorie", fontsize=8)
+    page.insert_text((36, 72), "DO NOT DELETE", fontsize=8)
+    pdf.save(source)
+    pdf.close()
+
+    block = Block(
+        id="contaminated-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text="<table><tr><td>Category</td></tr></table>",
+        bbox=BoundingBox(x0=30, y0=30, x1=270, y1=100),
+        reading_order_index=0,
+        source_type=SourceType.EMBEDDED,
+        metadata={
+            "source_text": "<table><tr><td>Kategorie</td></tr></table>",
+            "translated_from_block_ids": ["contaminated-table"],
+        },
+    )
+    output = tmp_path / "contaminated-table-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_single_page_table_document(block),
+        report_path=tmp_path / "contaminated-table-report.json",
+    )
+
+    assert any(
+        region.get("reason") == "table_cell_geometry_unreliable"
+        for region in report["regions"]
+    )
+    assert report["regions_replaced"] == 0
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    with fitz.open(output) as translated:
+        text = translated[0].get_text("text")
+        assert "Kategorie" in text
+        assert "DO NOT DELETE" in text
+        assert "Category" not in text
 
 
 def test_marker_cell_polygons_require_matching_source_topology(tmp_path: Path) -> None:
@@ -854,6 +1379,101 @@ def test_marker_cell_polygons_reject_swapped_and_repeated_regions(tmp_path: Path
             assert strategy == "unavailable"
 
 
+def test_marker_cell_polygons_allow_small_shared_boundary_overlap(tmp_path: Path) -> None:
+    source = tmp_path / "stored-table-fuzzy-boundaries.pdf"
+    source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
+        source
+    )
+    source_rows = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+    table = _stored_horizontal_table(
+        block=block,
+        source_markup=source_markup,
+        x_edges=x_edges,
+        y_edges=y_edges,
+    )
+    for row in [table.header_cells, *table.cells]:
+        for cell in row:
+            assert cell.bbox is not None
+            cell.bbox = BoundingBox(
+                x0=cell.bbox.x0 - 0.4,
+                y0=cell.bbox.y0 - 0.4,
+                x1=cell.bbox.x1 + 0.4,
+                y1=cell.bbox.y1 + 0.4,
+            )
+    assert block.bbox is not None
+
+    with fitz.open(source) as pdf:
+        rows, strategy = OriginalLayoutReconstructor()._stored_table_grid_rows(
+            page=pdf[0],
+            block=block,
+            table=table,
+            source_rows=source_rows,
+            table_bbox=block.bbox,
+        )
+
+    assert rows
+    assert strategy == "marker_table_cell_polygons"
+
+
+def test_table_row_similarity_tolerates_boundary_bleed_into_empty_cells(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "table-boundary-bleed.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=240, height=100)
+    page.insert_text((12, 27), "Heading", fontsize=10)
+    page.insert_text((90, 27), "Value", fontsize=10)
+    page.insert_text((12, 43), "Neighbour", fontsize=10)
+    page.insert_text((90, 43), "42", fontsize=10)
+    doc.save(source)
+    doc.close()
+    rows = OriginalLayoutReconstructor()._parse_table_rows(
+        "<table><tr><td>Heading</td><td>Value</td><td></td></tr></table>"
+    )
+
+    with fitz.open(source) as pdf:
+        score = OriginalLayoutReconstructor()._table_row_similarity(
+            pdf[0],
+            rows[0],
+            [
+                fitz.Rect(10, 15, 88, 46),
+                fitz.Rect(88, 15, 150, 46),
+                fitz.Rect(150, 15, 230, 46),
+            ],
+        )
+
+    assert score >= 0.68
+
+
+def test_table_row_similarity_rejects_short_header_substring_in_wrong_cell(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "table-short-header-mismatch.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=300, height=100)
+    page.insert_text(
+        (12, 27),
+        "Completely unrelated neighbouring paragraph",
+        fontsize=10,
+    )
+    doc.save(source)
+    doc.close()
+    rows = OriginalLayoutReconstructor()._parse_table_rows(
+        "<table><tr><td>N</td></tr></table>"
+    )
+
+    reconstructor = OriginalLayoutReconstructor()
+    with fitz.open(source) as pdf:
+        score = reconstructor._table_row_similarity(
+            pdf[0],
+            rows[0],
+            [fitz.Rect(10, 15, 290, 40)],
+        )
+
+    assert score == 0.0
+    assert reconstructor._table_cell_text_similarity("men", "Women") == 0.0
+
+
 def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) -> None:
     source = tmp_path / "mismatched-horizontal-table.pdf"
     _source_markup, _translated_markup, block, _x_edges, _y_edges = _horizontal_rule_table_source(
@@ -873,8 +1493,7 @@ def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) ->
 
     assert report["regions_replaced"] == 0
     assert any(
-        region.get("reason") == "table_cell_geometry_unreliable"
-        for region in report["regions"]
+        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
     )
     assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
 
@@ -914,6 +1533,370 @@ def test_semantic_table_geometry_rejects_near_tied_partitions(monkeypatch) -> No
         pdf.close()
 
     assert rows == []
+
+
+def _missing_bbox_scan_document(
+    filename: str,
+    *,
+    source_text: str,
+    translated_text: str,
+    page_width: float = 360,
+    page_height: float = 180,
+) -> DocumentModel:
+    block = Block(
+        id="missing-scan-bbox",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text=translated_text,
+        bbox=None,
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        metadata={
+            "source_text": source_text,
+            "translated_from_block_ids": ["missing-scan-bbox"],
+            "bbox_source": "qwen_wrapper_only",
+        },
+    )
+    return DocumentModel(
+        metadata=DocumentMetadata(filename=filename, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=page_width,
+                height=page_height,
+                has_embedded_text=True,
+                embedded_text_quality=0.1,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[block],
+    )
+
+
+def test_hidden_ocr_missing_bbox_is_recovered_by_unique_global_alignment(
+    tmp_path: Path,
+) -> None:
+    source_text = "Los pacientes reciben terapia durante esta fase"
+    translated_text = "Patients receive therapy during this phase"
+    source = tmp_path / "missing-bbox-hidden-ocr.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=360, height=180)
+    page.insert_textbox(
+        fitz.Rect(35, 40, 325, 68),
+        source_text,
+        fontsize=9,
+        render_mode=3,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    output = tmp_path / "missing-bbox-hidden-ocr-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_missing_bbox_scan_document(
+            source.name,
+            source_text=source_text,
+            translated_text=translated_text,
+        ),
+        report_path=tmp_path / "missing-bbox-hidden-ocr-report.json",
+    )
+
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 1
+    assert report["regions_missing_or_invalid_bboxes"] == 0
+    assert report["scan_text_regions_aligned"] == 1
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] is not None
+    assert replaced["source_text_masks"]
+    conversion = replaced["coordinate_metadata"][0]
+    assert conversion["reason"] == "missing_bbox"
+    alignment = replaced["coordinate_metadata"][-1]
+    assert alignment["geometry_source"] == "global_hidden_ocr_alignment_recovered_bbox"
+    assert alignment["bbox_recovered_by_global_hidden_ocr_alignment"] is True
+    assert alignment["preferred_search_extent_pdf"] == {
+        "x0": 0.0,
+        "y0": 0.0,
+        "x1": 360.0,
+        "y1": 180.0,
+    }
+    with fitz.open(output) as translated:
+        assert translated_text in translated[0].get_text("text")
+        assert source_text not in translated[0].get_text("text")
+
+
+def test_hidden_ocr_missing_bbox_ambiguous_global_alignment_is_safely_skipped(
+    tmp_path: Path,
+) -> None:
+    source_text = "Los pacientes reciben terapia durante esta fase"
+    source = tmp_path / "ambiguous-missing-bbox-hidden-ocr.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=360, height=180)
+    for rectangle in (fitz.Rect(35, 30, 325, 58), fitz.Rect(35, 105, 325, 133)):
+        page.insert_textbox(
+            rectangle,
+            source_text,
+            fontsize=9,
+            render_mode=3,
+        )
+    pdf.save(source)
+    pdf.close()
+
+    output = tmp_path / "ambiguous-missing-bbox-hidden-ocr-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_missing_bbox_scan_document(
+            source.name,
+            source_text=source_text,
+            translated_text="Patients receive therapy during this phase",
+        ),
+        report_path=tmp_path / "ambiguous-missing-bbox-hidden-ocr-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["regions_replaced"] == 0
+    assert report["regions_skipped"] == 1
+    assert report["regions_missing_or_invalid_bboxes"] == 1
+    assert report["scan_text_regions_alignment_failed"] == 1
+    skipped = report["regions"][0]
+    assert skipped["reason"] == "hidden_ocr_text_alignment_ambiguous"
+    assert skipped["bbox"] is None
+    assert (
+        skipped["alignment_diagnostics"]["geometry_source"]
+        == "global_hidden_ocr_alignment_recovered_bbox"
+    )
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_hidden_ocr_missing_bbox_no_match_is_safely_skipped(tmp_path: Path) -> None:
+    source = tmp_path / "unmatched-missing-bbox-hidden-ocr.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=360, height=180)
+    page.insert_textbox(
+        fitz.Rect(35, 40, 325, 68),
+        "Contenido completamente diferente sin correspondencia alguna",
+        fontsize=9,
+        render_mode=3,
+    )
+    pdf.save(source)
+    pdf.close()
+
+    output = tmp_path / "unmatched-missing-bbox-hidden-ocr-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_missing_bbox_scan_document(
+            source.name,
+            source_text="Los pacientes reciben terapia durante esta fase",
+            translated_text="Patients receive therapy during this phase",
+        ),
+        report_path=tmp_path / "unmatched-missing-bbox-hidden-ocr-report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    assert report["regions_skipped"] == 1
+    assert report["regions_missing_or_invalid_bboxes"] == 1
+    skipped = report["regions"][0]
+    assert skipped["reason"] in {
+        "hidden_ocr_text_alignment_low_confidence",
+        "hidden_ocr_text_alignment_no_candidate",
+    }
+    assert skipped["bbox"] is None
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_hidden_ocr_missing_bbox_without_hidden_text_retains_page_unchanged(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "missing-bbox-no-hidden-text.pdf"
+    pdf = fitz.open()
+    pdf.new_page(width=360, height=180)
+    pdf.save(source)
+    pdf.close()
+
+    output = tmp_path / "missing-bbox-no-hidden-text-output.pdf"
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_missing_bbox_scan_document(
+            source.name,
+            source_text="Los pacientes reciben terapia durante esta fase",
+            translated_text="Patients receive therapy during this phase",
+        ),
+        report_path=tmp_path / "missing-bbox-no-hidden-text-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["pages_using_fallback_behavior"] == 1
+    assert report["scan_overlay_pages"] == 0
+    assert report["regions_replaced"] == 0
+    assert report["regions"] == []
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "hidden-ocr-table-group.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=320, height=260)
+    x_edges = [30, 160, 290]
+    table_specs = (
+        (
+            "scan-table-a",
+            [30, 60, 90],
+            (("Uno", "Dos"), ("Tres", "Cuatro")),
+            "| Uno | Dos |\n|---|---|\n| Tres | Cuatro |",
+            "| One | Two |\n|---|---|\n| Three | Four |",
+        ),
+        (
+            "scan-table-b",
+            [120, 150, 180],
+            (("Cinco", "Seis"), ("Siete", "Ocho")),
+            "| Cinco | Seis |\n|---|---|\n| Siete | Ocho |",
+            "| Five | Six |\n|---|---|\n| Seven | Eight |",
+        ),
+    )
+    blocks: list[Block] = []
+    for order, (block_id, y_edges, cells, source_markup, translated_markup) in enumerate(
+        table_specs
+    ):
+        for x in x_edges:
+            page.draw_line((x, y_edges[0]), (x, y_edges[-1]), color=(0, 0, 0), width=0.6)
+        for y in y_edges:
+            page.draw_line((x_edges[0], y), (x_edges[-1], y), color=(0, 0, 0), width=0.6)
+        for row_index, row in enumerate(cells):
+            for column_index, text in enumerate(row):
+                page.insert_textbox(
+                    fitz.Rect(
+                        x_edges[column_index] + 4,
+                        y_edges[row_index] + 4,
+                        x_edges[column_index + 1] - 4,
+                        y_edges[row_index + 1] - 4,
+                    ),
+                    text,
+                    fontsize=8,
+                    align=fitz.TEXT_ALIGN_CENTER,
+                    render_mode=3,
+                )
+        blocks.append(
+            Block(
+                id=block_id,
+                page_number=1,
+                block_type=BlockType.TABLE,
+                text=translated_markup,
+                bbox=BoundingBox(
+                    x0=x_edges[0],
+                    y0=y_edges[0],
+                    x1=x_edges[-1],
+                    y1=y_edges[-1],
+                ),
+                reading_order_index=order,
+                source_type=SourceType.OCR,
+                metadata={
+                    "source_text": source_markup.replace("\n", " "),
+                    "source_text_before_cleaning": source_markup,
+                    "translated_from_block_ids": [block_id],
+                },
+            )
+        )
+
+    body_source = "Texto del cuerpo fuera de las dos tablas"
+    body_translation = "Body text outside both tables"
+    page.insert_textbox(
+        fitz.Rect(30, 205, 290, 235),
+        body_source,
+        fontsize=9,
+        render_mode=3,
+    )
+    blocks.append(
+        Block(
+            id="scan-body",
+            page_number=1,
+            block_type=BlockType.PARAGRAPH,
+            text=body_translation,
+            bbox=BoundingBox(x0=30, y0=205, x1=290, y1=235),
+            reading_order_index=2,
+            source_type=SourceType.OCR,
+            metadata={
+                "source_text": body_source,
+                "translated_from_block_ids": ["scan-body"],
+            },
+        )
+    )
+    pdf.save(source)
+    pdf.close()
+
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=320,
+                height=260,
+                has_embedded_text=True,
+                embedded_text_quality=0.1,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=blocks,
+    )
+    reconstructor = OriginalLayoutReconstructor()
+    reconstructor._preflight = (  # type: ignore[method-assign]
+        lambda **kwargs: (
+            (-1.0, 0.5)
+            if kwargs["region"].block_ids[0].startswith("scan-table-b#")
+            else (1.0, 1.0)
+        )
+    )
+    output = tmp_path / "hidden-ocr-table-group-output.pdf"
+    report = reconstructor.reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "hidden-ocr-table-group-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["regions_replaced"] == 1
+    assert report["raster_tables_reconstructed"] == 0
+    assert any(
+        region.get("block_ids") == ["scan-table-b"]
+        and region.get("reason") == "table_atomic_reconstruction_overflow"
+        for region in report["regions"]
+    )
+    retained_sibling = next(
+        region
+        for region in report["regions"]
+        if region.get("reason") == "scan_table_group_retained_after_sibling_failure"
+    )
+    assert retained_sibling["block_ids"] == ["scan-table-a"]
+    assert retained_sibling["bbox"] == {
+        "x0": 30.0,
+        "y0": 30.0,
+        "x1": 290.0,
+        "y1": 90.0,
+    }
+    group_warning = next(
+        warning
+        for warning in report["warnings"]
+        if warning["code"] == "scan_table_group_atomic_fallback"
+    )
+    assert "scan-table-b" in group_warning["reason"]
+    assert "scan-table-a" in group_warning["reason"]
+    with fitz.open(output) as translated:
+        output_text = translated[0].get_text("text")
+        assert body_translation in output_text
+        assert body_source not in output_text
+        assert "Uno" in output_text
+        assert "One" not in output_text
+
+    source_image = _render_rgb(source, scale=2)
+    output_image = _render_rgb(output, scale=2)
+    assert source_image.crop((0, 0, 640, 390)).tobytes() == output_image.crop(
+        (0, 0, 640, 390)
+    ).tobytes()
 
 
 def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Path) -> None:
@@ -970,16 +1953,8 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
     pdf.save(source)
     pdf.close()
 
-    source_table = (
-        "| Diagnostico | N |\n"
-        "|---|---|\n"
-        "| Depresion | 15 |"
-    )
-    translated_table = (
-        "| Diagnosis | N | "
-        "|---|---| "
-        "| Depression | 15 |"
-    )
+    source_table = "| Diagnostico | N |\n|---|---|\n| Depresion | 15 |"
+    translated_table = "| Diagnosis | N | |---|---| | Depression | 15 |"
     table = Block(
         id="ocr-table",
         page_number=1,
@@ -1007,6 +1982,15 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
             "translated_from_block_ids": ["ocr-caption"],
         },
     )
+    untranslated_body = Block(
+        id="untranslated-scan-body",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text="Texto corporal sin traduccion confirmada",
+        bbox=BoundingBox(x0=30, y0=125, x1=200, y1=145),
+        reading_order_index=2,
+        source_type=SourceType.OCR,
+    )
     document = DocumentModel(
         metadata=DocumentMetadata(filename=source.name, page_count=1),
         pages=[
@@ -1019,7 +2003,7 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
                 extraction_mode=SourceType.OCR,
             )
         ],
-        blocks=[table, caption],
+        blocks=[table, caption, untranslated_body],
         figures=[
             FigureAsset(
                 id="figure",
@@ -1050,6 +2034,12 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
     # and symbol cells stay pixel-identical so arrows and annotations survive.
     assert report["scan_text_masks"] == 3
     assert report["pages"][0]["reconstruction_strategy"] == "ocr_table_overlay"
+    assert report["pages"][0]["status"] == "partial"
+    assert any(
+        region.get("block_ids") == ["untranslated-scan-body"]
+        and region.get("reason") == "scan_table_only_non_table_translation_unavailable"
+        for region in report["regions"]
+    )
 
     source_image = _render_rgb(source, scale=2)
     output_image = _render_rgb(output, scale=2)
@@ -1061,6 +2051,8 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
     approved = Image.new("L", source_image.size, 0)
     approved_draw = ImageDraw.Draw(approved)
     for region in report["regions"]:
+        if region.get("status") != "replaced":
+            continue
         assert region["source_text_masks"]
         for box in [region["bbox"], *region["source_text_masks"]]:
             approved_draw.rectangle(
@@ -1079,6 +2071,85 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
         approved,
     )
     assert outside_difference.getbbox() is None
+
+
+def test_redaction_guard_preserves_figure_when_caption_box_touches_boundary(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    output = tmp_path / "translated.pdf"
+    _create_original_layout_source(source)
+    document = _original_layout_document()
+    caption = next(block for block in document.blocks if block.id == "caption")
+    caption.bbox = BoundingBox(x0=60, y0=280, x1=340, y1=325)
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "report.json",
+    )
+
+    caption_region = next(
+        region for region in report["regions"] if region.get("block_ids") == ["caption"]
+    )
+    assert all(mask["y0"] >= 281 for mask in caption_region["applied_redaction_bboxes"])
+    source_image = _render_rgb(source, scale=3)
+    output_image = _render_rgb(output, scale=3)
+    figure_box = (180, 300, 1020, 840)
+    assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
+
+
+def test_invalid_figure_bbox_is_reported_and_not_counted_as_preserved(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source.pdf"
+    pdf = fitz.open()
+    pdf.new_page(width=100, height=100)
+    pdf.save(source)
+    pdf.close()
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename=source.name, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=100,
+                height=100,
+                has_embedded_text=False,
+                embedded_text_quality=0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[],
+        figures=[
+            FigureAsset(
+                id="outside-figure",
+                page_number=1,
+                bbox=BoundingBox(x0=90, y0=10, x1=120, y1=50),
+            )
+        ],
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=tmp_path / "output.pdf",
+        document=document,
+        report_path=tmp_path / "report.json",
+    )
+
+    assert report["figures_preserved"] == 0
+    assert report["regions_missing_or_invalid_bboxes"] == 1
+    assert any(
+        warning["code"] == "figure_lock_region_invalid" for warning in report["warnings"]
+    )
+
+
+def test_source_character_count_uses_visible_table_text() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+
+    assert reconstructor._source_character_count(
+        '<table class="data"><tr><th>Edad media</th><td>32</td></tr></table>'
+    ) == len("Edad media 32")
 
 
 def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -> None:
@@ -1166,6 +2237,9 @@ def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -
     assert report["pages"][0]["reconstruction_strategy"] == "ocr_text_overlay"
     replaced = next(region for region in report["regions"] if region["status"] == "replaced")
     assert replaced["bbox"]["y0"] < 70
+    assert replaced["source_character_count"] == len("Texto fuente correcto segunda linea completa")
+    assert replaced["source_text_mask_count"] == len(replaced["source_text_masks"])
+    assert replaced["applied_redaction_bboxes"] == replaced["source_text_masks"]
     alignment = replaced["coordinate_metadata"][-1]
     assert alignment["geometry_source"] == "hidden_ocr_contiguous_line_alignment"
     assert alignment["surya_region_bbox_pdf"]["y0"] > 120
@@ -1215,20 +2289,14 @@ def test_hidden_ocr_body_does_not_treat_clipped_neighbor_glyphs_as_columns() -> 
         decoy_y0 = line.bbox.y0 - 12
         decoy_y1 = line.bbox.y0 + 1
         for word_index, x0 in enumerate((321.0, 386.0, 464.0)):
-            words.append(
-                (x0, decoy_y0, x0 + 5, decoy_y1, "q", 99, line_index, word_index)
-            )
+            words.append((x0, decoy_y0, x0 + 5, decoy_y1, "q", 99, line_index, word_index))
 
     class _ClippedWordPage:
         def get_text(self, kind: str, *, clip=None, sort=False):
             assert kind == "words"
             if clip is None:
                 return words
-            return [
-                word
-                for word in words
-                if fitz.Rect(*word[:4]).intersects(fitz.Rect(clip))
-            ]
+            return [word for word in words if fitz.Rect(*word[:4]).intersects(fitz.Rect(clip))]
 
     assert not reconstructor._scan_match_has_multicolumn_text(_ClippedWordPage(), lines)
 
@@ -1379,10 +2447,13 @@ def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -
     assert diagnostics["length_coverage"] < 1.0
     assert "prefix_score" in diagnostics
     assert "suffix_score" in diagnostics
-    assert ImageChops.difference(
-        _render_rgb(source, scale=2),
-        _render_rgb(output, scale=2),
-    ).getbbox() is None
+    assert (
+        ImageChops.difference(
+            _render_rgb(source, scale=2),
+            _render_rgb(output, scale=2),
+        ).getbbox()
+        is None
+    )
 
 
 def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -> None:
@@ -1423,15 +2494,9 @@ def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -
     pdf.save(source)
     pdf.close()
 
-    source_table = (
-        "| Source header words | |\n"
-        "|---|---|\n"
-        "| Second source label | value here |"
-    )
+    source_table = "| Source header words | |\n|---|---|\n| Second source label | value here |"
     translated_table = (
-        "| Source header words | Invented text |\n"
-        "|---|---|\n"
-        "| Second source label | value here |"
+        "| Source header words | Invented text |\n|---|---|\n| Second source label | value here |"
     )
     table = Block(
         id="unsafe-empty-cell",
@@ -1489,13 +2554,15 @@ def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -
         for region in report["regions"]
     )
     assert any(
-        region.get("reason") == "caption_hidden_ocr_text_mismatch"
-        for region in report["regions"]
+        region.get("reason") == "caption_hidden_ocr_text_mismatch" for region in report["regions"]
     )
-    assert ImageChops.difference(
-        _render_rgb(source, scale=2),
-        _render_rgb(output, scale=2),
-    ).getbbox() is None
+    assert (
+        ImageChops.difference(
+            _render_rgb(source, scale=2),
+            _render_rgb(output, scale=2),
+        ).getbbox()
+        is None
+    )
 
 
 def test_scan_background_sampling_preserves_light_cell_colour(tmp_path: Path) -> None:
@@ -1619,10 +2686,13 @@ def test_table_overflow_is_atomic_across_all_cells(
         region.get("reason") == "table_atomic_reconstruction_overflow"
         for region in report["regions"]
     )
-    assert ImageChops.difference(
-        _render_rgb(source, scale=2),
-        _render_rgb(output, scale=2),
-    ).getbbox() is None
+    assert (
+        ImageChops.difference(
+            _render_rgb(source, scale=2),
+            _render_rgb(output, scale=2),
+        ).getbbox()
+        is None
+    )
 
     postflight_reconstructor = OriginalLayoutReconstructor()
     postflight_reconstructor._preflight = (  # type: ignore[method-assign]
@@ -1655,14 +2725,14 @@ def test_table_overflow_is_atomic_across_all_cells(
         warning["code"] == "page_reconstruction_rolled_back"
         for warning in postflight_report["warnings"]
     )
-    assert all(
-        entry["status"] == "rolled_back"
-        for entry in postflight_report["scaling_applied"]
+    assert all(entry["status"] == "rolled_back" for entry in postflight_report["scaling_applied"])
+    assert (
+        ImageChops.difference(
+            _render_rgb(source, scale=2),
+            _render_rgb(postflight_output, scale=2),
+        ).getbbox()
+        is None
     )
-    assert ImageChops.difference(
-        _render_rgb(source, scale=2),
-        _render_rgb(postflight_output, scale=2),
-    ).getbbox() is None
 
 
 def test_unreliable_table_structure_is_retained_with_warning(tmp_path: Path) -> None:

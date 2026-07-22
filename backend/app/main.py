@@ -5,6 +5,7 @@ import shutil
 import sys
 import time
 import types
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -320,6 +321,14 @@ def _mark_interrupted_processing_jobs_cancelled() -> int:
 
 
 def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
+    with job_store.artifact_generation_lock(job_id):
+        return _ensure_pdf_artifact_locked(job_id, artifact_type)
+
+
+def _ensure_pdf_artifact_locked(job_id: str, artifact_type: str) -> Path:
+    # Read only after acquiring the generation lock. A preceding request may
+    # have refreshed figure assets or registered another PDF mode while this
+    # request was waiting.
     status = job_store.load_status(job_id)
     if status.stage != JobStage.COMPLETE:
         raise HTTPException(
@@ -372,34 +381,47 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
                 artifact_dir=artifacts_dir / "figures",
                 extraction_metadata=extraction_metadata,
             )
-            json_path.write_text(document.model_dump_json(indent=2), encoding="utf-8")
+            _write_text_atomically(json_path, document.model_dump_json(indent=2))
         report_path = artifacts_dir / "reconstruction_report_original_layout.json"
-        report = original_layout_reconstructor.reconstruct(
-            source_pdf_path=source_pdf,
-            output_pdf_path=pdf_path,
-            document=document,
-            report_path=report_path,
-        )
-        artifacts = dict(status.artifacts)
-        artifacts[key] = str(pdf_path)
-        artifacts["reconstruction_report"] = str(report_path)
-        translation = dict(status.translation)
-        translation["original_layout_reconstruction"] = {
+        staged_pdf_path = _temporary_artifact_path(pdf_path)
+        staged_report_path = _temporary_artifact_path(report_path)
+        try:
+            report = original_layout_reconstructor.reconstruct(
+                source_pdf_path=source_pdf,
+                output_pdf_path=staged_pdf_path,
+                document=document,
+                report_path=staged_report_path,
+            )
+            staged_pdf_path.replace(pdf_path)
+            report["output_pdf"] = str(pdf_path.resolve())
+            _write_text_atomically(
+                report_path,
+                json.dumps(report, ensure_ascii=False, indent=2),
+            )
+        finally:
+            staged_pdf_path.unlink(missing_ok=True)
+            staged_report_path.unlink(missing_ok=True)
+        reconstruction_metadata = {
             "status": report["status"],
             "pages_successfully_reconstructed": report["pages_successfully_reconstructed"],
             "pages_using_fallback_behavior": report["pages_using_fallback_behavior"],
             "warning_count": len(report["warnings"]),
         }
-        warnings = list(translation.get("warnings") or [])
+        warning = None
         if report["status"] != "complete":
             warning = (
                 "Original-layout reconstruction is partial; unchanged pages and skipped regions are "
                 "listed in the reconstruction report. Use the readable PDF as the safe fallback."
             )
-            if warning not in warnings:
-                warnings.append(warning)
-        translation["warnings"] = warnings
-        job_store.update_status(job_id, artifacts=artifacts, translation=translation)
+        job_store.merge_status(
+            job_id,
+            artifacts={
+                key: str(pdf_path),
+                "reconstruction_report": str(report_path),
+            },
+            translation={"original_layout_reconstruction": reconstruction_metadata},
+            translation_warnings=[warning] if warning else None,
+        )
         return pdf_path
 
     started = time.perf_counter()
@@ -417,13 +439,17 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
     markdown_loaded = time.perf_counter()
     html = reconstructor.markdown_to_html(markdown_text, title=status.filename, output_mode=mode)
     html_built = time.perf_counter()
-    if pdf_path.exists():
-        pdf_path.unlink()
-    reconstructor.html_to_pdf(html, pdf_path)
+    staged_pdf_path = _temporary_artifact_path(pdf_path)
+    try:
+        reconstructor.html_to_pdf(html, staged_pdf_path)
+        staged_pdf_path.replace(pdf_path)
+    finally:
+        staged_pdf_path.unlink(missing_ok=True)
     completed = time.perf_counter()
 
     profile_path = artifacts_dir / f"pdf_generation_profile_{mode}.json"
-    profile_path.write_text(
+    _write_text_atomically(
+        profile_path,
         (
             "{\n"
             f'  "mode": "{mode}",\n'
@@ -433,15 +459,28 @@ def _ensure_pdf_artifact(job_id: str, artifact_type: str) -> Path:
             f'  "total_s": {completed - started:.6f}\n'
             "}\n"
         ),
-        encoding="utf-8",
     )
-    artifacts = dict(status.artifacts)
-    artifacts[key] = str(pdf_path)
-    artifacts[f"pdf_profile_{mode}"] = str(profile_path)
+    artifact_updates = {
+        key: str(pdf_path),
+        f"pdf_profile_{mode}": str(profile_path),
+    }
     if artifact_type == "pdf":
-        artifacts["pdf"] = str(pdf_path)
-    job_store.update_status(job_id, artifacts=artifacts)
+        artifact_updates["pdf"] = str(pdf_path)
+    job_store.merge_status(job_id, artifacts=artifact_updates)
     return pdf_path
+
+
+def _temporary_artifact_path(path: Path) -> Path:
+    return path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp{path.suffix}")
+
+
+def _write_text_atomically(path: Path, value: str) -> None:
+    temporary_path = _temporary_artifact_path(path)
+    try:
+        temporary_path.write_text(value, encoding="utf-8")
+        temporary_path.replace(path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _figure_assets_need_refresh(document) -> bool:

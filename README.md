@@ -15,10 +15,17 @@ This browser-based app translates PDFs locally.
    stored cells, partial-rule and whitespace-separated tables can recover their logical grid from
    PDF text geometry only when every source cell has one unambiguous, monotonic alignment.
    Structurally collapsed ruled tables are also checked against the source PDF and repaired from an
-   exact clipped PyMuPDF grid only when the source text strongly agrees.
+   exact clipped PyMuPDF grid only when the source text strongly agrees. Qwen Markdown tables are
+   converted to stable HTML before translation; narrowly ragged rows may be repaired by adding
+   empty cells only. On hidden-OCR pages, a plain-text two-column region is promoted to a table only
+   when Surya table confidence, a repeated physical gutter, and Qwen-to-hidden-text alignment all
+   agree.
 9. Figure regions are deduplicated, validated, associated with captions, and captured as
    high-resolution PNG previews plus clipped vector SVG assets when the source supports them.
 10. A local MLX Qwen model translates the document into English.
+    Substantive output is checked for source-language residue, unchanged source text, and damaged
+    table topology. One stricter English-only retry is attempted; if it still fails, the source is
+    retained and the failure is recorded instead of claiming a successful translation.
 11. The browser presents the readable PDF and conservative original-layout PDF as the two primary
     results after translation completes. Structured Markdown, JSON, faithful reconstruction, and
     diagnostic artifacts remain available to the backend and existing API routes without
@@ -198,6 +205,40 @@ PYTHONPATH=backend .venv/bin/python scripts/build_pdf_regression_corpus.py
 PYTHONPATH=backend .venv/bin/pytest -q tests/test_pdf_regression_corpus.py
 ```
 
+With a development server already running, execute selected cases through the real upload, queue,
+translation, readable-PDF, and original-layout-PDF routes:
+
+```bash
+.venv/bin/python scripts/run_pdf_regression_workflows.py \
+  --base-url http://127.0.0.1:8000 \
+  --case fr-digital-gender-psychiatry \
+  --case es-hidden-ocr-endocrinology \
+  --output-dir workspace/regression_runs/manual
+```
+
+Omit every `--case` argument to run all ten cases. The runner never starts, stops, cancels, or
+deletes server jobs. It writes an atomic run manifest and downloads only the two user-facing PDF
+modes after each job reaches a terminal stage. Every downloaded PDF is opened with PyMuPDF and
+must contain at least one page with valid geometry before the runner records it as successful. If
+the built corpus manifest records a fixture checksum or page count, the runner verifies both before
+uploading and refuses a modified or incomplete fixture.
+Completed job directories can then be audited without invoking either model:
+
+```bash
+.venv/bin/python scripts/evaluate_pdf_regression_runs.py \
+  workspace/jobs \
+  --json-output workspace/regression_runs/manual/evaluation.json \
+  --markdown-output workspace/regression_runs/manual/evaluation.md
+```
+
+The evaluator checks artifact integrity (including opening figure previews), coordinate-space-aware
+structured figure/table boxes, exact original-page geometry, report-count consistency, reported
+skips/overflow/scaling, expected source/extraction page counts, visible-source-character-weighted
+replacement coverage, and severe punctuation-only or near-empty translation collapses. It remains
+a diagnostic command and exits successfully after writing a report even when the report contains
+review failures. It explicitly does not claim to score translation meaning or rendered visual
+fidelity; representative PDFs still need rendering and visual inspection.
+
 See `tests/regression_corpus/README.md` for provenance, storage, and source-path overrides. The
 artifact validation test skips on machines where the private corpus has not been built; the tracked
 ten-case specification is always tested.
@@ -246,6 +287,15 @@ ten-case specification is always tested.
   from translated text alone. A failure in any cell retains the
   complete source table instead of producing a partially translated grid. Such tables can still be
   translated as reflowed structured content in the readable PDF when OCR recovered their rows.
+- OCR table repair is deliberately narrow. Ragged Markdown is accepted only when a dominant width
+  is close to every row and repair consists solely of inserting missing empty cells. Hidden-OCR
+  two-column inference requires at least four aligned rows, stable gutter support, concise cell
+  contents, and strong source-text agreement. OCR character mistakes (for example a misread table
+  number) are preserved rather than replaced through language- or document-specific rules.
+- Translation validation is a safety net, not a reference-quality metric. Confidently failed
+  chunks are retried once and then retained with an explicit warning. Short headings, names,
+  citations, formulas, and link-only blocks are exempt where language detection would be
+  unreliable. Human review is still required for terminology and fluency.
 - Translated text that cannot fit at the minimum 60% scale is reported and the source region is
   retained instead of silently deleting text or shrinking it to an unreadable size.
 - Figure detection follows Marker/Surya structured regions. False-positive visual regions or missed

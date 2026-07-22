@@ -5,6 +5,7 @@ __pycache__/
 workspace/jobs/
 workspace/ocr_region_debug/
 workspace/regression_corpus/
+workspace/regression_runs/
 workspace/tests/
 *.pyc
 .DS_Store

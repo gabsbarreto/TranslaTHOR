@@ -12,6 +12,7 @@ from app.models.schema import (
     TableModel,
 )
 from app.services.markdown_builder import MarkdownBuilder
+from app.services.reconstructor import Reconstructor
 from app.services.table_markup import parse_table_rows
 
 
@@ -44,6 +45,33 @@ def test_markdown_builder_renders_structured_table_html() -> None:
     assert "<table class=\"structured-table\">" in markdown
     assert "<th>A</th>" in markdown
     assert "<td>x</td>" in markdown
+
+
+def test_markdown_builder_marks_long_tables_as_fragmentable() -> None:
+    rows = [[f"Row {index}", str(index)] for index in range(20)]
+    table = TableModel(
+        id="long-table",
+        page_numbers=[1],
+        headers=["Label", "Value"],
+        rows=rows,
+        cells=[
+            [TableModel.TableCell(text=cell) for cell in row]
+            for row in rows
+        ],
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="long.pdf", page_count=1),
+        pages=[],
+        blocks=[],
+        tables=[table],
+    )
+
+    markdown = MarkdownBuilder().build(document)
+    html = Reconstructor().markdown_to_html(markdown)
+
+    assert '<figure class="document-table document-table--long">' in markdown
+    assert "figure.document-table--long" in html
+    assert "break-inside: auto" in html
 
 
 def test_flattened_ocr_table_translation_replaces_stale_table_model_once() -> None:

@@ -121,6 +121,11 @@ class TranslationChunk(BaseModel):
     translated_text: str = ""
     context: str = ""
     source_language: str | None = None
+    source_language_origin: str | None = None
+    source_language_confidence: float | None = None
+    placement_group_id: str | None = None
+    placement_index: int | None = None
+    placement_count: int | None = None
     source_token_count: int | None = None
     chunk_type: str = "paragraph"
     document_id: str | None = None

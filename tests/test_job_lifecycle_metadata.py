@@ -188,6 +188,127 @@ def test_queue_persists_structured_position_and_terminal_timestamps(
     assert completed.completed_at is not None
 
 
+def test_status_reads_remain_valid_during_concurrent_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = _store(monkeypatch, tmp_path)
+    job_id, _ = store.create_job("concurrent.pdf")
+    finished = threading.Event()
+    read_errors: list[Exception] = []
+
+    def writer() -> None:
+        for index in range(100):
+            store.update_status(job_id, progress=index / 100, message=f"Update {index}")
+        finished.set()
+
+    thread = threading.Thread(target=writer)
+    thread.start()
+    while not finished.is_set():
+        try:
+            store.load_status(job_id)
+        except Exception as exc:  # pragma: no cover - assertion captures the race
+            read_errors.append(exc)
+            break
+    thread.join(timeout=2)
+
+    assert not thread.is_alive()
+    assert read_errors == []
+    assert store.load_status(job_id).message == "Update 99"
+
+
+def test_delete_waits_for_lock_borrowers_and_prunes_job_locks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = _store(monkeypatch, tmp_path)
+    job_id, job_dir = store.create_job("locked-delete.pdf")
+    lock_held = threading.Event()
+    release_lock = threading.Event()
+    delete_finished = threading.Event()
+    delete_result: list[bool] = []
+
+    def hold_artifact_lock() -> None:
+        with store.artifact_generation_lock(job_id):
+            lock_held.set()
+            assert release_lock.wait(timeout=2)
+
+    def delete() -> None:
+        delete_result.append(store.delete_job(job_id))
+        delete_finished.set()
+
+    holder = threading.Thread(target=hold_artifact_lock)
+    holder.start()
+    assert lock_held.wait(timeout=2)
+    deleter = threading.Thread(target=delete)
+    deleter.start()
+    _wait_for(lambda: store._artifact_generation_locks[job_id].users == 2)
+
+    assert job_dir.exists()
+    assert not delete_finished.is_set()
+    release_lock.set()
+    holder.join(timeout=2)
+    deleter.join(timeout=2)
+
+    assert not holder.is_alive()
+    assert not deleter.is_alive()
+    assert delete_result == [True]
+    assert not job_dir.exists()
+    assert job_id not in store._status_locks
+    assert job_id not in store._artifact_generation_locks
+
+
+def test_clear_jobs_prunes_all_per_job_locks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = _store(monkeypatch, tmp_path)
+    job_ids = [store.create_job(filename)[0] for filename in ("one.pdf", "two.pdf")]
+    for job_id in job_ids:
+        with store.artifact_generation_lock(job_id):
+            pass
+
+    assert set(store._status_locks) == set(job_ids)
+    assert set(store._artifact_generation_locks) == set(job_ids)
+    assert store.clear_jobs() == 2
+    assert store._status_locks == {}
+    assert store._artifact_generation_locks == {}
+
+
+def test_merge_status_preserves_existing_metadata_and_deduplicates_warnings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = _store(monkeypatch, tmp_path)
+    job_id, _ = store.create_job("merge.pdf")
+    store.update_status(
+        job_id,
+        artifacts={"json": "structured.json"},
+        translation={"model": "test-model", "warnings": ["existing warning"]},
+    )
+
+    store.merge_status(
+        job_id,
+        artifacts={"pdf_readable": "translated.pdf"},
+        translation={"original_layout_reconstruction": {"status": "partial"}},
+        translation_warnings=["existing warning", "partial reconstruction"],
+        message="Artifacts generated",
+    )
+
+    status = store.load_status(job_id)
+    assert status.artifacts == {
+        "json": "structured.json",
+        "pdf_readable": "translated.pdf",
+    }
+    assert status.translation["model"] == "test-model"
+    assert status.translation["original_layout_reconstruction"] == {"status": "partial"}
+    assert status.translation["warnings"] == [
+        "existing warning",
+        "partial reconstruction",
+    ]
+    assert status.message == "Artifacts generated"
+
+
 def test_archive_routes_filter_and_individual_delete_is_guarded(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

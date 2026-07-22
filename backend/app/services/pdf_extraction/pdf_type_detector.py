@@ -5,6 +5,7 @@ import re
 from pathlib import Path
 
 from app.services.pdf_extraction.models import PDFTypeDetectionResult, PageTextStats
+from app.utils.pdf_metadata import optional_pdf_metadata_text
 
 try:
     from pypdf import PdfReader
@@ -187,8 +188,8 @@ class PDFTypeDetector:
             warnings=warnings,
             metadata={
                 "filename": pdf_path.name,
-                "title": metadata.get("/Title"),
-                "author": metadata.get("/Author"),
+                "title": optional_pdf_metadata_text(metadata.get("/Title")),
+                "author": optional_pdf_metadata_text(metadata.get("/Author")),
                 "meaningful_page_ratio": round(meaningful_ratio, 4),
                 "garbled_page_ratio": round(garbled_ratio, 4),
                 "scanned_page_ratio": round(scanned_ratio, 4),

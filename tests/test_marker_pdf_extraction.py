@@ -12,6 +12,7 @@ from app.services.pdf_extraction.marker_extractor import PDFExtractor
 from app.services.pdf_extraction.models import PDFTypeDetectionResult, PageTextStats
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
+from app.services.pdf_inspector import PdfInspector
 
 
 fitz = pytest.importorskip("fitz")
@@ -34,6 +35,37 @@ def test_pdf_type_detector_classifies_digital_text(tmp_path: Path) -> None:
     assert result.classification == "digital_good_text"
     assert result.meaningful_page_count == 1
     assert result.embedded_text_words > 40
+
+
+def test_pdf_type_detector_discards_explicit_null_metadata(tmp_path: Path) -> None:
+    pypdf = pytest.importorskip("pypdf")
+    pdf_path = tmp_path / "null-metadata.pdf"
+    source_path = tmp_path / "source.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=612, height=792)
+    page.insert_textbox(
+        fitz.Rect(72, 72, 540, 720),
+        ("Texte numérique normal avec suffisamment de mots pour la détection. " * 20),
+        fontsize=11,
+    )
+    doc.save(source_path)
+    doc.close()
+
+    reader = pypdf.PdfReader(str(source_path))
+    writer = pypdf.PdfWriter()
+    writer.append_pages_from_reader(reader)
+    writer._info.get_object()[pypdf.generic.NameObject("/Author")] = (  # noqa: SLF001
+        pypdf.generic.NullObject()
+    )
+    with pdf_path.open("wb") as output:
+        writer.write(output)
+
+    result = PDFTypeDetector().detect(pdf_path)
+    inspection = PdfInspector().inspect(pdf_path)
+
+    assert result.classification == "digital_good_text"
+    assert result.metadata["author"] is None
+    assert inspection.author is None
 
 
 def test_pdf_type_detector_classifies_scanned_image_only(tmp_path: Path) -> None:
@@ -91,6 +123,141 @@ def test_marker_subprocess_failure_is_clear(tmp_path: Path, monkeypatch: pytest.
         extractor.extract(tmp_path / "input.pdf", job_dir=tmp_path, keep_debug_artifacts=True)
 
     assert (tmp_path / "marker" / "marker_failure.json").exists()
+
+
+def test_marker_debug_json_does_not_replace_primary_document_payload(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    marker_bin = tmp_path / "fake_marker_with_debug.py"
+    marker_bin.write_text(
+        """#!/usr/bin/env python3
+import json
+import sys
+from pathlib import Path
+source = Path(sys.argv[1])
+out = Path(sys.argv[sys.argv.index("--output_dir") + 1]) / source.stem
+out.mkdir(parents=True, exist_ok=True)
+(out / "blocks.json").write_text(json.dumps([{
+  "block_type": "2", "text": "fine grained debug span"
+}]), encoding="utf-8")
+(out / f"{source.stem}_meta.json").write_text(json.dumps({
+  "debug_data_path": "blocks.json"
+}), encoding="utf-8")
+(out / f"{source.stem}.json").write_text(json.dumps({
+  "block_type": "Document",
+  "children": [{
+    "id": "/page/0/Page/1", "block_type": "Page",
+    "polygon": [[0, 0], [600, 0], [600, 800], [0, 800]],
+    "children": [{
+      "id": "/page/0/Text/1", "block_type": "Text",
+      "html": "<p>Canonical semantic paragraph.</p>",
+      "polygon": [[50, 60], [550, 60], [550, 100], [50, 100]]
+    }]
+  }]
+}), encoding="utf-8")
+""",
+        encoding="utf-8",
+    )
+    marker_bin.chmod(0o755)
+    monkeypatch.setenv("MARKER_BIN", str(marker_bin))
+
+    result = PDFExtractor(detector=_FakeDetector("digital_good_text")).extract(
+        tmp_path / "input.pdf",
+        job_dir=tmp_path,
+        keep_debug_artifacts=True,
+    )
+
+    assert [block["text"] for block in result.blocks] == ["Canonical semantic paragraph."]
+    assert result.blocks[0]["bbox"] == {"x0": 50.0, "y0": 60.0, "x1": 550.0, "y1": 100.0}
+    assert "fine grained debug span" not in result.markdown
+
+
+def test_marker_payload_selection_rejects_debug_only_json(tmp_path: Path) -> None:
+    output = tmp_path / "output" / "input"
+    output.mkdir(parents=True)
+    (output / "blocks.json").write_text(
+        json.dumps(
+            [
+                {
+                    "block_type": "8",
+                    "children": [
+                        {
+                            "block_type": "2",
+                            "polygon": {"bbox": [0, 0, 100, 20]},
+                        }
+                    ],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (output / "input_meta.json").write_text("{}", encoding="utf-8")
+
+    selected = PDFExtractor()._find_marker_payload(  # noqa: SLF001
+        tmp_path / "output",
+        "json",
+        source_stem="input",
+    )
+
+    assert selected is None
+
+
+def test_marker_payload_selection_uses_nested_canonical_shape(tmp_path: Path) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    (output / "unrelated.json").write_text(json.dumps({"status": "ok"}), encoding="utf-8")
+    canonical = output / "nested" / "converted.json"
+    canonical.parent.mkdir()
+    canonical.write_text(
+        json.dumps(
+            {
+                "block_type": "Document",
+                "children": [
+                    {
+                        "block_type": "Page",
+                        "children": [
+                            {"block_type": "Text", "text": "Canonical content"}
+                        ],
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    selected = PDFExtractor()._find_marker_payload(  # noqa: SLF001
+        output,
+        "json",
+        source_stem="input",
+    )
+
+    assert selected == canonical
+
+
+def test_marker_builder_rejects_numeric_debug_object_graph() -> None:
+    debug_payload = [
+        {
+            "block_type": "8",
+            "children": [
+                {
+                    "block_type": "2",
+                    "text": "Debug span",
+                    "polygon": {"bbox": [0, 0, 100, 20]},
+                }
+            ],
+        }
+    ]
+
+    with pytest.raises(ValueError, match="refusing to interpret debug spans"):
+        MarkerDocumentBuilder().build_document(
+            marker_payload=debug_payload,
+            detection=_FakeDetector("digital_good_text").detect(Path("input.pdf")),
+            filename="input.pdf",
+            source_type=SourceType.EMBEDDED,
+            parser_metadata={},
+            warnings=[],
+        )
 
 
 def test_marker_force_ocr_accelerator_failure_retries_on_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -249,6 +416,94 @@ def test_marker_builder_ignores_tablegroup_wrapper_tables() -> None:
     assert "*Table 1. Demographic data*" in markdown
     assert "<td>Age</td><td>53</td>" in markdown
     assert len([chunk for chunk in chunks if "<table" in chunk.original_text]) == 1
+
+
+def test_marker_builder_anchors_trailing_table_footnote_without_sorting_page() -> None:
+    detection = PDFTypeDetectionResult(
+        classification="digital_good_text",
+        page_count=1,
+        pages=[_page_stats(1)],
+        embedded_text_chars=1000,
+        embedded_text_words=160,
+        meaningful_page_count=1,
+        garbled_page_count=0,
+        image_dominant_page_count=0,
+        scanned_page_count=0,
+        mixed=False,
+    )
+    marker_payload = [
+        {
+            "id": "/page/0/Page/0",
+            "block_type": "Page",
+            "children": [
+                {
+                    "id": "/page/0/TableGroup/1",
+                    "block_type": "TableGroup",
+                    "polygon": [[40, 50], [540, 50], [540, 360], [40, 360]],
+                    "children": [
+                        {
+                            "id": "/page/0/Table/2",
+                            "block_type": "Table",
+                            "html": "<table><tr><td>Value</td></tr></table>",
+                            "polygon": [[40, 50], [540, 50], [540, 340], [40, 340]],
+                        },
+                        {
+                            "id": "/page/0/Footnote/3",
+                            "block_type": "Footnote",
+                            "text": "First table note.",
+                            "polygon": [[50, 342], [300, 342], [300, 351], [50, 351]],
+                        },
+                    ],
+                },
+                {
+                    "id": "/page/0/Text/4",
+                    "block_type": "Text",
+                    "text": "First column body.",
+                    "polygon": [[40, 410], [280, 410], [280, 600], [40, 600]],
+                },
+                {
+                    "id": "/page/0/Text/5",
+                    "block_type": "Text",
+                    "text": "Second column body.",
+                    "polygon": [[300, 410], [540, 410], [540, 600], [300, 600]],
+                },
+                {
+                    "id": "/page/0/PageFooter/6",
+                    "block_type": "PageFooter",
+                    "text": "Journal footer.",
+                    "polygon": [[40, 760], [540, 760], [540, 772], [40, 772]],
+                },
+                {
+                    "id": "/page/0/Footnote/7",
+                    "block_type": "Footnote",
+                    "text": "Second table note.",
+                    "polygon": [[50, 361], [390, 361], [390, 371], [50, 371]],
+                },
+            ],
+        }
+    ]
+
+    document, markdown, chunks = MarkerDocumentBuilder().build_document(
+        marker_payload=marker_payload,
+        detection=detection,
+        filename="paper.pdf",
+        source_type=SourceType.EMBEDDED,
+        parser_metadata={},
+        warnings=[],
+    )
+
+    assert [block.id for block in document.blocks] == [
+        "/page/0/Table/2",
+        "/page/0/Footnote/3",
+        "/page/0/Footnote/7",
+        "/page/0/Text/4",
+        "/page/0/Text/5",
+        "/page/0/PageFooter/6",
+    ]
+    assert markdown.count("First table note.") == 1
+    assert markdown.count("Second table note.") == 1
+    assert markdown.index("Second table note.") < markdown.index("First column body.")
+    assert [chunk.block_ids[0] for chunk in chunks] == [block.id for block in document.blocks]
 
 
 def test_marker_builder_normalizes_one_column_table_caption_html() -> None:
@@ -800,6 +1055,36 @@ def test_qwen_fallback_uses_rendered_png_metadata_for_ocr_input(tmp_path: Path) 
     assert metadata["ocr_image_mode"] == "rendered_page_png"
     assert metadata["ocr_image_width"] == 400
     assert metadata["ocr_image_height"] == 200
+
+
+def test_marker_document_language_sampling_includes_late_document_regions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.services.pdf_extraction import markdown_builder as marker_builder_module
+
+    captured: list[str] = []
+    monkeypatch.setattr(
+        marker_builder_module,
+        "detect",
+        lambda text: captured.append(text) or "de",
+    )
+    blocks = [
+        _paragraph_block("abstract", "English abstract terminology. " * 600),
+        *[
+            _paragraph_block(
+                f"german-{index}",
+                f"SPÄTERER-DEUTSCHER-ABSCHNITT-{index} Klinische Behandlung und Forschung.",
+            )
+            for index in range(20)
+        ],
+    ]
+
+    language = MarkerDocumentBuilder()._detect_language(blocks)
+
+    assert language == "de"
+    assert len(captured) == 1
+    assert "SPÄTERER-DEUTSCHER-ABSCHNITT-19" in captured[0]
+    assert len(captured[0]) <= 50_000
 
 
 def test_qwen_fallback_preserves_full_page_margins_before_ocr(tmp_path: Path) -> None:

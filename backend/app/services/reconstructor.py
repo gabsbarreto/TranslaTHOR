@@ -85,6 +85,12 @@ class Reconstructor:
       break-before: avoid;
     }}
     figure.document-table .table-notes {{ display: block; margin-top: .35em; }}
+    figure.document-table--long,
+    figure.document-table--long table,
+    figure.document-table--long tbody {{
+      page-break-inside: auto;
+      break-inside: auto;
+    }}
     em {{ color: #2d2d2d; }}
     small {{ color: #666; font-size: 9pt; }}
     .page-marker {{ column-span: all; break-before: page; height: 0; overflow: hidden; }}

@@ -336,31 +336,40 @@ class TranslationPipeline:
             logger.info("Translation started")
             logger.info("Translation chunks: %s", len(result.chunks))
             translation_started = time.perf_counter()
+            translation_progress = 0.7
 
             def on_chunk_translated(index: int, total: int, preview: str) -> None:
-                partial_progress = 0.7 + (0.18 * (index / max(total, 1)))
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=True),
+                )
                 safe_preview = preview if preview else "(empty output)"
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.88), 3),
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: {safe_preview}",
                 )
 
             def on_chunk_started(index: int, total: int) -> None:
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=False),
+                )
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=0.7,
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: translating...",
                 )
 
             def on_table_progress(index: int, total: int, label: str) -> None:
-                partial_progress = 0.88 + (0.08 * (index / max(total, 1)))
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.96), 3),
+                    progress=translation_progress,
                     message=f"Tables {index}/{total}: {label}",
                 )
 
@@ -384,6 +393,11 @@ class TranslationPipeline:
                 return
 
             translated_document = DocumentModel.model_validate_json(json_path.read_text(encoding="utf-8"))
+            # Translation can add safe-retention warnings (for example when an
+            # English-only retry still returns source-language prose). Surface
+            # those through the normal job-details warning channel as well as
+            # the structured artifact.
+            result.warnings = list(translated_document.warnings)
             comparison_json, comparison_md = write_translation_comparison_report(
                 source_path=source_md_path,
                 translated_path=md_path,
@@ -502,6 +516,17 @@ class TranslationPipeline:
             pages = int(event.get("pages") or 0)
             return 0.5, f"Qwen OCR completed for {pages} page(s)"
         return None
+
+    def _translation_chunk_progress(
+        self,
+        index: int,
+        total: int,
+        *,
+        completed: bool,
+    ) -> float:
+        completed_chunks = index if completed else index - 1
+        fraction = max(0, completed_chunks) / max(total, 1)
+        return round(min(0.7 + (0.18 * fraction), 0.88), 3)
 
     def _update_status(self, job_id: str, **updates: object) -> bool:
         try:

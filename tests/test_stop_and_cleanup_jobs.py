@@ -44,6 +44,9 @@ def test_cleanup_terminal_removes_cancelled_and_failed_jobs(monkeypatch: pytest.
     store.update_status(cancelled_job_id, stage=JobStage.CANCELLED, progress=1.0)
     store.update_status(failed_job_id, stage=JobStage.FAILED, progress=1.0)
     store.update_status(active_job_id, stage=JobStage.OCR_LAYOUT, progress=0.5)
+    for job_id in (cancelled_job_id, failed_job_id, active_job_id):
+        with store.artifact_generation_lock(job_id):
+            pass
 
     result = main.clear_terminal_jobs()
 
@@ -51,3 +54,8 @@ def test_cleanup_terminal_removes_cancelled_and_failed_jobs(monkeypatch: pytest.
     assert not cancelled_dir.exists()
     assert not failed_dir.exists()
     assert active_dir.exists()
+    for removed_job_id in (cancelled_job_id, failed_job_id):
+        assert removed_job_id not in store._status_locks
+        assert removed_job_id not in store._artifact_generation_locks
+    assert active_job_id in store._status_locks
+    assert active_job_id in store._artifact_generation_locks

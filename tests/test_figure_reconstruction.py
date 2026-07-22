@@ -209,7 +209,7 @@ def test_only_external_caption_is_translated(monkeypatch) -> None:
     monkeypatch.setattr(
         translator,
         "_translate_chunk_with_validation",
-        lambda text, _context, _language, _block_type: f"ENGLISH {text}",
+        lambda text, _context, _language, _block_type, **_kwargs: f"ENGLISH {text}",
     )
 
     chunks = translator.build_chunks(document)
@@ -264,6 +264,66 @@ def test_readable_pdf_embeds_figure_once_with_translated_caption(tmp_path: Path)
         visual_count = sum(len(page.get_drawings()) + len(page.get_images()) for page in output)
         assert "Translated external caption" in text
         assert visual_count > 0
+
+
+def test_readable_pdf_suppresses_qwen_remote_image_when_local_asset_exists(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "vector.pdf"
+    _create_vector_figure_pdf(pdf_path)
+    document = FigureExtractionService().extract(
+        pdf_path=pdf_path,
+        document=_vector_document(),
+        artifact_dir=tmp_path / "figures",
+    )
+    figure_block = next(block for block in document.blocks if block.id == "figure-region")
+    # Exercise the renderer's defensive path for a Qwen image wrapper that was
+    # misclassified as prose before its local figure crop was materialised.
+    figure_block.block_type = BlockType.PARAGRAPH
+    figure_block.text = (
+        "![Generated chart description]"
+        "(https://example.invalid/generated-placeholder.png)"
+    )
+    figure_block.metadata["parser"] = "qwen_surya_full_page_ocr"
+
+    markdown = MarkdownBuilder().build(document)
+
+    assert "example.invalid" not in markdown
+    assert "Generated chart description" not in markdown
+    assert markdown.count('<figure class="document-figure"') == 1
+    assert "figure-p0001-001" in markdown
+
+
+def test_readable_pdf_keeps_qwen_alt_text_when_local_figure_asset_is_missing(
+    tmp_path: Path,
+) -> None:
+    document = _vector_document()
+    figure_block = next(block for block in document.blocks if block.id == "figure-region")
+    figure_block.text = (
+        "![Generated chart description]"
+        "(https://example.invalid/generated-placeholder.png)"
+    )
+    document.figures[0].image_path = str(tmp_path / "missing-figure.png")
+
+    markdown = MarkdownBuilder().build(document)
+
+    assert "example.invalid" not in markdown
+    assert "[Image unavailable: Generated chart description]" in markdown
+    assert '<figure class="document-figure"' not in markdown
+
+
+def test_readable_pdf_preserves_unrelated_remote_markdown_image() -> None:
+    document = _vector_document()
+    mention = next(block for block in document.blocks if block.id == "mention")
+    mention.text = "![Publisher logo](https://static.example.org/publisher-logo.png)"
+    mention.metadata["parser"] = "marker"
+
+    markdown = MarkdownBuilder().build(document)
+
+    assert (
+        "![Publisher logo](https://static.example.org/publisher-logo.png)" in markdown
+    )
+    assert "Image unavailable" not in markdown
 
 
 def test_figure_moves_after_reliable_first_mention(tmp_path: Path) -> None:

@@ -10,6 +10,13 @@ try:
 except Exception:  # pragma: no cover - lightweight test environments may omit langdetect
     detect = None
 
+try:
+    from langdetect import DetectorFactory
+
+    DetectorFactory.seed = 0
+except (ImportError, AttributeError):  # pragma: no cover - lightweight compatibility
+    pass
+
 from app.models.schema import (
     Block,
     BlockType,
@@ -38,6 +45,11 @@ class MarkerDocumentBuilder:
         warnings: list[str],
     ) -> tuple[DocumentModel, str, list[ExtractionChunk]]:
         pages_payload = self._page_payloads(marker_payload)
+        if not pages_payload and not isinstance(marker_payload, str):
+            raise ValueError(
+                "Marker JSON does not contain canonical symbolic Document/Page blocks; "
+                "refusing to interpret debug spans as document content."
+            )
         blocks: list[Block] = []
         figures: list[FigureAsset] = []
         tables: list[TableModel] = []
@@ -230,18 +242,36 @@ class MarkerDocumentBuilder:
         if isinstance(payload, dict):
             if str(payload.get("block_type", "")).lower() == "document":
                 children = payload.get("children") or []
-                return [item for item in children if isinstance(item, dict)]
-            if "children" in payload:
+                return [
+                    item
+                    for item in children
+                    if isinstance(item, dict)
+                    and str(item.get("block_type", "")).lower() == "page"
+                ]
+            if (
+                str(payload.get("block_type", "")).lower() == "page"
+                and isinstance(payload.get("children"), list)
+            ):
                 return [payload]
             if "pages" in payload and isinstance(payload["pages"], list):
-                return [item for item in payload["pages"] if isinstance(item, dict)]
+                return [
+                    item
+                    for item in payload["pages"]
+                    if isinstance(item, dict)
+                    and str(item.get("block_type", "")).lower() == "page"
+                ]
         if isinstance(payload, list):
-            pages = [item for item in payload if isinstance(item, dict) and str(item.get("block_type", "")).lower() == "page"]
-            return pages or [item for item in payload if isinstance(item, dict)]
+            return [
+                item
+                for item in payload
+                if isinstance(item, dict)
+                and str(item.get("block_type", "")).lower() == "page"
+                and isinstance(item.get("children"), list)
+            ]
         return []
 
     def _iter_content_blocks(self, node: dict[str, Any]):
-        children = node.get("children")
+        children = self._ordered_children(node)
         if not isinstance(children, list):
             return
         for child in children:
@@ -259,6 +289,115 @@ class MarkerDocumentBuilder:
                 # duplicates the same text in Markdown and translation chunks.
                 continue
             yield from self._iter_content_blocks(child)
+
+    def _ordered_children(self, node: dict[str, Any]) -> list[Any] | None:
+        """Keep Marker order, except for unambiguous table/figure notes.
+
+        Marker normally emits a sound multi-column reading order, so sorting all
+        blocks by coordinates would be destructive. Some versions nevertheless
+        leave a direct Caption or Footnote at the end of a page even when its box
+        is immediately beside a TableGroup or FigureGroup. Move only those
+        strongly anchored notes and leave every other child in Marker order.
+        """
+
+        children = node.get("children")
+        if not isinstance(children, list):
+            return None
+        if str(node.get("block_type", "")).casefold() != "page":
+            return children
+
+        anchor_types = {
+            "tablegroup",
+            "formgroup",
+            "figuregroup",
+            "picturegroup",
+            "table",
+            "form",
+            "figure",
+            "picture",
+            "handwriting",
+        }
+        note_types = {"caption", "footnote"}
+        anchors: list[tuple[int, BoundingBox]] = []
+        for index, child in enumerate(children):
+            if not isinstance(child, dict):
+                continue
+            if str(child.get("block_type", "")).casefold() not in anchor_types:
+                continue
+            bbox = self._bbox_from_polygon(self._polygon(child))
+            if bbox is not None and bbox.x1 > bbox.x0 and bbox.y1 > bbox.y0:
+                anchors.append((index, bbox))
+
+        if not anchors:
+            return children
+
+        attached: dict[int, dict[str, list[tuple[float, int, Any]]]] = {}
+        claimed: set[int] = set()
+        for note_index, child in enumerate(children):
+            if not isinstance(child, dict):
+                continue
+            if str(child.get("block_type", "")).casefold() not in note_types:
+                continue
+            note_bbox = self._bbox_from_polygon(self._polygon(child))
+            if note_bbox is None or note_bbox.x1 <= note_bbox.x0 or note_bbox.y1 <= note_bbox.y0:
+                continue
+
+            note_width = note_bbox.x1 - note_bbox.x0
+            note_height = note_bbox.y1 - note_bbox.y0
+            max_gap = max(24.0, note_height * 2.5)
+            best: tuple[float, int, str] | None = None
+            for anchor_index, anchor_bbox in anchors:
+                if anchor_index == note_index:
+                    continue
+                overlap = max(
+                    0.0,
+                    min(note_bbox.x1, anchor_bbox.x1) - max(note_bbox.x0, anchor_bbox.x0),
+                )
+                anchor_width = anchor_bbox.x1 - anchor_bbox.x0
+                if overlap / max(1.0, min(note_width, anchor_width)) < 0.5:
+                    continue
+
+                if note_bbox.y0 >= anchor_bbox.y1:
+                    gap = note_bbox.y0 - anchor_bbox.y1
+                    position = "after"
+                elif anchor_bbox.y0 >= note_bbox.y1:
+                    gap = anchor_bbox.y0 - note_bbox.y1
+                    position = "before"
+                else:
+                    continue
+                if gap > max_gap:
+                    continue
+
+                horizontal_offset = abs(
+                    (note_bbox.x0 + note_bbox.x1) / 2
+                    - (anchor_bbox.x0 + anchor_bbox.x1) / 2
+                ) / max(1.0, anchor_width)
+                score = gap + horizontal_offset
+                if best is None or score < best[0]:
+                    best = (score, anchor_index, position)
+
+            if best is None:
+                continue
+            _, anchor_index, position = best
+            attached.setdefault(anchor_index, {"before": [], "after": []})[position].append(
+                (note_bbox.y0, note_index, child)
+            )
+            claimed.add(note_index)
+
+        if not claimed:
+            return children
+
+        ordered: list[Any] = []
+        for index, child in enumerate(children):
+            if index in claimed:
+                continue
+            placement = attached.get(index)
+            if placement:
+                ordered.extend(item[2] for item in sorted(placement["before"]))
+            ordered.append(child)
+            if placement:
+                ordered.extend(item[2] for item in sorted(placement["after"]))
+        return ordered
 
     def _page_number(self, page_payload: dict[str, Any], fallback: int) -> int:
         for key in ("page_number", "page", "page_id"):
@@ -679,7 +818,7 @@ class MarkerDocumentBuilder:
         return blocks, chunks
 
     def _detect_language(self, blocks: list[Block]) -> str | None:
-        text = "\n".join(block.text for block in blocks if block.text.strip())[:5000]
+        text = self._document_language_sample(blocks)
         if len(text.strip()) < 20:
             return None
         try:
@@ -688,6 +827,32 @@ class MarkerDocumentBuilder:
             return detect(text)
         except Exception:
             return None
+
+    def _document_language_sample(self, blocks: list[Block]) -> str:
+        texts = [" ".join(block.text.split()) for block in blocks if block.text.strip()]
+        if not texts:
+            return ""
+
+        # Sample the whole reading order so a long bilingual abstract on page 1
+        # cannot determine the language for the rest of the paper. Cap both the
+        # number of regions and each region's contribution for predictable cost.
+        max_blocks = 500
+        if len(texts) > max_blocks:
+            last_index = len(texts) - 1
+            texts = [
+                texts[round(index * last_index / (max_blocks - 1))]
+                for index in range(max_blocks)
+            ]
+        budget = 50_000
+        per_block = max(1, (budget - len(texts)) // len(texts))
+        sampled: list[str] = []
+        for text in texts:
+            if len(text) <= per_block:
+                sampled.append(text)
+                continue
+            head = per_block // 2
+            sampled.append(f"{text[:head]} {text[-(per_block - head - 1):]}")
+        return "\n".join(sampled)[:budget]
 
 
 class _HTMLTextExtractor(HTMLParser):

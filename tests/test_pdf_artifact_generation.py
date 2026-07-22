@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -184,6 +187,107 @@ class _FakeOriginalLayoutReconstructor:
         }
 
 
+class _GenerationTracker:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.active = 0
+        self.maximum_active = 0
+        self.calls = 0
+
+    def begin(self) -> int:
+        with self._lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            self.calls += 1
+            return self.calls
+
+    def finish(self) -> None:
+        with self._lock:
+            self.active -= 1
+
+
+class _TrackedReadableReconstructor(_FakeReconstructor):
+    def __init__(self, tracker: _GenerationTracker) -> None:
+        super().__init__()
+        self.tracker = tracker
+
+    def html_to_pdf(self, html_text: str, pdf_path: Path) -> None:
+        call_number = self.tracker.begin()
+        try:
+            time.sleep(0.05)
+            self.html_to_pdf_calls += 1
+            pdf_path.write_text(
+                f"readable-call={call_number}; {html_text}",
+                encoding="utf-8",
+            )
+        finally:
+            self.tracker.finish()
+
+
+class _TrackedOriginalLayoutReconstructor:
+    def __init__(self, tracker: _GenerationTracker) -> None:
+        self.tracker = tracker
+
+    def reconstruct(
+        self,
+        *,
+        source_pdf_path: Path,
+        output_pdf_path: Path,
+        document: DocumentModel,
+        report_path: Path,
+    ) -> dict:
+        del source_pdf_path, document
+        call_number = self.tracker.begin()
+        try:
+            time.sleep(0.05)
+            output_pdf_path.write_bytes(f"%PDF-original-call={call_number}".encode())
+            report_path.write_text("{}", encoding="utf-8")
+            return {
+                "status": "partial",
+                "pages_successfully_reconstructed": 0,
+                "pages_using_fallback_behavior": 1,
+                "warnings": [{"reason": "synthetic warning"}],
+                "generation_call": call_number,
+            }
+        finally:
+            self.tracker.finish()
+
+
+def _completed_dual_mode_job(store: JobStore) -> tuple[str, Path]:
+    job_id, job_dir = store.create_job("Concurrent.pdf")
+    (job_dir / "input.pdf").write_bytes(b"source")
+    structured_path = job_dir / "artifacts" / "structured.json"
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="Concurrent.pdf", page_count=0),
+        pages=[],
+        blocks=[],
+    )
+    structured_path.write_text(document.model_dump_json(), encoding="utf-8")
+    store.update_status(
+        job_id,
+        stage=JobStage.COMPLETE,
+        artifacts={
+            "json": str(structured_path),
+            "preexisting": str(job_dir / "artifacts" / "preexisting.txt"),
+        },
+        translation={"existing_metadata": "preserved", "warnings": ["existing warning"]},
+    )
+    return job_id, job_dir
+
+
+def _run_concurrently(job_id: str, artifact_types: tuple[str, str]) -> list[Path]:
+    barrier = threading.Barrier(3)
+
+    def generate(artifact_type: str) -> Path:
+        barrier.wait(timeout=2)
+        return main._ensure_pdf_artifact(job_id, artifact_type)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(generate, artifact_type) for artifact_type in artifact_types]
+        barrier.wait(timeout=2)
+        return [future.result(timeout=5) for future in futures]
+
+
 def test_original_layout_artifact_and_report_are_registered(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -221,6 +325,75 @@ def test_original_layout_artifact_and_report_are_registered(
     assert Path(status.artifacts["reconstruction_report"]).is_file()
     assert status.translation["original_layout_reconstruction"]["status"] == "partial"
     assert any("safe fallback" in warning for warning in status.translation["warnings"])
+
+
+def test_concurrent_readable_and_original_generation_preserve_both_status_updates(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(job_store_module, "JOBS_DIR", jobs_dir)
+    store = JobStore()
+    tracker = _GenerationTracker()
+    monkeypatch.setattr(main, "job_store", store)
+    monkeypatch.setattr(main, "reconstructor", _TrackedReadableReconstructor(tracker))
+    monkeypatch.setattr(
+        main,
+        "original_layout_reconstructor",
+        _TrackedOriginalLayoutReconstructor(tracker),
+    )
+    job_id, _job_dir = _completed_dual_mode_job(store)
+
+    paths = _run_concurrently(
+        job_id,
+        ("pdf_readable", "pdf_original_layout"),
+    )
+
+    status = store.load_status(job_id)
+    assert all(path.is_file() for path in paths)
+    assert tracker.maximum_active == 1
+    assert status.artifacts["pdf_readable"] in {str(path) for path in paths}
+    assert status.artifacts["pdf_original_layout"] in {str(path) for path in paths}
+    assert Path(status.artifacts["reconstruction_report"]).is_file()
+    assert "pdf_profile_readable" in status.artifacts
+    assert "preexisting" in status.artifacts
+    assert status.translation["existing_metadata"] == "preserved"
+    assert status.translation["warnings"].count("existing warning") == 1
+    assert sum("safe fallback" in warning for warning in status.translation["warnings"]) == 1
+
+
+def test_duplicate_original_layout_generation_is_serialized_and_uses_safe_staging_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(job_store_module, "JOBS_DIR", jobs_dir)
+    store = JobStore()
+    tracker = _GenerationTracker()
+    monkeypatch.setattr(main, "job_store", store)
+    monkeypatch.setattr(
+        main,
+        "original_layout_reconstructor",
+        _TrackedOriginalLayoutReconstructor(tracker),
+    )
+    job_id, job_dir = _completed_dual_mode_job(store)
+
+    paths = _run_concurrently(
+        job_id,
+        ("pdf_original_layout", "pdf_original_layout"),
+    )
+
+    assert paths[0] == paths[1]
+    assert tracker.calls == 2
+    assert tracker.maximum_active == 1
+    assert paths[0].read_bytes() == b"%PDF-original-call=2"
+    report_path = job_dir / "artifacts" / "reconstruction_report_original_layout.json"
+    assert '"generation_call": 2' in report_path.read_text(encoding="utf-8")
+    assert list((job_dir / "artifacts").glob(".*.tmp.*")) == []
+    warnings = store.load_status(job_id).translation["warnings"]
+    assert sum("safe fallback" in warning for warning in warnings) == 1
 
 
 def test_original_layout_route_accepts_hyphenated_mode(

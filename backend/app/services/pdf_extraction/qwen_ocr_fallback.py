@@ -140,6 +140,12 @@ class QwenFullPageOCRFallback:
                 on_process_finished=on_process_finished,
                 on_ocr_progress=on_ocr_progress,
             )
+            self._attach_embedded_text_geometry(
+                pdf_path=pdf_path,
+                inspection=inspection,
+                manifest=surya_layout_manifest,
+                manifest_path=surya_layout_dir / "layout.json",
+            )
             ocr_image_paths = self._surya_boxed_page_paths(
                 surya_layout_manifest,
                 expected_pages=len(image_paths),
@@ -435,6 +441,119 @@ class QwenFullPageOCRFallback:
         if not manifest_path.exists():
             raise RuntimeError("Surya layout detection did not write layout.json.")
         return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def _attach_embedded_text_geometry(
+        self,
+        *,
+        pdf_path: Path,
+        inspection,
+        manifest: dict,
+        manifest_path: Path,
+    ) -> None:
+        """Add auditable hidden-OCR word positions to the Surya manifest.
+
+        A full-page image can have a useful hidden OCR layer even though that
+        layer must not be trusted as the visible source.  We use its word
+        positions only as an independent alignment signal for Qwen's text.
+        The visible page image remains the OCR source of truth.
+        """
+
+        try:
+            import fitz
+        except Exception:  # pragma: no cover - PyMuPDF is a runtime dependency
+            return
+
+        attached_pages = 0
+        try:
+            source = fitz.open(pdf_path)
+        except Exception:
+            return
+        try:
+            inspection_pages = {
+                int(page.page_number): page for page in getattr(inspection, "pages", [])
+            }
+            for page_manifest in manifest.get("pages", []):
+                page_number = int(page_manifest.get("page_index", 0) or 0)
+                page_inspection = inspection_pages.get(page_number)
+                if (
+                    page_number < 1
+                    or page_number > len(source)
+                    or page_inspection is None
+                    or not bool(page_inspection.has_embedded_text)
+                    or float(page_inspection.embedded_text_quality or 0.0) < 0.55
+                ):
+                    continue
+
+                page = source[page_number - 1]
+                if int(page.rotation or 0) % 360 != 0:
+                    page_manifest["embedded_text_geometry"] = {
+                        "available": False,
+                        "reason": "rotated_page_not_supported_for_alignment",
+                    }
+                    continue
+                page_width = float(page.rect.width)
+                page_height = float(page.rect.height)
+                rendered_width = float(page_manifest.get("width", 0) or 0)
+                rendered_height = float(page_manifest.get("height", 0) or 0)
+                if min(page_width, page_height, rendered_width, rendered_height) <= 0:
+                    continue
+                scale_x = rendered_width / page_width
+                scale_y = rendered_height / page_height
+                words: list[dict] = []
+                try:
+                    page_words = page.get_text("words", sort=False)
+                except Exception:
+                    page_words = []
+                for word in page_words:
+                    if len(word) < 5 or not str(word[4]).strip():
+                        continue
+                    try:
+                        x0, y0, x1, y1 = (float(word[index]) for index in range(4))
+                    except (TypeError, ValueError):
+                        continue
+                    if x1 <= x0 or y1 <= y0:
+                        continue
+                    words.append(
+                        {
+                            "text": str(word[4]),
+                            "bbox": [
+                                round(x0 * scale_x, 4),
+                                round(y0 * scale_y, 4),
+                                round(x1 * scale_x, 4),
+                                round(y1 * scale_y, 4),
+                            ],
+                            "block": int(word[5]) if len(word) > 5 else None,
+                            "line": int(word[6]) if len(word) > 6 else None,
+                            "word": int(word[7]) if len(word) > 7 else None,
+                        }
+                    )
+                if not words:
+                    continue
+                page_manifest["embedded_text_geometry"] = {
+                    "available": True,
+                    "usage": "alignment_only",
+                    "coordinate_space": {
+                        "name": "surya_rendered_pixels",
+                        "width": rendered_width,
+                        "height": rendered_height,
+                        "source_page_width": page_width,
+                        "source_page_height": page_height,
+                        "scale_x": scale_x,
+                        "scale_y": scale_y,
+                    },
+                    "word_count": len(words),
+                    "words": words,
+                }
+                attached_pages += 1
+        finally:
+            source.close()
+
+        manifest["embedded_text_geometry_page_count"] = attached_pages
+        if attached_pages:
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
 
     def _resolve_worker_python_executable(self) -> str:
         configured = os.getenv("QWEN_OCR_PYTHON")
