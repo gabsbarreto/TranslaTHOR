@@ -1,35 +1,37 @@
 # Local PDF regression corpus
 
-This specification produces five compact non-English digital PDF fixtures and five scan-only
-counterparts. Each pair has the same pages and dimensions, so extraction and reconstruction changes
-can be compared without conflating document content with scan quality.
+The core corpus contains five non-English digital PDFs and five non-English scan PDFs selected
+from the private files in `workspace/tests/`. It covers German, Spanish, French, and Brazilian
+Portuguese documents with multi-column prose, tables, charts, a flowchart, captions, page
+decorations, and imperfect text mappings.
 
-The two source collections currently contain only three non-English-dominant publications and no
-non-English scan-dominant documents. The five cases therefore select complementary, verified
-non-English page ranges from those publications and derive a raster-only copy of each case. The
-cases cover Spanish and French front matter, multi-column prose, tables, charts, a flowchart, and
-captions.
+The scan set deliberately exercises both scan paths:
 
-The publication PDFs and their derived fixtures are deliberately not tracked in Git. The repository
-is public and the source files do not all grant redistribution rights. Instead, Git tracks:
+- two genuine full-page-image scans retain their noisy hidden OCR and must classify as
+  `bad_hidden_ocr`;
+- three digital fixtures are rendered as raster-only PDFs with no OCR text layer and must classify
+  as `scanned_no_text`.
+
+The source files include exactly five usable digital documents but only two genuine scans. The
+derived German, Spanish, and French scans complete the five-case scan set while providing known
+visual counterparts for pixel and geometry comparisons. The selected page ranges omit irrelevant
+English lending covers and keep the corpus compact.
+
+The source publications and generated fixtures are deliberately not tracked in Git. The repository
+is public and the source files do not all grant redistribution rights. Git instead tracks:
 
 - `corpus_spec.json`, including source SHA-256 hashes and original page numbers;
 - `scripts/build_pdf_regression_corpus.py`, which refuses changed source files;
-- `tests/test_pdf_regression_corpus.py`, which validates the local corpus when it is present.
+- `tests/test_pdf_regression_corpus.py`, which validates every local artifact when present.
 
-Build the corpus from the two local RQ collections:
+Build and validate the corpus:
 
 ```bash
 PYTHONPATH=backend .venv/bin/python scripts/build_pdf_regression_corpus.py
-```
-
-The generated corpus is stored in `workspace/regression_corpus/` and contains `digital/`,
-`scanned/`, and `manifest.json`. Run its validation independently with:
-
-```bash
 PYTHONPATH=backend .venv/bin/pytest -q tests/test_pdf_regression_corpus.py
 ```
 
-On machines without the private source collection, the specification test still runs and the local
-artifact test is skipped. Override either source root or the output directory with the builder's
-command-line options.
+Generated files are stored in `workspace/regression_corpus/` under `digital/`, `scanned/`, and
+`manifest.json`. On machines without the private source files, the specification test still runs
+and artifact validation is skipped. Use `--source-dir` or `--output-dir` to override either local
+path.

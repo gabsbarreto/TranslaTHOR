@@ -32,13 +32,12 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _full_page_image_ratio(page: fitz.Page) -> float:
+def _page_image_coverage(page: fitz.Page) -> float:
     page_area = max(page.rect.get_area(), 1.0)
-    largest = 0.0
+    image_area = 0.0
     for image in page.get_images(full=True):
-        for rect in page.get_image_rects(image[0]):
-            largest = max(largest, min(rect.get_area() / page_area, 1.0))
-    return largest
+        image_area += sum(rect.get_area() for rect in page.get_image_rects(image[0]))
+    return min(image_area / page_area, 1.0)
 
 
 def _page_visual_difference(digital_page: fitz.Page, scanned_page: fitz.Page) -> float:
@@ -58,20 +57,43 @@ def _page_visual_difference(digital_page: fitz.Page, scanned_page: fitz.Page) ->
     return sum(channel_means) / len(channel_means)
 
 
-def test_regression_corpus_spec_defines_five_non_english_pairs() -> None:
+def test_regression_corpus_spec_defines_five_digital_and_five_scan_cases() -> None:
     spec = _load_json(SPEC_PATH)
-    cases = spec["cases"]
+    digital_cases = spec["digital_cases"]
+    scanned_cases = spec["scanned_cases"]
+    all_cases = digital_cases + scanned_cases
+    digital_ids = {case["id"] for case in digital_cases}
 
-    assert spec["schema_version"] == 1
-    assert len(cases) == 5
-    assert len({case["id"] for case in cases}) == 5
-    assert {case["language"] for case in cases} == {"es", "fr"}
-    assert all(case["language"] != "en" for case in cases)
-    assert all(case["language_profile"] == "non_english_pages" for case in cases)
-    assert all(case["source_pages"] for case in cases)
-    assert all(case["minimum_embedded_characters"] >= 1000 for case in cases)
-    assert all(case["features"] for case in cases)
-    assert all(SHA256_PATTERN.fullmatch(case["source_sha256"]) for case in cases)
+    assert spec["schema_version"] == 2
+    assert len(digital_cases) == 5
+    assert len(scanned_cases) == 5
+    assert len({case["id"] for case in all_cases}) == 10
+    assert {case["language"] for case in digital_cases} == {"de", "es", "fr", "pt"}
+    assert {case["language"] for case in scanned_cases} == {"de", "es", "fr", "pt"}
+    assert all(case["language"] != "en" for case in all_cases)
+    assert all(case["features"] for case in all_cases)
+    assert all(case["expected_page_count"] >= 4 for case in all_cases)
+    assert all(
+        SHA256_PATTERN.fullmatch(case["source_sha256"])
+        for case in digital_cases
+    )
+
+    authentic_scans = [
+        case for case in scanned_cases if case["build_mode"] == "copy_hidden_ocr"
+    ]
+    derived_scans = [
+        case for case in scanned_cases if case["build_mode"] == "rasterize_digital"
+    ]
+    assert len(authentic_scans) == 2
+    assert len(derived_scans) == 3
+    assert all(SHA256_PATTERN.fullmatch(case["source_sha256"]) for case in authentic_scans)
+    assert all(case["derived_from"] in digital_ids for case in derived_scans)
+    assert all(
+        case["expected_classification"] == "bad_hidden_ocr" for case in authentic_scans
+    )
+    assert all(
+        case["expected_classification"] == "scanned_no_text" for case in derived_scans
+    )
 
 
 def test_local_regression_corpus_integrity_and_pdf_classification() -> None:
@@ -82,47 +104,80 @@ def test_local_regression_corpus_integrity_and_pdf_classification() -> None:
 
     spec = _load_json(SPEC_PATH)
     manifest = _load_json(MANIFEST_PATH)
-    cases_by_id = {case["id"]: case for case in manifest["cases"]}
+    digital_specs = {case["id"]: case for case in spec["digital_cases"]}
+    scanned_specs = {case["id"]: case for case in spec["scanned_cases"]}
+    digital_cases = {case["id"]: case for case in manifest["digital_cases"]}
+    scanned_cases = {case["id"]: case for case in manifest["scanned_cases"]}
 
-    assert manifest["schema_version"] == 1
-    assert manifest["counts"] == {"cases": 5, "digital": 5, "scanned": 5}
+    assert manifest["schema_version"] == 2
+    assert manifest["counts"] == {
+        "digital": 5,
+        "scanned": 5,
+        "authentic_hidden_ocr": 2,
+        "derived_raster": 3,
+    }
     assert manifest["spec_sha256"] == _sha256(SPEC_PATH)
-    assert set(cases_by_id) == {case["id"] for case in spec["cases"]}
-    expected_filenames = {f"{case_id}.pdf" for case_id in cases_by_id}
-    assert {path.name for path in (CORPUS_ROOT / "digital").glob("*.pdf")} == expected_filenames
-    assert {path.name for path in (CORPUS_ROOT / "scanned").glob("*.pdf")} == expected_filenames
+    assert set(digital_cases) == set(digital_specs)
+    assert set(scanned_cases) == set(scanned_specs)
+    assert {path.name for path in (CORPUS_ROOT / "digital").glob("*.pdf")} == {
+        f"{case_id}.pdf" for case_id in digital_specs
+    }
+    assert {path.name for path in (CORPUS_ROOT / "scanned").glob("*.pdf")} == {
+        f"{case_id}.pdf" for case_id in scanned_specs
+    }
 
     detector = PDFTypeDetector()
-    for case_spec in spec["cases"]:
-        case = cases_by_id[case_spec["id"]]
+    digital_paths: dict[str, Path] = {}
+    for case_id, case_spec in digital_specs.items():
+        case = digital_cases[case_id]
+        fixture = case["fixture"]
+        path = CORPUS_ROOT / fixture["path"]
+        digital_paths[case_id] = path
+        assert path.is_file()
+        assert _sha256(path) == fixture["sha256"]
         assert case["language"] == case_spec["language"]
-        assert case["digital"]["detected_language"] == case_spec["language"]
+        assert fixture["detected_language"] == case_spec["language"]
         assert case["source"]["sha256"] == case_spec["source_sha256"]
         assert case["source"]["pages"] == case_spec["source_pages"]
 
-        digital_path = CORPUS_ROOT / case["digital"]["path"]
-        scanned_path = CORPUS_ROOT / case["scanned"]["path"]
-        assert digital_path.is_file()
-        assert scanned_path.is_file()
-        assert _sha256(digital_path) == case["digital"]["sha256"]
-        assert _sha256(scanned_path) == case["scanned"]["sha256"]
+        detection = detector.detect(path)
+        assert detection.classification == "digital_good_text"
+        assert detection.page_count == case_spec["expected_page_count"]
+        assert detection.embedded_text_chars >= case_spec["minimum_embedded_characters"]
 
-        digital_detection = detector.detect(digital_path)
-        scanned_detection = detector.detect(scanned_path)
-        assert digital_detection.classification == "digital_good_text"
-        assert scanned_detection.classification == "scanned_no_text"
-        assert digital_detection.embedded_text_chars >= case_spec[
-            "minimum_embedded_characters"
-        ]
-        assert scanned_detection.embedded_text_chars == 0
+    for case_id, case_spec in scanned_specs.items():
+        case = scanned_cases[case_id]
+        fixture = case["fixture"]
+        path = CORPUS_ROOT / fixture["path"]
+        assert path.is_file()
+        assert _sha256(path) == fixture["sha256"]
+        assert case["build_mode"] == case_spec["build_mode"]
+        assert case["language"] == case_spec["language"]
 
-        with fitz.open(digital_path) as digital_pdf, fitz.open(scanned_path) as scanned_pdf:
-            assert digital_pdf.page_count == scanned_pdf.page_count == len(
-                case_spec["source_pages"]
-            )
+        detection = detector.detect(path)
+        assert detection.classification == case_spec["expected_classification"]
+        assert detection.page_count == case_spec["expected_page_count"]
+        with fitz.open(path) as scanned_pdf:
+            assert all(_page_image_coverage(page) >= 0.99 for page in scanned_pdf)
+
+        if case_spec["build_mode"] == "copy_hidden_ocr":
+            assert fixture["detected_language"] == case_spec["language"]
+            assert detection.embedded_text_chars >= case_spec["minimum_embedded_characters"]
+            assert detection.metadata["hidden_ocr_page_count"] == detection.page_count
+            assert case["source"]["sha256"] == case_spec["source_sha256"]
+            assert case["source"]["pages"] == case_spec["source_pages"]
+            continue
+
+        assert detection.embedded_text_chars == 0
+        digital_case_id = case_spec["derived_from"]
+        assert case["source"] == {"derived_from": digital_case_id}
+        with (
+            fitz.open(digital_paths[digital_case_id]) as digital_pdf,
+            fitz.open(path) as scanned_pdf,
+        ):
+            assert digital_pdf.page_count == scanned_pdf.page_count
             for digital_page, scanned_page in zip(digital_pdf, scanned_pdf, strict=True):
                 assert abs(digital_page.rect.width - scanned_page.rect.width) < 0.01
                 assert abs(digital_page.rect.height - scanned_page.rect.height) < 0.01
                 assert scanned_page.get_text("text").strip() == ""
-                assert _full_page_image_ratio(scanned_page) >= 0.99
                 assert _page_visual_difference(digital_page, scanned_page) < 15.0

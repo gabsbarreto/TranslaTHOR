@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the private, paired PDF regression corpus from verified local sources."""
+"""Build the private PDF regression corpus from verified workspace sources."""
 
 from __future__ import annotations
 
@@ -24,12 +24,7 @@ if str(BACKEND_ROOT) not in sys.path:
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector  # noqa: E402
 
 
-DEFAULT_SOURCE_ROOTS = {
-    "included": Path.home()
-    / "Library/CloudStorage/OneDrive-UniversityofBristol/Documents/RQ folder/PDFs included",
-    "included_2": Path.home()
-    / "Library/CloudStorage/OneDrive-UniversityofBristol/Documents/RQ folder/PDFs included 2",
-}
+DEFAULT_SOURCE_DIR = REPOSITORY_ROOT / "workspace" / "tests"
 DEFAULT_SPEC_PATH = REPOSITORY_ROOT / "tests" / "regression_corpus" / "corpus_spec.json"
 DEFAULT_OUTPUT_DIR = REPOSITORY_ROOT / "workspace" / "regression_corpus"
 DetectorFactory.seed = 0
@@ -45,19 +40,22 @@ def _sha256(path: Path) -> str:
 
 def _load_spec(path: Path) -> dict[str, Any]:
     spec = json.loads(path.read_text(encoding="utf-8"))
-    if spec.get("schema_version") != 1:
+    if spec.get("schema_version") != 2:
         raise ValueError(f"Unsupported corpus schema in {path}")
-    cases = spec.get("cases")
-    if not isinstance(cases, list) or len(cases) != 5:
-        raise ValueError("The regression corpus must define exactly five paired cases.")
+    digital_cases = spec.get("digital_cases")
+    scanned_cases = spec.get("scanned_cases")
+    if not isinstance(digital_cases, list) or len(digital_cases) != 5:
+        raise ValueError("The regression corpus must define exactly five digital cases.")
+    if not isinstance(scanned_cases, list) or len(scanned_cases) != 5:
+        raise ValueError("The regression corpus must define exactly five scanned cases.")
+    all_ids = [case.get("id") for case in digital_cases + scanned_cases]
+    if len(all_ids) != len(set(all_ids)):
+        raise ValueError("Every regression corpus case ID must be unique.")
     return spec
 
 
-def _verified_source(case: dict[str, Any], source_roots: dict[str, Path]) -> Path:
-    collection = str(case["source_collection"])
-    if collection not in source_roots:
-        raise ValueError(f"Unknown source collection {collection!r}")
-    source_path = source_roots[collection] / str(case["source_filename"])
+def _verified_source(case: dict[str, Any], source_dir: Path) -> Path:
+    source_path = source_dir / str(case["source_filename"])
     if not source_path.is_file():
         raise FileNotFoundError(f"Corpus source is missing: {source_path}")
     actual_hash = _sha256(source_path)
@@ -86,7 +84,11 @@ def _selected_page_indexes(case: dict[str, Any], page_count: int) -> list[int]:
     return indexes
 
 
-def _build_digital_fixture(source_path: Path, case: dict[str, Any], output_path: Path) -> None:
+def _build_selected_fixture(
+    source_path: Path,
+    case: dict[str, Any],
+    output_path: Path,
+) -> None:
     temporary_path = output_path.with_suffix(".building.pdf")
     temporary_path.unlink(missing_ok=True)
     with fitz.open(source_path) as source_pdf, fitz.open() as output_pdf:
@@ -110,7 +112,7 @@ def _build_digital_fixture(source_path: Path, case: dict[str, Any], output_path:
     temporary_path.replace(output_path)
 
 
-def _build_scanned_fixture(
+def _build_raster_scan(
     digital_path: Path,
     output_path: Path,
     *,
@@ -119,8 +121,7 @@ def _build_scanned_fixture(
 ) -> None:
     temporary_path = output_path.with_suffix(".building.pdf")
     temporary_path.unlink(missing_ok=True)
-    zoom = dpi / 72.0
-    matrix = fitz.Matrix(zoom, zoom)
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     with fitz.open(digital_path) as digital_pdf, fitz.open() as scanned_pdf:
         for source_page in digital_pdf:
             target_page = scanned_pdf.new_page(
@@ -132,7 +133,7 @@ def _build_scanned_fixture(
             target_page.insert_image(target_page.rect, stream=image_bytes)
         scanned_pdf.set_metadata(
             {
-                "title": f"Scan-only regression fixture: {digital_path.stem}",
+                "title": f"Scan-only regression fixture: {output_path.stem}",
                 "subject": (
                     "Raster-only counterpart generated for local TranslaTHOR regression tests; "
                     "contains no OCR text layer"
@@ -165,6 +166,8 @@ def _detected_language(path: Path) -> str:
 def _paired_visual_difference(digital_path: Path, scanned_path: Path) -> dict[str, float]:
     page_differences: list[float] = []
     with fitz.open(digital_path) as digital_pdf, fitz.open(scanned_path) as scanned_pdf:
+        if digital_pdf.page_count != scanned_pdf.page_count:
+            raise RuntimeError("A derived scan has a different page count from its digital source.")
         for digital_page, scanned_page in zip(digital_pdf, scanned_pdf, strict=True):
             digital_pixmap = digital_page.get_pixmap(alpha=False)
             scanned_pixmap = scanned_page.get_pixmap(alpha=False)
@@ -203,15 +206,41 @@ def _fixture_record(path: Path, output_dir: Path) -> dict[str, Any]:
         "meaningful_page_count": detection.meaningful_page_count,
         "image_dominant_page_count": detection.image_dominant_page_count,
         "scanned_page_count": detection.scanned_page_count,
+        "hidden_ocr_page_count": detection.metadata.get("hidden_ocr_page_count", 0),
         "page_dimensions": _page_dimensions(path),
     }
+
+
+def _validate_text_fixture(case: dict[str, Any], record: dict[str, Any], path: Path) -> None:
+    if record["classification"] != case["expected_classification"]:
+        raise RuntimeError(
+            f"Fixture {case['id']} classified as {record['classification']}, "
+            f"expected {case['expected_classification']}"
+        )
+    if record["page_count"] != case["expected_page_count"]:
+        raise RuntimeError(f"Fixture {case['id']} has an unexpected page count.")
+    if record["embedded_text_characters"] < case["minimum_embedded_characters"]:
+        raise RuntimeError(f"Fixture {case['id']} lost too much embedded text.")
+    detected_language = _detected_language(path)
+    if detected_language != case["language"]:
+        raise RuntimeError(
+            f"Fixture {case['id']} detected as {detected_language}, "
+            f"expected {case['language']}"
+        )
+    record["detected_language"] = detected_language
+
+
+def _clean_fixture_directory(directory: Path, expected_filenames: set[str]) -> None:
+    for stale_path in directory.glob("*.pdf"):
+        if stale_path.name not in expected_filenames:
+            stale_path.unlink()
 
 
 def build_corpus(
     *,
     spec_path: Path,
     output_dir: Path,
-    source_roots: dict[str, Path],
+    source_dir: Path,
 ) -> Path:
     spec = _load_spec(spec_path)
     digital_dir = output_dir / "digital"
@@ -220,83 +249,131 @@ def build_corpus(
     scanned_dir.mkdir(parents=True, exist_ok=True)
     dpi = int(spec["render_dpi"])
     jpeg_quality = int(spec["jpeg_quality"])
-    manifest_cases: list[dict[str, Any]] = []
-    expected_filenames = {f"{case['id']}.pdf" for case in spec["cases"]}
-    for fixture_dir in (digital_dir, scanned_dir):
-        for stale_path in fixture_dir.glob("*.pdf"):
-            if stale_path.name not in expected_filenames:
-                stale_path.unlink()
+    digital_specs = {case["id"]: case for case in spec["digital_cases"]}
+    digital_paths: dict[str, Path] = {}
+    manifest_digital: list[dict[str, Any]] = []
+    manifest_scanned: list[dict[str, Any]] = []
 
-    for case in spec["cases"]:
-        source_path = _verified_source(case, source_roots)
-        case_id = str(case["id"])
-        digital_path = digital_dir / f"{case_id}.pdf"
-        scanned_path = scanned_dir / f"{case_id}.pdf"
-        _build_digital_fixture(source_path, case, digital_path)
-        _build_scanned_fixture(
-            digital_path,
-            scanned_path,
-            dpi=dpi,
-            jpeg_quality=jpeg_quality,
-        )
-        digital_record = _fixture_record(digital_path, output_dir)
-        scanned_record = _fixture_record(scanned_path, output_dir)
-        minimum_characters = int(case["minimum_embedded_characters"])
-        if digital_record["classification"] != "digital_good_text":
-            raise RuntimeError(
-                f"Digital fixture {case_id} classified as {digital_record['classification']}"
-            )
-        if digital_record["embedded_text_characters"] < minimum_characters:
-            raise RuntimeError(f"Digital fixture {case_id} lost too much embedded text.")
-        detected_language = _detected_language(digital_path)
-        if detected_language != case["language"]:
-            raise RuntimeError(
-                f"Digital fixture {case_id} detected as {detected_language}, "
-                f"expected {case['language']}"
-            )
-        if scanned_record["classification"] != "scanned_no_text":
-            raise RuntimeError(
-                f"Scanned fixture {case_id} classified as {scanned_record['classification']}"
-            )
-        if scanned_record["embedded_text_characters"] != 0:
-            raise RuntimeError(f"Scanned fixture {case_id} unexpectedly contains a text layer.")
-        if digital_record["page_dimensions"] != scanned_record["page_dimensions"]:
-            raise RuntimeError(f"Page geometry differs within fixture pair {case_id}.")
-        visual_difference = _paired_visual_difference(digital_path, scanned_path)
-        if visual_difference["maximum_page_mean_difference"] >= 15.0:
-            raise RuntimeError(f"Raster counterpart for {case_id} differs too much visually.")
-        digital_record["detected_language"] = detected_language
+    _clean_fixture_directory(
+        digital_dir,
+        {f"{case_id}.pdf" for case_id in digital_specs},
+    )
+    _clean_fixture_directory(
+        scanned_dir,
+        {f"{case['id']}.pdf" for case in spec["scanned_cases"]},
+    )
 
-        manifest_cases.append(
+    for case in spec["digital_cases"]:
+        source_path = _verified_source(case, source_dir)
+        output_path = digital_dir / f"{case['id']}.pdf"
+        _build_selected_fixture(source_path, case, output_path)
+        record = _fixture_record(output_path, output_dir)
+        _validate_text_fixture(case, record, output_path)
+        digital_paths[case["id"]] = output_path
+        manifest_digital.append(
             {
-                "id": case_id,
+                "id": case["id"],
                 "language": case["language"],
                 "language_profile": case["language_profile"],
                 "features": case["features"],
                 "source": {
-                    "collection": case["source_collection"],
                     "filename": source_path.name,
                     "sha256": case["source_sha256"],
                     "pages": case["source_pages"],
                 },
-                "digital": digital_record,
-                "scanned": scanned_record,
-                "paired_visual_difference": visual_difference,
+                "fixture": record,
             }
         )
         print(
-            f"built {case_id}: {digital_record['page_count']} pages, "
-            f"{digital_record['embedded_text_characters']} digital characters"
+            f"built digital {case['id']}: {record['page_count']} pages, "
+            f"{record['embedded_text_characters']} characters"
+        )
+
+    for case in spec["scanned_cases"]:
+        output_path = scanned_dir / f"{case['id']}.pdf"
+        build_mode = case["build_mode"]
+        source_record: dict[str, Any]
+        visual_difference: dict[str, float] | None = None
+        if build_mode == "copy_hidden_ocr":
+            source_path = _verified_source(case, source_dir)
+            _build_selected_fixture(source_path, case, output_path)
+            source_record = {
+                "filename": source_path.name,
+                "sha256": case["source_sha256"],
+                "pages": case["source_pages"],
+            }
+        elif build_mode == "rasterize_digital":
+            digital_case_id = str(case["derived_from"])
+            if digital_case_id not in digital_paths:
+                raise ValueError(
+                    f"Scanned case {case['id']} references unknown digital case "
+                    f"{digital_case_id}."
+                )
+            digital_path = digital_paths[digital_case_id]
+            _build_raster_scan(
+                digital_path,
+                output_path,
+                dpi=dpi,
+                jpeg_quality=jpeg_quality,
+            )
+            source_record = {"derived_from": digital_case_id}
+            visual_difference = _paired_visual_difference(digital_path, output_path)
+            if visual_difference["maximum_page_mean_difference"] >= 15.0:
+                raise RuntimeError(f"Raster counterpart for {case['id']} differs too much.")
+        else:
+            raise ValueError(f"Unknown scan build mode {build_mode!r}")
+
+        record = _fixture_record(output_path, output_dir)
+        if record["classification"] != case["expected_classification"]:
+            raise RuntimeError(
+                f"Fixture {case['id']} classified as {record['classification']}, "
+                f"expected {case['expected_classification']}"
+            )
+        if record["page_count"] != case["expected_page_count"]:
+            raise RuntimeError(f"Fixture {case['id']} has an unexpected page count.")
+        if build_mode == "copy_hidden_ocr":
+            _validate_text_fixture(case, record, output_path)
+            if record["hidden_ocr_page_count"] != record["page_count"]:
+                raise RuntimeError(f"Hidden-OCR fixture {case['id']} lost its scan classification.")
+        elif record["embedded_text_characters"] != 0:
+            raise RuntimeError(f"Raster-only fixture {case['id']} contains a text layer.")
+
+        manifest_case = {
+            "id": case["id"],
+            "language": case["language"],
+            "language_profile": case["language_profile"],
+            "build_mode": build_mode,
+            "features": case["features"],
+            "source": source_record,
+            "fixture": record,
+        }
+        if visual_difference is not None:
+            manifest_case["paired_visual_difference"] = visual_difference
+        manifest_scanned.append(manifest_case)
+        print(
+            f"built scanned {case['id']}: {record['page_count']} pages, "
+            f"{record['classification']}"
         )
 
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "spec_sha256": _sha256(spec_path),
         "builder": "scripts/build_pdf_regression_corpus.py",
         "render": {"dpi": dpi, "jpeg_quality": jpeg_quality},
-        "counts": {"cases": len(manifest_cases), "digital": 5, "scanned": 5},
-        "cases": manifest_cases,
+        "counts": {
+            "digital": len(manifest_digital),
+            "scanned": len(manifest_scanned),
+            "authentic_hidden_ocr": sum(
+                case["build_mode"] == "copy_hidden_ocr" for case in spec["scanned_cases"]
+            ),
+            "derived_raster": sum(
+                case["build_mode"] == "rasterize_digital"
+                for case in spec["scanned_cases"]
+            ),
+        },
+        "digital_cases": manifest_digital,
+        "scanned_cases": manifest_scanned,
     }
     manifest_path = output_dir / "manifest.json"
     temporary_manifest = output_dir / "manifest.building.json"
@@ -313,16 +390,10 @@ def _parse_arguments() -> argparse.Namespace:
     parser.add_argument("--spec", type=Path, default=DEFAULT_SPEC_PATH)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument(
-        "--source-one",
+        "--source-dir",
         type=Path,
-        default=DEFAULT_SOURCE_ROOTS["included"],
-        help="Path to the 'PDFs included' collection.",
-    )
-    parser.add_argument(
-        "--source-two",
-        type=Path,
-        default=DEFAULT_SOURCE_ROOTS["included_2"],
-        help="Path to the 'PDFs included 2' collection.",
+        default=DEFAULT_SOURCE_DIR,
+        help="Directory containing the private source PDFs.",
     )
     return parser.parse_args()
 
@@ -332,10 +403,7 @@ def main() -> None:
     manifest_path = build_corpus(
         spec_path=arguments.spec.resolve(),
         output_dir=arguments.output_dir.resolve(),
-        source_roots={
-            "included": arguments.source_one.resolve(),
-            "included_2": arguments.source_two.resolve(),
-        },
+        source_dir=arguments.source_dir.resolve(),
     )
     print(f"manifest: {manifest_path}")
 

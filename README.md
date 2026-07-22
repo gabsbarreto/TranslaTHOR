@@ -182,11 +182,11 @@ safe translated fallback.
 
 ## PDF Regression Corpus
 
-The local regression corpus contains five compact non-English digital cases and five paired
-scan-only counterparts. Its Spanish and French pages cover front matter, multi-column prose,
-tables, charts, a flowchart, captions, and accented text. Each scanned PDF is rendered from the
-corresponding digital fixture with identical page dimensions and no OCR layer, providing a known
-visual baseline for comparing both extraction paths.
+The local regression corpus contains five compact non-English digital cases and five scan cases in
+German, Spanish, French, and Brazilian Portuguese. It covers multi-column prose, tables, charts, a
+flowchart, captions, accented text, and noisy text mappings. Two cases are genuine scans retaining
+their imperfect hidden OCR (`bad_hidden_ocr`); three are raster-only derivatives without a text
+layer (`scanned_no_text`) and provide known visual baselines for geometry and pixel comparisons.
 
 The source publications and generated PDFs are kept under the ignored local `workspace/` tree
 rather than redistributed through this public repository. The tracked corpus specification records
@@ -198,9 +198,9 @@ PYTHONPATH=backend .venv/bin/python scripts/build_pdf_regression_corpus.py
 PYTHONPATH=backend .venv/bin/pytest -q tests/test_pdf_regression_corpus.py
 ```
 
-See `tests/regression_corpus/README.md` for provenance, storage, and source-root overrides. The
+See `tests/regression_corpus/README.md` for provenance, storage, and source-path overrides. The
 artifact validation test skips on machines where the private corpus has not been built; the tracked
-five-case specification is always tested.
+ten-case specification is always tested.
 
 ## Reconstruction Limitations
 
