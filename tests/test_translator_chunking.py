@@ -671,7 +671,7 @@ def test_repeated_homograph_uses_numbered_affiliation_structure_fallback() -> No
     assert translated == "Affiliations"
 
 
-def test_translation_validation_preserves_numbers_and_acronym_order() -> None:
+def test_translation_validation_preserves_numbers_but_allows_acronym_changes() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = "La relación TMF/TFM fue 2,4/1 en 2020."
 
@@ -682,7 +682,7 @@ def test_translation_validation_preserves_numbers_and_acronym_order() -> None:
             "es",
             BlockType.PARAGRAPH,
         )
-        == "translation_acronyms_changed"
+        is None
     )
     assert (
         translator._chunk_translation_issue(
@@ -800,7 +800,7 @@ def test_parenthesized_document_acronym_is_preserved() -> None:
             "Continued hormonal therapy (MTF).",
             BlockType.PARAGRAPH,
         )
-        == "translation_acronyms_changed"
+        is None
     )
 
 
@@ -1414,6 +1414,59 @@ def test_table_validation_rejects_short_untranslated_label_in_mixed_table() -> N
     assert (
         translator._table_translation_issue(source, partially_translated, "es")
         == "translation_output_matches_source"
+    )
+
+
+def test_table_validation_accepts_translated_cells_despite_html_and_abbreviation_overlap() -> None:
+    source = (
+        "<table> <thead> <tr> <th>Absolutas</th> <th>Relativas</th> </tr> </thead> "
+        "<tbody> <tr> <td>HTA severa</td> <td>HTA</td> </tr> "
+        "<tr> <td>C.Isquémica</td> <td>Migraña refractaria</td> </tr> "
+        "<tr> <td>Hepatopatía</td> <td>Poliglobulia</td> </tr> "
+        "<tr> <td>I.Renal</td> <td>Dislipemia</td> </tr> "
+        "<tr> <td></td> <td>Tromboflebitis</td> </tr> </tbody> </table>"
+    )
+    translated = (
+        "<table> <thead> <tr> <th>Absolute</th> <th>Relative</th> </tr> </thead> "
+        "<tbody> <tr> <td>Serious HTA</td> <td>HTA</td> </tr> "
+        "<tr> <td>C. Ischemic</td> <td>Intractable migraine</td> </tr> "
+        "<tr> <td>Hepatopathy</td> <td>Polycythemia</td> </tr> "
+        "<tr> <td>Renal I.R.</td> <td>Dyslipidemia</td> </tr> "
+        "<tr> <td></td> <td>Thrombophlebitis</td> </tr> </tbody> </table>"
+    )
+    translator = MlxTranslator(TranslationSettings())
+
+    assert translator._has_valid_table_markup_structure(source, translated) is True
+    assert translator._table_translation_issue(source, translated, "es") is None
+
+
+def test_table_cell_validation_allows_close_medical_cognates_when_changed() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = "<table><tr><td>Hiperprolactinemia</td><td>Edad media</td></tr></table>"
+    translated = "<table><tr><td>Hyperprolactinemia</td><td>Mean age</td></tr></table>"
+    copied = "<table><tr><td>Hyperprolactinemia</td><td>Edad media</td></tr></table>"
+
+    assert translator._table_translation_issue(source, translated, "es") is None
+    assert (
+        translator._table_translation_issue(source, copied, "es")
+        == "translation_output_matches_source"
+    )
+
+
+def test_table_validation_rejects_cell_tag_role_changes() -> None:
+    source = (
+        "<table><thead><tr><th>Absolutas</th><th>Relativas</th></tr></thead>"
+        "<tbody><tr><td>HTA severa</td><td>Migraña refractaria</td></tr></tbody></table>"
+    )
+    changed_cell_role = (
+        "<table><thead><tr><th>Absolute</th><th>Relative</th></tr></thead>"
+        "<tbody><tr><th>Severe HTN</th><td>Intractable migraine</td></tr></tbody></table>"
+    )
+    translator = MlxTranslator(TranslationSettings())
+
+    assert (
+        translator._table_translation_issue(source, changed_cell_role, "es")
+        == "translation_table_structure_invalid"
     )
 
 
@@ -2164,7 +2217,7 @@ def test_continuous_redistribution_rejects_reordered_or_duplicated_numbers() -> 
         )
 
 
-def test_continuous_redistribution_keeps_stable_markers_in_their_source_region() -> None:
+def test_continuous_redistribution_keeps_numeric_markers_in_their_source_region() -> None:
     translator = MlxTranslator(TranslationSettings())
     numeric_segments = [
         ("first", "Die ausführliche Untersuchung ende-", BlockType.PARAGRAPH),
@@ -2175,21 +2228,6 @@ def test_continuous_redistribution_keeps_stable_markers_in_their_source_region()
             "Die ausführliche Untersuchung endete 2021.",
             "In 2021, the extensive study ended.",
             numeric_segments,
-            "de",
-            continuity_proven=True,
-        )
-        is None
-    )
-
-    acronym_segments = [
-        ("first", "Die Gruppen MDS/MDK wurden vergli-", BlockType.PARAGRAPH),
-        ("second", "chen.", BlockType.PARAGRAPH),
-    ]
-    assert (
-        translator._redistribute_logical_translation(
-            "Die Gruppen MDS/MDK wurden verglichen.",
-            "The MDK/MDS groups were compared.",
-            acronym_segments,
             "de",
             continuity_proven=True,
         )

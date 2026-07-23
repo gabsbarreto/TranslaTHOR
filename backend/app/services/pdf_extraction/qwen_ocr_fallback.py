@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -393,9 +394,89 @@ class QwenFullPageOCRFallback:
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         on_ocr_progress: Callable[[dict], None] | None,
     ) -> dict:
+        batch_size = settings.get("surya_layout_batch_size")
+        requested_batch_size = max(1, int(batch_size)) if batch_size is not None else None
+        attempts: list[dict] = [
+            {
+                "name": "default",
+                "output_dir": output_dir,
+                "batch_size": requested_batch_size,
+                "env_overrides": None,
+            }
+        ]
+        cpu_output_dir = output_dir / "retry_cpu"
+        attempts.append(
+            {
+                "name": "cpu",
+                "output_dir": cpu_output_dir,
+                "batch_size": requested_batch_size,
+                "env_overrides": {"TORCH_DEVICE": "cpu", "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+            }
+        )
+        pagewise_output_dir = output_dir / "retry_cpu_pagewise"
+        attempts.append(
+            {
+                "name": "cpu_pagewise",
+                "output_dir": pagewise_output_dir,
+                "batch_size": 1,
+                "env_overrides": {"TORCH_DEVICE": "cpu", "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+            }
+        )
+
+        failures: list[str] = []
+        for attempt in attempts:
+            try:
+                manifest = self._run_surya_layout_once(
+                    render_dir=render_dir,
+                    output_dir=attempt["output_dir"],
+                    settings=settings,
+                    batch_size=attempt["batch_size"],
+                    env_overrides=attempt["env_overrides"],
+                    cancel_requested=cancel_requested,
+                    on_process_started=on_process_started,
+                    on_process_finished=on_process_finished,
+                    on_ocr_progress=on_ocr_progress,
+                )
+            except RuntimeError as exc:
+                if cancel_requested is not None and cancel_requested():
+                    raise
+                failures.append(f"{attempt['name']}: {self._short_runtime_error(exc)}")
+                if not self._looks_like_surya_accelerator_failure(exc):
+                    break
+                logger.warning("Surya layout attempt %s failed; retrying if possible: %s", attempt["name"], exc)
+                continue
+
+            manifest["surya_layout_attempt"] = attempt["name"]
+            manifest["surya_layout_retried"] = attempt["name"] != "default"
+            if failures:
+                manifest["surya_layout_retry_failures"] = failures
+            manifest_path = output_dir / "layout.json"
+            if attempt["output_dir"] != output_dir:
+                output_dir.mkdir(parents=True, exist_ok=True)
+                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+            return manifest
+
+        detail = "; ".join(failures) if failures else "no Surya layout attempts were run"
+        raise RuntimeError(f"Surya layout detection failed after accelerator-safe retries: {detail}")
+
+    def _run_surya_layout_once(
+        self,
+        *,
+        render_dir: Path,
+        output_dir: Path,
+        settings: dict,
+        batch_size: int | None,
+        env_overrides: dict[str, str] | None,
+        cancel_requested: Callable[[], bool] | None,
+        on_process_started: Callable[[subprocess.Popen], None] | None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None,
+        on_ocr_progress: Callable[[dict], None] | None,
+    ) -> dict:
         worker = Path(
             os.getenv("SURYA_LAYOUT_WORKER", str(BASE_DIR / "scripts" / "surya_layout_worker.py"))
         )
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
         cmd = [
             self._resolve_surya_python_executable(),
             str(worker),
@@ -406,15 +487,18 @@ class QwenFullPageOCRFallback:
             "--padding",
             str(max(0, int(settings.get("surya_layout_padding", 16)))),
         ]
-        batch_size = settings.get("surya_layout_batch_size")
         if batch_size is not None:
             cmd.extend(["--batch-size", str(max(1, int(batch_size)))])
+        env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
         try:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                env=env,
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
@@ -441,6 +525,14 @@ class QwenFullPageOCRFallback:
         if not manifest_path.exists():
             raise RuntimeError("Surya layout detection did not write layout.json.")
         return json.loads(manifest_path.read_text(encoding="utf-8"))
+
+    def _looks_like_surya_accelerator_failure(self, exc: RuntimeError) -> bool:
+        text = str(exc).lower()
+        return "torch.acceleratorerror" in text or "accelerator" in text or "mps" in text
+
+    def _short_runtime_error(self, exc: RuntimeError) -> str:
+        lines = str(exc).strip().splitlines()
+        return lines[-1][-500:] if lines else str(exc)[-500:]
 
     def _attach_embedded_text_geometry(
         self,

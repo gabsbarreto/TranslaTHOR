@@ -1162,9 +1162,7 @@ def test_qwen_fallback_runs_surya_worker_with_marker_environment(
     import sys
 
     output_dir = tmp_path / "layout"
-    output_dir.mkdir()
     manifest = {"pages": [], "region_count": 0}
-    (output_dir / "layout.json").write_text(json.dumps(manifest), encoding="utf-8")
     captured: dict[str, object] = {}
 
     class _FakeProcess:
@@ -1179,7 +1177,13 @@ def test_qwen_fallback_runs_surya_worker_with_marker_environment(
     monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
     monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
     monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
-    monkeypatch.setattr(fallback, "_communicate_with_cancel", lambda *_args, **_kwargs: ("", ""))
+
+    def fake_communicate(*_args, **_kwargs):
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "layout.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return "", ""
+
+    monkeypatch.setattr(fallback, "_communicate_with_cancel", fake_communicate)
 
     result = fallback._run_surya_layout(
         render_dir=tmp_path / "rendered",
@@ -1191,7 +1195,10 @@ def test_qwen_fallback_runs_surya_worker_with_marker_environment(
         on_ocr_progress=None,
     )
 
-    assert result == manifest
+    assert result["pages"] == manifest["pages"]
+    assert result["region_count"] == manifest["region_count"]
+    assert result["surya_layout_attempt"] == "default"
+    assert result["surya_layout_retried"] is False
     assert captured["cmd"] == [
         sys.executable,
         str(tmp_path / "worker.py"),
@@ -1204,6 +1211,96 @@ def test_qwen_fallback_runs_surya_worker_with_marker_environment(
         "--batch-size",
         "2",
     ]
+    assert captured["kwargs"]["env"]["SURYA_LAYOUT_PYTHON"] == sys.executable
+
+
+def test_qwen_fallback_retries_surya_layout_accelerator_failure_on_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    output_dir = tmp_path / "layout"
+    manifest = {"pages": [], "region_count": 0}
+    attempts: list[dict] = []
+
+    class _FakeProcess:
+        def __init__(self, returncode: int) -> None:
+            self.returncode = returncode
+
+    def fake_popen(cmd, **kwargs):
+        attempts.append({"cmd": cmd, "kwargs": kwargs})
+        return _FakeProcess(1 if len(attempts) == 1 else 0)
+
+    fallback = QwenFullPageOCRFallback()
+    monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
+    monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
+    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+
+    def fake_communicate(process, *_args, **_kwargs):
+        if process.returncode:
+            return "", "torch.AcceleratorError: index 8192 is out of bounds"
+        retry_output_dir = Path(attempts[-1]["cmd"][attempts[-1]["cmd"].index("--output-dir") + 1])
+        retry_output_dir.mkdir(parents=True, exist_ok=True)
+        (retry_output_dir / "layout.json").write_text(json.dumps(manifest), encoding="utf-8")
+        return "", ""
+
+    monkeypatch.setattr(fallback, "_communicate_with_cancel", fake_communicate)
+
+    result = fallback._run_surya_layout(
+        render_dir=tmp_path / "rendered",
+        output_dir=output_dir,
+        settings={"surya_layout_padding": 24},
+        cancel_requested=None,
+        on_process_started=None,
+        on_process_finished=None,
+        on_ocr_progress=None,
+    )
+
+    assert result["surya_layout_attempt"] == "cpu"
+    assert result["surya_layout_retried"] is True
+    assert len(attempts) == 2
+    assert attempts[1]["kwargs"]["env"]["TORCH_DEVICE"] == "cpu"
+    assert (output_dir / "layout.json").exists()
+
+
+def test_qwen_fallback_stops_surya_layout_retry_for_non_accelerator_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import sys
+
+    attempts: list[dict] = []
+
+    class _FakeProcess:
+        returncode = 1
+
+    def fake_popen(cmd, **kwargs):
+        attempts.append({"cmd": cmd, "kwargs": kwargs})
+        return _FakeProcess()
+
+    fallback = QwenFullPageOCRFallback()
+    monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
+    monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
+    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        fallback,
+        "_communicate_with_cancel",
+        lambda *_args, **_kwargs: ("", "RuntimeError: invalid image file"),
+    )
+
+    with pytest.raises(RuntimeError, match="after accelerator-safe retries"):
+        fallback._run_surya_layout(
+            render_dir=tmp_path / "rendered",
+            output_dir=tmp_path / "layout",
+            settings={},
+            cancel_requested=None,
+            on_process_started=None,
+            on_process_finished=None,
+            on_ocr_progress=None,
+        )
+
+    assert len(attempts) == 1
 
 
 def _page_stats(page_number: int) -> PageTextStats:

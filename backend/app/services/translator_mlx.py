@@ -652,6 +652,9 @@ class MlxTranslator:
             chunk.translated_text = translated
             if validation_issue is not None:
                 self._mark_translation_failure(chunk, validation_issue)
+            else:
+                chunk.status = "ready_for_translation"
+                chunk.reason = None
             if not physical_segments:
                 application_chunks.append(chunk)
             if on_chunk_translated is not None:
@@ -1155,8 +1158,8 @@ class MlxTranslator:
         ):
             # The logical translation already preserves stable values globally.
             # Requiring them in their original physical region prevents a
-            # proportional split from silently moving a number or acronym into
-            # a neighboring box.
+            # proportional split from silently moving a number into a
+            # neighboring box.
             return None
         return redistributed
 
@@ -1992,8 +1995,15 @@ class MlxTranslator:
         source_normalized = self._normalized_language_text(source)
         translated_normalized = self._normalized_language_text(translated)
         if source_normalized and source_normalized == translated_normalized:
+            if block_type == BlockType.TABLE and self._normalized_table_cell(
+                source
+            ) != self._normalized_table_cell(translated):
+                return None
             return "translation_output_matches_source"
-        if self._has_high_source_overlap(source_normalized, translated_normalized):
+        if block_type != BlockType.TABLE and self._has_high_source_overlap(
+            source_normalized,
+            translated_normalized,
+        ):
             return "translation_output_high_source_overlap"
         if self._looks_like_english_text(translated):
             return None
@@ -2294,9 +2304,6 @@ class MlxTranslator:
             "translation_numbers_changed": (
                 "Translation output changed or reordered source numeric values after retry."
             ),
-            "translation_acronyms_changed": (
-                "Translation output changed, omitted, or reordered source acronyms after retry."
-            ),
         }
         chunk.status = self.TRANSLATION_FAILED_STATUS
         chunk.reason = issue
@@ -2363,8 +2370,8 @@ class MlxTranslator:
             "The previous output was not an acceptable English translation. Return English only and "
             "translate every substantive source-language phrase; do not repeat source-language prose. "
             "Preserve the source structure exactly: keep paragraph boundaries, list boundaries, headings, "
-            "Markdown markers, citations, numeric values, document-defined acronyms, and line breaks that "
-            "separate logical blocks. Keep acronym and numeric-value order unchanged. "
+            "Markdown markers, citations, numeric values, and line breaks that "
+            "separate logical blocks. Keep numeric-value order unchanged. "
             "Do not summarize, omit, or collapse content."
         ).strip()
         retried = self._translate_chunk(text, retry_context, source_language)
@@ -2545,16 +2552,6 @@ class MlxTranslator:
     ) -> str | None:
         if self._ordered_numeric_tokens(source) != self._ordered_numeric_tokens(translated):
             return "translation_numbers_changed"
-        if block_type != BlockType.TABLE:
-            source_acronyms = self._ordered_acronyms(source)
-            protected = set(source_acronyms)
-            translated_acronyms = [
-                acronym
-                for acronym in self._ordered_acronyms(translated)
-                if acronym in protected
-            ]
-            if source_acronyms != translated_acronyms:
-                return "translation_acronyms_changed"
         return None
 
     def _ordered_numeric_tokens(self, text: str) -> list[str]:
@@ -3000,15 +2997,6 @@ class MlxTranslator:
         ):
             return "translation_output_matches_source"
 
-        issue = self._translation_acceptance_issue(
-            source_text,
-            translated_text,
-            source_language,
-            BlockType.TABLE,
-        )
-        if issue is not None:
-            return issue
-
         for source_cell, translated_cell in zip(
             self._table_cell_texts(source_table),
             self._table_cell_texts(translated_table),
@@ -3037,11 +3025,16 @@ class MlxTranslator:
         translated_cells = self._table_cell_texts(translated_table)
         if len(source_cells) != len(translated_cells):
             return False
-        if [self._normalized_table_cell(cell) for cell in source_cells] != [
-            self._normalized_table_cell(cell) for cell in translated_cells
-        ]:
-            return False
-        return any(self._table_cell_requires_translation(cell) for cell in source_cells)
+        return any(
+            self._normalized_table_cell(source_cell)
+            == self._normalized_table_cell(translated_cell)
+            and self._table_cell_requires_translation(source_cell)
+            for source_cell, translated_cell in zip(
+                source_cells,
+                translated_cells,
+                strict=True,
+            )
+        )
 
     def _normalized_table_cell(self, text: str) -> str:
         return " ".join(html.unescape(text).split()).casefold()
@@ -3198,8 +3191,7 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "units, numeric values, and figure references. Preserve document-defined acronyms exactly and in "
-            "the same order. "
+            "units, numeric values, and figure references. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
             "Translate short section headings and titles as well."
         )
