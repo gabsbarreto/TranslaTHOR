@@ -704,6 +704,51 @@ def test_translation_validation_preserves_numbers_but_allows_acronym_changes() -
     )
 
 
+def test_translation_validation_allows_natural_numeric_reordering() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = (
+        "En ambas series, por criterios diagnósticos, han sido excluidos el 14% "
+        "(la mitad de ellos habían realizado autotratamiento previo: Grupo 3) "
+        "y sólo se ha excluido de tratamiento hormonal por criterios médicos "
+        "2 pacientes hombre-a-mujer."
+    )
+    translated = (
+        "In both series, only two male-to-female patients were excluded from "
+        "hormonal treatment for medical reasons, while 14% were excluded based "
+        "on diagnostic criteria, half of whom had previously self-treated: Group 3."
+    )
+
+    assert (
+        translator._chunk_translation_issue(
+            source,
+            translated,
+            "es",
+            BlockType.PARAGRAPH,
+        )
+        is None
+    )
+
+
+def test_translation_validation_rejects_missing_changed_or_duplicated_numbers() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = "Fueron excluidos el 14%, Grupo 3, y 2 pacientes."
+
+    for translated in (
+        "14% were excluded in Group 3.",
+        "15% were excluded in Group 3, and two patients.",
+        "14% were excluded in Group 3, Group 3, and 2 patients.",
+    ):
+        assert (
+            translator._chunk_translation_issue(
+                source,
+                translated,
+                "es",
+                BlockType.PARAGRAPH,
+            )
+            == "translation_numbers_changed"
+        )
+
+
 def test_table_abbreviations_may_use_equally_compact_target_language_forms() -> None:
     translator = MlxTranslator(TranslationSettings())
 

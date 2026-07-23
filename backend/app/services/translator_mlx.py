@@ -376,6 +376,29 @@ class MlxTranslator:
         "results",
         "summary",
     }
+    _ENGLISH_NUMBER_WORDS = {
+        "zero": "0",
+        "one": "1",
+        "two": "2",
+        "three": "3",
+        "four": "4",
+        "five": "5",
+        "six": "6",
+        "seven": "7",
+        "eight": "8",
+        "nine": "9",
+        "ten": "10",
+        "eleven": "11",
+        "twelve": "12",
+        "thirteen": "13",
+        "fourteen": "14",
+        "fifteen": "15",
+        "sixteen": "16",
+        "seventeen": "17",
+        "eighteen": "18",
+        "nineteen": "19",
+        "twenty": "20",
+    }
 
     def __init__(self, settings: TranslationSettings) -> None:
         self.settings = settings
@@ -2302,7 +2325,7 @@ class MlxTranslator:
                 "Translation output omitted content from one or more source table cells after retry."
             ),
             "translation_numbers_changed": (
-                "Translation output changed or reordered source numeric values after retry."
+                "Translation output changed source numeric values after retry."
             ),
         }
         chunk.status = self.TRANSLATION_FAILED_STATUS
@@ -2371,7 +2394,7 @@ class MlxTranslator:
             "translate every substantive source-language phrase; do not repeat source-language prose. "
             "Preserve the source structure exactly: keep paragraph boundaries, list boundaries, headings, "
             "Markdown markers, citations, numeric values, and line breaks that "
-            "separate logical blocks. Keep numeric-value order unchanged. "
+            "separate logical blocks. Preserve every numeric value exactly. "
             "Do not summarize, omit, or collapse content."
         ).strip()
         retried = self._translate_chunk(text, retry_context, source_language)
@@ -2550,22 +2573,56 @@ class MlxTranslator:
         translated: str,
         block_type: BlockType | None,
     ) -> str | None:
-        if self._ordered_numeric_tokens(source) != self._ordered_numeric_tokens(translated):
+        if self._numeric_token_counts(source) != self._numeric_token_counts(
+            translated,
+            reference_values=set(self._numeric_token_counts(source)),
+        ):
             return "translation_numbers_changed"
         return None
 
+    def _numeric_token_counts(
+        self,
+        text: str,
+        *,
+        reference_values: set[str] | None = None,
+    ) -> Counter[str]:
+        tokens: list[str] = []
+        for token, origin in self._ordered_numeric_token_items(text):
+            if (
+                reference_values is not None
+                and origin == "word"
+                and token not in reference_values
+            ):
+                continue
+            tokens.append(token)
+        return Counter(tokens)
+
     def _ordered_numeric_tokens(self, text: str) -> list[str]:
+        return [token for token, _ in self._ordered_numeric_token_items(text)]
+
+    def _ordered_numeric_token_items(self, text: str) -> list[tuple[str, str]]:
         visible = html.unescape(text)
         visible = re.sub(
             r"(?<![\w])(?P<whole>\d+)[.,]\s+(?P<fraction>\d+)\s*%",
             r"\g<whole>.\g<fraction>%",
             visible,
         )
-        tokens = re.findall(
-            r"(?<![\w\d])(?:\d+(?:[.,]\d+)?|[.,]\d+)\s*%?",
-            visible,
+        number_words = "|".join(re.escape(word) for word in self._ENGLISH_NUMBER_WORDS)
+        token_pattern = re.compile(
+            rf"(?<![\w\d])(?P<digit>(?:\d+(?:[.,]\d+)?|[.,]\d+)\s*%?)"
+            rf"|(?<![\w])(?P<word>{number_words})(?![\w])",
+            re.IGNORECASE,
         )
-        return [re.sub(r"\s+", "", token).replace(",", ".") for token in tokens]
+        tokens: list[tuple[str, str]] = []
+        for match in token_pattern.finditer(visible):
+            digit = match.group("digit")
+            if digit is not None:
+                tokens.append((re.sub(r"\s+", "", digit).replace(",", "."), "digit"))
+                continue
+            word = str(match.group("word") or "").casefold()
+            if word in self._ENGLISH_NUMBER_WORDS:
+                tokens.append((self._ENGLISH_NUMBER_WORDS[word], "word"))
+        return tokens
 
     def _ordered_acronyms(self, text: str) -> list[str]:
         """Return acronyms whose surrounding syntax marks them as stable.
