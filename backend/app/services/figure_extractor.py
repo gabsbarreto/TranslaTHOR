@@ -81,7 +81,9 @@ class FigureExtractionService:
             assets: list[FigureAsset] = []
             valid_index_by_page: dict[int, int] = {}
             for candidate in sorted(canonical, key=self._candidate_sort_key):
-                if candidate.bbox is None or not (1 <= candidate.page_number <= source_pdf.page_count):
+                if candidate.bbox is None or not (
+                    1 <= candidate.page_number <= source_pdf.page_count
+                ):
                     asset = self._unmaterialized_asset(candidate, len(assets) + 1)
                     assets.append(asset)
                     warnings.append(
@@ -90,7 +92,9 @@ class FigureExtractionService:
                     continue
 
                 page_index = candidate.page_number - 1
-                valid_index_by_page[candidate.page_number] = valid_index_by_page.get(candidate.page_number, 0) + 1
+                valid_index_by_page[candidate.page_number] = (
+                    valid_index_by_page.get(candidate.page_number, 0) + 1
+                )
                 sequence = valid_index_by_page[candidate.page_number]
                 basename = f"figure-p{candidate.page_number:04d}-{sequence:03d}"
                 asset, asset_warnings = self._materialize_candidate(
@@ -133,14 +137,14 @@ class FigureExtractionService:
                 continue
             metadata = dict(block.metadata or {})
             source_region_ids = [str(value) for value in metadata.get("source_region_ids", [])]
-            region_metadata = [surya_regions[value] for value in source_region_ids if value in surya_regions]
+            region_metadata = [
+                surya_regions[value] for value in source_region_ids if value in surya_regions
+            ]
             if region_metadata:
                 metadata["surya_source_regions"] = region_metadata
             confidence = self._candidate_confidence(block, region_metadata)
             marker_type = str(
-                metadata.get("marker_block_type")
-                or metadata.get("surya_region_type")
-                or "figure"
+                metadata.get("marker_block_type") or metadata.get("surya_region_type") or "figure"
             )
             candidates.append(
                 _FigureCandidate(
@@ -260,7 +264,9 @@ class FigureExtractionService:
         if outer.page_number != inner.page_number or outer.bbox is None or inner.bbox is None:
             return False
         inner_area = bbox_area(inner.bbox)
-        return inner_area > 0 and bbox_intersection_area(outer.bbox, inner.bbox) / inner_area >= 0.94
+        return (
+            inner_area > 0 and bbox_intersection_area(outer.bbox, inner.bbox) / inner_area >= 0.94
+        )
 
     def _merge_candidates(
         self,
@@ -310,7 +316,9 @@ class FigureExtractionService:
     ) -> dict[str, BoundingBox | None]:
         result: dict[str, BoundingBox | None] = {}
         for block in document.blocks:
-            if block.block_type != BlockType.CAPTION or not (1 <= block.page_number <= source_pdf.page_count):
+            if block.block_type != BlockType.CAPTION or not (
+                1 <= block.page_number <= source_pdf.page_count
+            ):
                 continue
             page = source_pdf[block.page_number - 1]
             result[block.id] = convert_bbox_to_pdf(
@@ -494,7 +502,9 @@ class FigureExtractionService:
                 finally:
                     vector_document.close()
             except Exception as exc:
-                warnings.append(f"Figure {basename} vector capture failed; raster preview will be used: {exc}")
+                warnings.append(
+                    f"Figure {basename} vector capture failed; raster preview will be used: {exc}"
+                )
 
         metadata = dict(candidate.metadata)
         metadata.update(

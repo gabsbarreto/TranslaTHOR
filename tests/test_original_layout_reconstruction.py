@@ -1212,17 +1212,14 @@ def test_overlapping_marker_cells_fall_back_to_ruled_colspan_grid(tmp_path: Path
         round((x_edges[4] - 2) * 2),
         round((y_edges[-1] - 2) * 2),
     )
-    assert source_image.crop(numeric_cells).tobytes() == output_image.crop(
-        numeric_cells
-    ).tobytes()
+    assert source_image.crop(numeric_cells).tobytes() == output_image.crop(numeric_cells).tobytes()
 
     difference = ImageChops.difference(source_image, output_image)
     outside_mask = Image.new("L", difference.size, 255)
     mask_draw = ImageDraw.Draw(outside_mask)
     for region in report["regions"]:
         if region.get("status") != "replaced" or not any(
-            block_id.startswith("ruled-colspan-table#")
-            for block_id in region.get("block_ids", [])
+            block_id.startswith("ruled-colspan-table#") for block_id in region.get("block_ids", [])
         ):
             continue
         bbox = region["bbox"]
@@ -1275,8 +1272,7 @@ def test_ruled_table_grid_rejects_unexplained_extra_cell_text(tmp_path: Path) ->
     )
 
     assert any(
-        region.get("reason") == "table_cell_geometry_unreliable"
-        for region in report["regions"]
+        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
     )
     assert report["regions_replaced"] == 0
     assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
@@ -1458,9 +1454,7 @@ def test_table_row_similarity_rejects_short_header_substring_in_wrong_cell(
     )
     doc.save(source)
     doc.close()
-    rows = OriginalLayoutReconstructor()._parse_table_rows(
-        "<table><tr><td>N</td></tr></table>"
-    )
+    rows = OriginalLayoutReconstructor()._parse_table_rows("<table><tr><td>N</td></tr></table>")
 
     reconstructor = OriginalLayoutReconstructor()
     with fitz.open(source) as pdf:
@@ -1873,10 +1867,13 @@ def test_surya2_image_only_scan_uses_raster_text_masks_and_preserves_visuals(
         round(figure_bbox.x1 * 2),
         round(figure_bbox.y1 * 2),
     )
-    assert ImageChops.difference(
-        source_image.crop(figure_pixels),
-        output_image.crop(figure_pixels),
-    ).getbbox() is None
+    assert (
+        ImageChops.difference(
+            source_image.crop(figure_pixels),
+            output_image.crop(figure_pixels),
+        ).getbbox()
+        is None
+    )
 
 
 def test_surya2_image_only_scan_rejects_nonuniform_visual_text_region(
@@ -1955,9 +1952,7 @@ def test_surya2_image_only_scan_retains_table_without_cell_geometry(
     assert report["status"] == "partial"
     assert report["regions_replaced"] == 1
     skipped_table = next(
-        region
-        for region in report["regions"]
-        if region["block_ids"] == ["surya2-table"]
+        region for region in report["regions"] if region["block_ids"] == ["surya2-table"]
     )
     assert skipped_table["reason"] == "surya2_image_scan_table_requires_cell_geometry"
 
@@ -2072,9 +2067,7 @@ def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
     reconstructor = OriginalLayoutReconstructor()
     reconstructor._preflight = (  # type: ignore[method-assign]
         lambda **kwargs: (
-            (-1.0, 0.5)
-            if kwargs["region"].block_ids[0].startswith("scan-table-b#")
-            else (1.0, 1.0)
+            (-1.0, 0.5) if kwargs["region"].block_ids[0].startswith("scan-table-b#") else (1.0, 1.0)
         )
     )
     output = tmp_path / "hidden-ocr-table-group-output.pdf"
@@ -2121,9 +2114,10 @@ def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
 
     source_image = _render_rgb(source, scale=2)
     output_image = _render_rgb(output, scale=2)
-    assert source_image.crop((0, 0, 640, 390)).tobytes() == output_image.crop(
-        (0, 0, 640, 390)
-    ).tobytes()
+    assert (
+        source_image.crop((0, 0, 640, 390)).tobytes()
+        == output_image.crop((0, 0, 640, 390)).tobytes()
+    )
 
 
 def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Path) -> None:
@@ -2366,9 +2360,7 @@ def test_invalid_figure_bbox_is_reported_and_not_counted_as_preserved(
 
     assert report["figures_preserved"] == 0
     assert report["regions_missing_or_invalid_bboxes"] == 1
-    assert any(
-        warning["code"] == "figure_lock_region_invalid" for warning in report["warnings"]
-    )
+    assert any(warning["code"] == "figure_lock_region_invalid" for warning in report["warnings"])
 
 
 def test_source_character_count_uses_visible_table_text() -> None:

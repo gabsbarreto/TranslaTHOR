@@ -254,16 +254,16 @@ Before implementation, the unmodified starting commit passed:
 85 passed in 6.92s
 ```
 
-Final verification:
+Final verification on the combined `surya2afterreconstruction` branch:
 
 ```text
-PYTHONPATH=backend .venv/bin/python -m pytest -q
-110 passed, 1 warning in 9.27s
+.venv/bin/pytest -q
+325 passed, 5 warnings in 21.86s
 
-.venv/bin/ruff format --check <changed Python files>
-17 files already formatted
+.venv/bin/ruff format --check <integration-changed Python files>
+5 files already formatted
 
-.venv/bin/ruff check <changed Python files>
+.venv/bin/ruff check backend tests scripts
 All checks passed
 
 PYTHONPATH=backend .venv/bin/mypy <seven Surya/reconstruction core files>
@@ -272,6 +272,7 @@ Success: no issues found in 7 source files
 bash -n scripts/run_dev.sh scripts/setup_local_runtime.sh scripts/setup_surya2_runtime.sh
 .venv-surya2/bin/python -m pip check
 .venv-marker/bin/python -m pip check
+No broken requirements found in either isolated environment
 ```
 
 A standalone manager/server lifecycle reported worker exit code 0. Process

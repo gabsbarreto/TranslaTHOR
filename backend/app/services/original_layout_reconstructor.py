@@ -379,9 +379,7 @@ class OriginalLayoutReconstructor:
                     page_report["regions_replaced"] += 1
                     report["scan_text_masks"] += len(region.redaction_bboxes or [])
                     if region.reconstruction_strategy == "surya2_image_text_overlay":
-                        report["surya2_image_text_masks"] += len(
-                            region.redaction_bboxes or []
-                        )
+                        report["surya2_image_text_masks"] += len(region.redaction_bboxes or [])
                     report["regions"].append({**entry, "status": "replaced"})
                 raster_table_ids = {
                     str(metadata["table_block_id"])
@@ -537,14 +535,11 @@ class OriginalLayoutReconstructor:
             surya2_blocks = [
                 block
                 for block in blocks
-                if str(block.metadata.get("ocr_engine", "")).casefold()
-                == "surya2_llamacpp"
-                or str(block.metadata.get("parser", "")).casefold()
-                == "surya2_llamacpp"
+                if str(block.metadata.get("ocr_engine", "")).casefold() == "surya2_llamacpp"
+                or str(block.metadata.get("parser", "")).casefold() == "surya2_llamacpp"
             ]
             if any(
-                block.bbox is not None
-                and block.block_type not in self.locked_block_types
+                block.bbox is not None and block.block_type not in self.locked_block_types
                 for block in surya2_blocks
             ):
                 return "surya2_image_overlay", ""
@@ -832,9 +827,7 @@ class OriginalLayoutReconstructor:
                 y1=float(page.rect.height),
             )
             bbox = (
-                global_search_bbox
-                if recover_bbox_from_hidden_ocr
-                else self._union_bbox(converted)
+                global_search_bbox if recover_bbox_from_hidden_ocr else self._union_bbox(converted)
             )
 
             source_text = " ".join(
@@ -1016,9 +1009,7 @@ class OriginalLayoutReconstructor:
                         if len(converted) == 1
                         else self._union_bbox(converted).model_dump()
                     )
-                replacement.coordinate_metadata.append(
-                    alignment_metadata
-                )
+                replacement.coordinate_metadata.append(alignment_metadata)
                 claimed_scan_lines.update(scan_match.keys)
                 report["scan_text_regions_aligned"] += 1
             elif surya2_image_overlay:
@@ -1223,10 +1214,7 @@ class OriginalLayoutReconstructor:
             return []
 
         expected_columns = max(
-            (
-                sum(max(1, int(cell.colspan or 1)) for cell in row)
-                for row in source_rows
-            ),
+            (sum(max(1, int(cell.colspan or 1)) for cell in row) for row in source_rows),
             default=0,
         )
         grid_rows, grid_strategy = self._stored_table_grid_rows(
@@ -2844,13 +2832,9 @@ class OriginalLayoutReconstructor:
         ):
             return [], {"reason": "empty_or_invalid_render"}
 
-        background = tuple(
-            min(255, max(0, round(channel * 255.0))) for channel in background_fill
-        )
+        background = tuple(min(255, max(0, round(channel * 255.0))) for channel in background_fill)
         background_luminance = (
-            0.2126 * background[0]
-            + 0.7152 * background[1]
-            + 0.0722 * background[2]
+            0.2126 * background[0] + 0.7152 * background[1] + 0.0722 * background[2]
         )
         luminance_limit = min(210.0, background_luminance - 28.0)
         foreground_by_row: list[list[int]] = [[] for _ in range(pixmap.height)]
@@ -3061,14 +3045,10 @@ class OriginalLayoutReconstructor:
         matching_characters = sum(match.size for match in matcher.get_matching_blocks())
         opcodes = matcher.get_opcodes()
         actual_unexplained_runs = [
-            j2 - j1
-            for tag, _i1, _i2, j1, j2 in opcodes
-            if tag in {"insert", "replace"} and j2 > j1
+            j2 - j1 for tag, _i1, _i2, j1, j2 in opcodes if tag in {"insert", "replace"} and j2 > j1
         ]
         expected_unmatched_runs = [
-            i2 - i1
-            for tag, i1, i2, _j1, _j2 in opcodes
-            if tag in {"delete", "replace"} and i2 > i1
+            i2 - i1 for tag, i1, i2, _j1, _j2 in opcodes if tag in {"delete", "replace"} and i2 > i1
         ]
         actual_unexplained = len(actual) - matching_characters
         expected_unmatched = len(expected) - matching_characters
@@ -3098,10 +3078,7 @@ class OriginalLayoutReconstructor:
         ):
             diagnostics["reason"] = "embedded_source_bbox_contains_unexplained_text"
             return diagnostics
-        if (
-            expected_unmatched > maximum_expected_unmatched
-            or ratio < 0.92
-        ):
+        if expected_unmatched > maximum_expected_unmatched or ratio < 0.92:
             diagnostics["reason"] = "embedded_source_text_does_not_match_bbox"
             return diagnostics
 
@@ -3275,9 +3252,7 @@ class OriginalLayoutReconstructor:
     def _table_alignment_has_full_cell_coverage(
         self,
         page: fitz.Page,
-        alignment: list[
-            tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]]
-        ],
+        alignment: list[tuple[list[ParsedTableCell], list[ParsedTableCell], list[fitz.Rect]]],
     ) -> bool:
         """Reject grids whose cells contain source text absent from the table model.
 

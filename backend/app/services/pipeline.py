@@ -227,6 +227,7 @@ class TranslationPipeline:
                         on_ocr_progress=on_qwen_progress,
                     )
             else:
+
                 def on_marker_detection_complete(
                     detected: PDFTypeDetectionResult,
                     marker_mode: MarkerMode,
@@ -247,9 +248,7 @@ class TranslationPipeline:
                             in {"force_ocr", "strip_existing_ocr_force_ocr"},
                             "force_ocr": marker_mode
                             in {"force_ocr", "strip_existing_ocr_force_ocr"},
-                            "strip_existing_ocr": (
-                                marker_mode == "strip_existing_ocr_force_ocr"
-                            ),
+                            "strip_existing_ocr": (marker_mode == "strip_existing_ocr_force_ocr"),
                             "warnings": detected.warnings,
                         },
                     )
