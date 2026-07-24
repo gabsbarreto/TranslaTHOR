@@ -16,8 +16,14 @@ def write_translation_comparison_report(
     output_dir: Path,
 ) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    source = source_path.read_text(encoding="utf-8", errors="ignore") if source_path.exists() else ""
-    translated = translated_path.read_text(encoding="utf-8", errors="ignore") if translated_path.exists() else ""
+    source = (
+        source_path.read_text(encoding="utf-8", errors="ignore") if source_path.exists() else ""
+    )
+    translated = (
+        translated_path.read_text(encoding="utf-8", errors="ignore")
+        if translated_path.exists()
+        else ""
+    )
     report = build_translation_comparison_report(
         source_text=source,
         translated_text=translated,
@@ -56,6 +62,7 @@ def build_translation_comparison_report(
             "source_region_ids": chunk.source_region_ids,
             "section_path": chunk.section_path,
             "status": chunk.status,
+            "reason": chunk.reason,
             "warnings": chunk.warnings,
             "source_start": chunk.source_text[:200],
             "source_end": chunk.source_text[-200:],
@@ -64,12 +71,28 @@ def build_translation_comparison_report(
         }
         for chunk in chunks
     ]
-    empty = [row["chunk_id"] for row in chunk_rows if row["source_char_count"] and not row["translated_char_count"]]
+    empty = [
+        row["chunk_id"]
+        for row in chunk_rows
+        if row["source_char_count"] and not row["translated_char_count"]
+    ]
     suspicious = [
         row["chunk_id"]
         for row in chunk_rows
-        if row["source_char_count"] >= 200 and row["translated_char_count"] < row["source_char_count"] * 0.25
+        if row["source_char_count"] >= 200
+        and row["translated_char_count"] < row["source_char_count"] * 0.25
     ]
+    failed_validation = [
+        row["chunk_id"] for row in chunk_rows if row["status"] == "translation_failed"
+    ]
+    validation_failure_reason_counts: dict[str, int] = {}
+    for row in chunk_rows:
+        if row["status"] != "translation_failed":
+            continue
+        reason = str(row.get("reason") or "unspecified")
+        validation_failure_reason_counts[reason] = (
+            validation_failure_reason_counts.get(reason, 0) + 1
+        )
     malformed = _malformed_markdown_checks(source_text, translated_text)
     placeholder_report = _placeholder_report(source_text, translated_text)
 
@@ -78,6 +101,7 @@ def build_translation_comparison_report(
         translated_stats=translated_stats,
         empty_chunks=empty,
         suspicious_chunks=suspicious,
+        failed_validation_chunks=failed_validation,
         malformed=malformed,
     )
     return {
@@ -90,6 +114,8 @@ def build_translation_comparison_report(
         "missing_chunk_ids": [],
         "empty_translated_chunk_ids": empty,
         "suspiciously_short_chunk_ids": suspicious,
+        "failed_translation_validation_chunk_ids": failed_validation,
+        "failed_translation_validation_reason_counts": validation_failure_reason_counts,
         "malformed_markdown": malformed,
         "placeholders": placeholder_report,
         "chunks": chunk_rows,
@@ -105,8 +131,11 @@ def _markdown_stats(text: str) -> dict[str, int]:
         "word_count": len(re.findall(r"\b\w+\b", text)),
         "paragraph_count": len(paragraphs),
         "heading_count": len(re.findall(r"(?m)^\s{0,3}#{1,6}\s+\S", text)),
-        "table_count": len(re.findall(r"(?is)<table\b", text)) + len(re.findall(r"(?m)^\s*\|.+\|\s*$", text)),
-        "image_or_figure_placeholder_count": len(re.findall(r"!\[[^\]]*\]\([^)]+\)|\[\[FIGURE_[^\]]+\]\]", text)),
+        "table_count": len(re.findall(r"(?is)<table\b", text))
+        + len(re.findall(r"(?m)^\s*\|.+\|\s*$", text)),
+        "image_or_figure_placeholder_count": len(
+            re.findall(r"!\[[^\]]*\]\([^)]+\)|\[\[FIGURE_[^\]]+\]\]", text)
+        ),
     }
 
 
@@ -116,7 +145,8 @@ def _malformed_markdown_checks(source: str, translated: str) -> dict[str, Any]:
         "source_table_close_count": len(re.findall(r"(?is)</table>", source)),
         "translated_table_open_count": len(re.findall(r"(?is)<table\b", translated)),
         "translated_table_close_count": len(re.findall(r"(?is)</table>", translated)),
-        "translated_unclosed_table": len(re.findall(r"(?is)<table\b", translated)) != len(re.findall(r"(?is)</table>", translated)),
+        "translated_unclosed_table": len(re.findall(r"(?is)<table\b", translated))
+        != len(re.findall(r"(?is)</table>", translated)),
         "source_code_fence_count": source.count("```"),
         "translated_code_fence_count": translated.count("```"),
     }
@@ -140,26 +170,38 @@ def _likely_failure_point(
     translated_stats: dict[str, int],
     empty_chunks: list[str],
     suspicious_chunks: list[str],
+    failed_validation_chunks: list[str],
     malformed: dict[str, Any],
 ) -> str:
+    if failed_validation_chunks:
+        return "English-output validation failed for one or more translation chunks"
     if empty_chunks:
         return "translation returned empty output for one or more chunks"
     if suspicious_chunks:
         return "translation output is suspiciously short for one or more chunks"
     if malformed.get("translated_unclosed_table"):
         return "translated markdown contains malformed table markup"
-    if source_stats["paragraph_count"] and translated_stats["paragraph_count"] < max(1, source_stats["paragraph_count"] // 4):
+    if source_stats["paragraph_count"] and translated_stats["paragraph_count"] < max(
+        1, source_stats["paragraph_count"] // 4
+    ):
         return "translated markdown appears to have collapsed many paragraphs"
-    if source_stats["character_count"] and translated_stats["character_count"] < source_stats["character_count"] * 0.35:
+    if (
+        source_stats["character_count"]
+        and translated_stats["character_count"] < source_stats["character_count"] * 0.35
+    ):
         return "translated markdown is much shorter than source markdown"
     return "no obvious source/translation mismatch detected"
 
 
 def _recommended_fix(likely_failure: str) -> str:
+    if "English-output validation failed" in likely_failure:
+        return "Review the listed failed chunk IDs; their source text was preserved after an English-only retry."
     if "empty output" in likely_failure or "suspiciously short" in likely_failure:
         return "Reduce effective translation chunk size and inspect the listed chunk IDs."
     if "malformed table" in likely_failure:
-        return "Use table-specific translation fallback or preserve table markup without translation."
+        return (
+            "Use table-specific translation fallback or preserve table markup without translation."
+        )
     if "collapsed" in likely_failure:
         return "Split source text at paragraph boundaries before translation and preserve markdown line breaks."
     if "much shorter" in likely_failure:
@@ -183,7 +225,14 @@ def _report_to_markdown(report: dict[str, Any]) -> str:
         "| Metric | Source | Translated |",
         "| --- | ---: | ---: |",
     ]
-    for key in ("character_count", "word_count", "paragraph_count", "heading_count", "table_count", "image_or_figure_placeholder_count"):
+    for key in (
+        "character_count",
+        "word_count",
+        "paragraph_count",
+        "heading_count",
+        "table_count",
+        "image_or_figure_placeholder_count",
+    ):
         lines.append(f"| {key} | {source[key]} | {translated[key]} |")
     lines.extend(
         [
@@ -194,6 +243,18 @@ def _report_to_markdown(report: dict[str, Any]) -> str:
             f"- Translated chunks: {report['translated_chunk_count']}",
             f"- Empty translated chunks: {', '.join(report['empty_translated_chunk_ids']) or 'none'}",
             f"- Suspiciously short chunks: {', '.join(report['suspiciously_short_chunk_ids']) or 'none'}",
+            "- Failed English-output validation: "
+            f"{', '.join(report['failed_translation_validation_chunk_ids']) or 'none'}",
+            "- Validation failure reasons: "
+            + (
+                ", ".join(
+                    f"{reason} ({count})"
+                    for reason, count in sorted(
+                        report["failed_translation_validation_reason_counts"].items()
+                    )
+                )
+                or "none"
+            ),
         ]
     )
     return "\n".join(lines) + "\n"

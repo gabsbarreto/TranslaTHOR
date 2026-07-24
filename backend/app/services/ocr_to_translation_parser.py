@@ -374,6 +374,8 @@ class OCRToTranslationParser:
         return {text for text, pages in pages_by_text.items() if len(pages) >= 2}
 
     def _exclusion_reason(self, block: Block, repeated_margin_text: set[str]) -> str | None:
+        if block.block_type == BlockType.FIGURE:
+            return "figure_internal_text_preserved"
         if block.block_type in {BlockType.HEADER, BlockType.FOOTER, BlockType.PAGE_NUMBER}:
             return f"surya_{block.block_type.value}"
         stripped = block.text.strip()

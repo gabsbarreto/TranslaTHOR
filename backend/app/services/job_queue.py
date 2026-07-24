@@ -5,7 +5,7 @@ from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.models.schema import JobStage
+from app.models.schema import JobQueueState, JobStage
 from app.services.job_store import JobStore
 from app.services.pipeline import TranslationPipeline
 
@@ -33,6 +33,12 @@ class JobQueue:
             self._refresh_queue_messages_locked()
             self._condition.notify()
 
+    def contains(self, job_id: str) -> bool:
+        with self._condition:
+            return self._active_job_id == job_id or any(
+                item.job_id == job_id for item in self._queue
+            )
+
     def cancel_job(self, job_id: str) -> dict[str, str]:
         removed_from_queue = False
         is_active = False
@@ -59,6 +65,10 @@ class JobQueue:
                     progress=1.0,
                     message="Cancelled before processing started.",
                     error=None,
+                    queue_state=JobQueueState.NONE,
+                    queue_position=None,
+                    jobs_ahead=None,
+                    completed_at=self.job_store.utc_now(),
                 )
             except FileNotFoundError:
                 pass
@@ -66,6 +76,16 @@ class JobQueue:
 
         if is_active:
             self.pipeline.cancel_job(job_id)
+            try:
+                self.job_store.update_status(
+                    job_id,
+                    queue_state=JobQueueState.NONE,
+                    queue_position=None,
+                    jobs_ahead=None,
+                    completed_at=self.job_store.utc_now(),
+                )
+            except FileNotFoundError:
+                pass
             return {"status": "active_cancelled"}
 
         return {"status": "not_found"}
@@ -85,6 +105,10 @@ class JobQueue:
                     progress=1.0,
                     message="Cancelled before processing started.",
                     error=None,
+                    queue_state=JobQueueState.NONE,
+                    queue_position=None,
+                    jobs_ahead=None,
+                    completed_at=self.job_store.utc_now(),
                 )
                 cancelled_queued += 1
             except FileNotFoundError:
@@ -93,6 +117,16 @@ class JobQueue:
         cancelled_active = 0
         if active_job_id:
             self.pipeline.cancel_job(active_job_id)
+            try:
+                self.job_store.update_status(
+                    active_job_id,
+                    queue_state=JobQueueState.NONE,
+                    queue_position=None,
+                    jobs_ahead=None,
+                    completed_at=self.job_store.utc_now(),
+                )
+            except FileNotFoundError:
+                pass
             cancelled_active = 1
 
         return {"queued_cancelled": cancelled_queued, "active_cancelled": cancelled_active}
@@ -104,12 +138,44 @@ class JobQueue:
                     self._condition.wait()
                 item = self._queue.popleft()
                 self._active_job_id = item.job_id
+                try:
+                    self.job_store.update_status(
+                        item.job_id,
+                        queue_state=JobQueueState.RUNNING,
+                        queue_position=None,
+                        jobs_ahead=None,
+                        started_at=self.job_store.utc_now(),
+                        message="Processing started.",
+                    )
+                except FileNotFoundError:
+                    self._active_job_id = None
+                    continue
                 self._refresh_queue_messages_locked()
 
             try:
                 self.pipeline.run(item.job_id, item.pdf_path, item.settings)
             finally:
                 with self._condition:
+                    try:
+                        status = self.job_store.load_status(item.job_id)
+                        terminal_updates = {
+                            "queue_state": JobQueueState.NONE,
+                            "queue_position": None,
+                            "jobs_ahead": None,
+                        }
+                        if (
+                            status.stage
+                            in {
+                                JobStage.COMPLETE,
+                                JobStage.CANCELLED,
+                                JobStage.FAILED,
+                            }
+                            and status.completed_at is None
+                        ):
+                            terminal_updates["completed_at"] = self.job_store.utc_now()
+                        self.job_store.update_status(item.job_id, **terminal_updates)
+                    except FileNotFoundError:
+                        pass
                     self._active_job_id = None
                     self._refresh_queue_messages_locked()
                     self._condition.notify_all()
@@ -129,6 +195,13 @@ class JobQueue:
                     progress=0.0,
                     message=message,
                     error=None,
+                    queue_state=JobQueueState.QUEUED,
+                    queue_position=idx + 1,
+                    jobs_ahead=queued_ahead,
+                    queued_at=(
+                        self.job_store.load_status(item.job_id).queued_at
+                        or self.job_store.utc_now()
+                    ),
                 )
             except FileNotFoundError:
                 continue

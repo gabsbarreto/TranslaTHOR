@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from app.models.inspection import PageInspection, PdfInspection
+from app.utils.pdf_metadata import optional_pdf_metadata_text
 
 try:
     from pypdf import PdfReader
@@ -56,8 +57,8 @@ class PdfInspector:
 
         return PdfInspection(
             filename=pdf_path.name,
-            title=metadata.get("/Title"),
-            author=metadata.get("/Author"),
+            title=optional_pdf_metadata_text(metadata.get("/Title")),
+            author=optional_pdf_metadata_text(metadata.get("/Author")),
             page_count=len(reader.pages),
             pages=pages,
         )

@@ -2,12 +2,25 @@ from __future__ import annotations
 
 import html
 import logging
+import math
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
+from difflib import SequenceMatcher
+from html.parser import HTMLParser
 from typing import Any, Callable
 
 from langdetect import detect
+
+try:
+    from langdetect import DetectorFactory, detect_langs
+
+    # langdetect otherwise chooses a random seed and can disagree about the same
+    # short scientific phrase between chunks in a single run.
+    DetectorFactory.seed = 0
+except (ImportError, AttributeError):  # pragma: no cover - compatibility for light test stubs
+    detect_langs = None  # type: ignore[assignment]
 
 from app.config import (
     DEFAULT_CHUNK_SIZE,
@@ -46,21 +59,248 @@ class TranslationUnit:
     context: str = ""
 
 
+@dataclass(frozen=True)
+class _LanguageResolution:
+    language: str | None
+    origin: str | None
+    confidence: float | None
+
+
+@dataclass(frozen=True)
+class _TableCellTopology:
+    tag: str
+    attributes: tuple[tuple[str, str], ...]
+    rowspan: int
+    colspan: int
+
+
+@dataclass(frozen=True)
+class _TableRowTopology:
+    section: tuple[str, int] | None
+    attributes: tuple[tuple[str, str], ...]
+    cells: tuple[_TableCellTopology, ...]
+
+
+@dataclass(frozen=True)
+class _TableMarkupTopology:
+    table_attributes: tuple[tuple[str, str], ...]
+    section_attributes: tuple[
+        tuple[str, int, tuple[tuple[str, str], ...]],
+        ...,
+    ]
+    rows: tuple[_TableRowTopology, ...]
+    section_events: tuple[tuple[str, str, int], ...]
+
+
+class _StrictTableTopologyParser(HTMLParser):
+    """Read table structure while rejecting crossed or unbalanced table tags."""
+
+    MAX_CELL_SPAN = 1_000
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.valid = True
+        self.saw_table = False
+        self.table_open = False
+        self.table_attributes: tuple[tuple[str, str], ...] = ()
+        self.current_section: tuple[str, int] | None = None
+        self.current_row: list[_TableCellTopology] | None = None
+        self.current_row_attributes: tuple[tuple[str, str], ...] = ()
+        self.current_cell: _TableCellTopology | None = None
+        self.section_attributes: list[
+            tuple[str, int, tuple[tuple[str, str], ...]]
+        ] = []
+        self.rows: list[_TableRowTopology] = []
+        self.section_events: list[tuple[str, str, int]] = []
+        self._section_counts: Counter[str] = Counter()
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.casefold()
+        if normalized == "table":
+            if self.table_open or self.saw_table:
+                self.valid = False
+                return
+            self.saw_table = True
+            self.table_open = True
+            self.table_attributes = self._normalized_attributes(attrs)
+            return
+        if normalized in {"thead", "tbody", "tfoot"}:
+            if (
+                not self.table_open
+                or self.current_section is not None
+                or self.current_row is not None
+                or self.current_cell is not None
+            ):
+                self.valid = False
+                return
+            occurrence = self._section_counts[normalized]
+            self._section_counts[normalized] += 1
+            self.current_section = (normalized, occurrence)
+            self.section_attributes.append(
+                (normalized, occurrence, self._normalized_attributes(attrs))
+            )
+            self.section_events.append(("start", normalized, occurrence))
+            return
+        if normalized == "tr":
+            if not self.table_open or self.current_row is not None or self.current_cell is not None:
+                self.valid = False
+                return
+            self.current_row = []
+            self.current_row_attributes = self._normalized_attributes(attrs)
+            return
+        if normalized in {"td", "th"}:
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            attributes = {str(name).casefold(): value for name, value in attrs}
+            self.current_cell = _TableCellTopology(
+                tag=normalized,
+                attributes=self._normalized_attributes(attrs),
+                rowspan=self._cell_span(attributes.get("rowspan")),
+                colspan=self._cell_span(attributes.get("colspan")),
+            )
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() in {"table", "thead", "tbody", "tfoot", "tr", "td", "th"}:
+            self.valid = False
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.casefold()
+        if normalized in {"td", "th"}:
+            if (
+                self.current_cell is None
+                or self.current_row is None
+                or self.current_cell.tag != normalized
+            ):
+                self.valid = False
+                return
+            self.current_row.append(self.current_cell)
+            self.current_cell = None
+            return
+        if normalized == "tr":
+            if self.current_row is None or self.current_cell is not None:
+                self.valid = False
+                return
+            self.rows.append(
+                _TableRowTopology(
+                    section=self.current_section,
+                    attributes=self.current_row_attributes,
+                    cells=tuple(self.current_row),
+                )
+            )
+            self.current_row = None
+            self.current_row_attributes = ()
+            return
+        if normalized in {"thead", "tbody", "tfoot"}:
+            if (
+                self.current_section is None
+                or self.current_section[0] != normalized
+                or self.current_row is not None
+                or self.current_cell is not None
+            ):
+                self.valid = False
+                return
+            occurrence = self.current_section[1]
+            self.section_events.append(("end", normalized, occurrence))
+            self.current_section = None
+            return
+        if normalized == "table":
+            if (
+                not self.table_open
+                or self.current_section is not None
+                or self.current_row is not None
+                or self.current_cell is not None
+            ):
+                self.valid = False
+                return
+            self.table_open = False
+
+    def topology(self) -> _TableMarkupTopology | None:
+        if (
+            not self.valid
+            or not self.saw_table
+            or self.table_open
+            or self.current_section is not None
+            or self.current_row is not None
+            or self.current_cell is not None
+            or not self.rows
+        ):
+            return None
+        return _TableMarkupTopology(
+            table_attributes=self.table_attributes,
+            section_attributes=tuple(self.section_attributes),
+            rows=tuple(self.rows),
+            section_events=tuple(self.section_events),
+        )
+
+    def _normalized_attributes(
+        self,
+        attrs: list[tuple[str, str | None]],
+    ) -> tuple[tuple[str, str], ...]:
+        normalized: list[tuple[str, str]] = []
+        for raw_name, raw_value in attrs:
+            name = str(raw_name).strip().casefold()
+            value = html.unescape(str(raw_value or "")).strip()
+            if name == "class":
+                value = " ".join(sorted(value.split()))
+            elif name == "style":
+                value = self._normalized_style(value)
+            elif name in {"align", "valign", "dir", "scope"}:
+                value = value.casefold()
+            normalized.append((name, value))
+        return tuple(sorted(normalized))
+
+    def _normalized_style(self, value: str) -> str:
+        declarations: list[str] = []
+        for declaration in value.split(";"):
+            declaration = declaration.strip()
+            if not declaration:
+                continue
+            property_name, separator, property_value = declaration.partition(":")
+            if not separator:
+                declarations.append(" ".join(declaration.split()))
+                continue
+            declarations.append(
+                f"{property_name.strip().casefold()}:{' '.join(property_value.split())}"
+            )
+        return ";".join(declarations)
+
+    def _cell_span(self, value: str | None) -> int:
+        try:
+            span = int(str(value or "1").strip())
+        except (TypeError, ValueError):
+            return 1
+        return span if 0 < span <= self.MAX_CELL_SPAN else 1
+
+
 class MlxTranslator:
     TABLE_DELIMITER = "\n|||CELL_BREAK|||\n"
     TABLE_HEADER_PREFIX = "__table_header__:"
     TABLE_ROW_PREFIX = "__table_row__:"
     TABLE_OUTPUT_MAX_TOKENS = 4096
-    TABLE_ROW_GROUP_SIZE = 8
+    TABLE_ROW_GROUP_SIZE = 3
     PROSE_CHUNK_TOKEN_CAP = 800
+    TRANSLATION_FAILED_STATUS = "translation_failed"
+    _ENGLISH_SOURCE_CONFIDENCE = 0.90
+    _NON_ENGLISH_OUTPUT_CONFIDENCE = 0.85
+    _COMPACT_TABLE_TRANSLATION_GUIDANCE = (
+        "Keep table labels as concise as the source so they fit their original cells. "
+        "Do not expand source abbreviations; use an equally concise standard English abbreviation "
+        "when unambiguous, otherwise preserve the source abbreviation. Prefer compact labels over "
+        "explanatory phrases."
+    )
     _TAG_RE = re.compile(r"<[^>]+>")
     _ENTITY_RE = re.compile(r"&[a-zA-Z0-9#]+;")
     _TABLE_BLOCK_RE = re.compile(r"(?is)<table\b.*?</table>")
-    _TABLE_SPLIT_RE = re.compile(r"(?is)^(?P<before>.*?)(?P<table><table\b.*?</table>)(?P<after>.*)$")
+    _TABLE_SPLIT_RE = re.compile(
+        r"(?is)^(?P<before>.*?)(?P<table><table\b.*?</table>)(?P<after>.*)$"
+    )
     _TABLE_PARTS_RE = re.compile(
         r"(?is)^(?P<prefix>.*?<table\b[^>]*>)(?P<body>.*)(?P<suffix></table>\s*)$"
     )
     _TABLE_ROW_RE = re.compile(r"(?is)<tr\b[^>]*>.*?</tr>")
+    _TABLE_OPEN_RE = re.compile(r"(?is)<table\b[^>]*>")
+    _TABLE_SECTION_OPEN_RE = re.compile(r"(?is)<(?P<tag>thead|tbody|tfoot)\b[^>]*>")
     _TABLE_ESCAPED_TAG_RE = re.compile(
         r"(?is)&lt;\s*(/?)\s*(table|thead|tbody|tfoot|tr|td|th)\b([^<>]*?)&gt;"
     )
@@ -68,6 +308,11 @@ class MlxTranslator:
     _TABLE_ROW_OPEN_RE = re.compile(r"(?is)<tr\b[^>]*>")
     _TABLE_ROW_CLOSE_RE = re.compile(r"(?is)</tr\s*>")
     _TABLE_CELL_RE = re.compile(r"(?is)<t[dh]\b[^>]*>(?P<body>.*?)</t[dh]\s*>")
+    _SEGMENT_TAG = "translathor-segment"
+    _SEGMENT_RE = re.compile(
+        r"(?is)<translathor-segment\s+index=(?:\"|')(?P<index>\d+)(?:\"|')\s*>"
+        r"(?P<body>.*?)</translathor-segment\s*>"
+    )
     _SENTENCE_ABBREVIATIONS = {
         "al",
         "approx",
@@ -131,7 +376,6 @@ class MlxTranslator:
         "results",
         "summary",
     }
-
     def __init__(self, settings: TranslationSettings) -> None:
         self.settings = settings
         self._model = None
@@ -168,48 +412,97 @@ class MlxTranslator:
     def build_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
         self._document_language = self._normalize_lang_code(document.metadata.detected_language)
         if document.metadata.translation.get("ocr_logical_chunks_prepared"):
-            return self._prepared_logical_chunks(document.translation_chunks)
+            return self._prepared_logical_chunks(document)
 
         units = self._build_translation_units(document)
+        block_by_id = {block.id: block for block in document.blocks}
         chunks: list[TranslationChunk] = []
         chunk_block_types: dict[str, BlockType] = {}
         for unit in units:
+            unit_pages = sorted(
+                {
+                    block_by_id[block_id].page_number
+                    for block_id in unit.block_ids
+                    if block_id in block_by_id
+                }
+            )
             if unit.block_ids and (
-                unit.block_ids[0].startswith(self.TABLE_HEADER_PREFIX) or unit.block_ids[0].startswith(self.TABLE_ROW_PREFIX)
+                unit.block_ids[0].startswith(self.TABLE_HEADER_PREFIX)
+                or unit.block_ids[0].startswith(self.TABLE_ROW_PREFIX)
             ):
                 text_parts = [unit.text]
             elif unit.block_type == BlockType.TABLE and self._is_table_heavy_markup(unit.text):
                 text_parts = [unit.text]
+            elif len(unit.block_ids) > 1:
+                # Physical block boundaries must survive token-budget handling.
+                # _translate_physical_segments() batches whole regions safely.
+                text_parts = [unit.text]
             else:
                 text_parts = self._split_to_token_budget(unit.text)
             for text_part in text_parts:
-                if unit.block_type != BlockType.TABLE and not self._has_translatable_content(text_part):
+                if unit.block_type != BlockType.TABLE and not self._has_translatable_content(
+                    text_part
+                ):
                     continue
+                nearby_context = self._nearby_heading_context(
+                    document,
+                    unit.block_ids,
+                    unit.block_type,
+                )
+                language = self._chunk_language_resolution(
+                    text_part,
+                    unit.block_type,
+                    nearby_context,
+                )
                 chunk = TranslationChunk(
                     id=f"chunk-{len(chunks)}",
                     block_ids=unit.block_ids,
                     source_text=text_part,
-                    context=unit.context,
-                    source_language=self._chunk_source_language(text_part, unit.block_type),
+                    context=self._context_with_nearby_source(unit.context, nearby_context),
+                    source_language=language.language,
+                    source_language_origin=language.origin,
+                    source_language_confidence=language.confidence,
                     source_token_count=self._token_count(text_part),
+                    page_start=unit_pages[0] if unit_pages else None,
+                    page_end=unit_pages[-1] if unit_pages else None,
                 )
                 chunks.append(chunk)
                 chunk_block_types[chunk.id] = unit.block_type
-        return self._merge_adjacent_translation_chunks(chunks, chunk_block_types)
+        return self._merge_adjacent_translation_chunks(
+            chunks,
+            chunk_block_types,
+            document=document,
+        )
 
-    def _prepared_logical_chunks(self, chunks: list[TranslationChunk]) -> list[TranslationChunk]:
+    def _prepared_logical_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
         prepared: list[TranslationChunk] = []
-        for chunk in chunks:
+        for chunk in document.translation_chunks:
             if chunk.status != "ready_for_translation":
                 continue
             block_type = self._logical_chunk_block_type(chunk.chunk_type)
+            if block_type == BlockType.FIGURE:
+                continue
             if block_type == BlockType.TABLE and self._is_table_heavy_markup(chunk.source_text):
+                text_parts = [chunk.source_text]
+            elif len(chunk.block_ids) > 1:
+                # Repeating the full block-id list on every token-budget part
+                # would translate and apply each physical region more than once.
                 text_parts = [chunk.source_text]
             else:
                 text_parts = self._split_to_token_budget(chunk.source_text)
             for part_index, text_part in enumerate(text_parts, start=1):
                 if block_type != BlockType.TABLE and not self._has_translatable_content(text_part):
                     continue
+                nearby_context = self._nearby_heading_context(
+                    document,
+                    chunk.block_ids,
+                    block_type,
+                )
+                language = self._chunk_language_resolution(
+                    text_part,
+                    block_type,
+                    nearby_context,
+                )
                 prepared.append(
                     chunk.model_copy(
                         update={
@@ -219,7 +512,13 @@ class MlxTranslator:
                                 else f"{chunk.id}-part{part_index:02d}"
                             ),
                             "source_text": text_part,
-                            "source_language": self._chunk_source_language(text_part, block_type),
+                            "context": self._context_with_nearby_source(
+                                chunk.context,
+                                nearby_context,
+                            ),
+                            "source_language": language.language,
+                            "source_language_origin": language.origin,
+                            "source_language_confidence": language.confidence,
                             "source_token_count": self._token_count(text_part),
                         }
                     )
@@ -257,16 +556,27 @@ class MlxTranslator:
         translated_md = markdown
         block_by_id = {block.id: block for block in document.blocks}
         table_by_id = {table.id: table for table in document.tables}
-        translated_chunks: list[TranslationChunk] = []
-        table_like_chunks = [chunk for chunk in chunks if self._is_table_heavy_markup(chunk.source_text)]
-        table_chunk_index: dict[int, int] = {id(chunk): idx for idx, chunk in enumerate(table_like_chunks, start=1)}
+        application_chunks: list[TranslationChunk] = []
+        table_like_chunks = [
+            chunk for chunk in chunks if self._is_table_heavy_markup(chunk.source_text)
+        ]
+        table_chunk_index: dict[int, int] = {
+            id(chunk): idx for idx, chunk in enumerate(table_like_chunks, start=1)
+        }
 
         total_chunks = len(chunks)
         for index, chunk in enumerate(chunks, start=1):
             block_type = self._chunk_block_type(chunk, block_by_id)
             effective_context = self._augment_context_for_block_type(chunk.context, block_type)
+            source_language_authoritative = self._source_language_is_authoritative(chunk)
             is_table_like = self._is_table_heavy_markup(chunk.source_text)
-            is_english = loaded and self._is_already_english(chunk)
+            preserve_verbatim = block_type in {
+                BlockType.EQUATION,
+                BlockType.PAGE_NUMBER,
+                BlockType.REFERENCE,
+            }
+            is_english = loaded and (preserve_verbatim or self._is_already_english(chunk))
+            validation_issue: str | None = None
 
             if on_chunk_started is not None:
                 on_chunk_started(index, total_chunks)
@@ -278,13 +588,50 @@ class MlxTranslator:
                     f"chunk-{index}",
                 )
 
+            physical_segments = self._physical_translation_segments(chunk, block_by_id)
             if not loaded or is_english:
                 translated = chunk.source_text
+                if physical_segments:
+                    application_chunks.extend(
+                        self._segment_application_chunks(
+                            chunk,
+                            physical_segments,
+                            [source_text for _, source_text, _ in physical_segments],
+                        )
+                    )
             elif is_table_like:
                 translated = self._translate_table_markup_chunk(
                     chunk.source_text,
                     effective_context,
                     chunk.source_language,
+                )
+                validation_issue = self._table_translation_issue(
+                    chunk.source_text,
+                    translated,
+                    chunk.source_language,
+                )
+            elif physical_segments:
+                segment_targets = self._translate_physical_segments(
+                    physical_segments,
+                    effective_context,
+                    chunk.source_language,
+                    chunk.source_text,
+                    block_by_id,
+                )
+                translated = "\n\n".join(segment_targets)
+                validation_issue = self._translation_acceptance_issue(
+                    "\n\n".join(source_text for _, source_text, _ in physical_segments),
+                    translated,
+                    chunk.source_language,
+                    block_type,
+                )
+                application_chunks.extend(
+                    self._segment_application_chunks(
+                        chunk,
+                        physical_segments,
+                        segment_targets,
+                        validation_issue=validation_issue,
+                    )
                 )
             else:
                 translated = self._translate_chunk_with_validation(
@@ -292,17 +639,645 @@ class MlxTranslator:
                     effective_context,
                     chunk.source_language,
                     block_type,
+                    source_language_authoritative=source_language_authoritative,
+                )
+                validation_issue = self._translation_acceptance_issue(
+                    chunk.source_text,
+                    translated,
+                    chunk.source_language,
+                    block_type,
+                    source_language_authoritative=source_language_authoritative,
                 )
             chunk.translated_text = translated
-            translated_chunks.append(chunk)
+            if validation_issue is not None:
+                self._mark_translation_failure(chunk, validation_issue)
+            else:
+                chunk.status = "ready_for_translation"
+                chunk.reason = None
+            if not physical_segments:
+                application_chunks.append(chunk)
             if on_chunk_translated is not None:
                 preview = translated.replace("\n", " ").strip()
                 on_chunk_translated(index, total_chunks, preview[:160])
 
-        for chunk in self._coalesce_translated_chunks(translated_chunks):
+        application_chunks = self._coalesce_translated_chunks(application_chunks)
+        document.translation_chunks = application_chunks
+        for chunk in application_chunks:
             self._apply_translation_to_target(chunk, block_by_id, table_by_id)
 
+        failed_chunks = [
+            chunk for chunk in application_chunks if chunk.status == self.TRANSLATION_FAILED_STATUS
+        ]
+        document.metadata.translation["target_language_validation"] = {
+            "status": "warning" if failed_chunks else "passed",
+            "failed_chunk_count": len(failed_chunks),
+            "failed_chunk_ids": [chunk.id for chunk in failed_chunks],
+            "policy": "retry_english_then_preserve_source",
+        }
+        if failed_chunks:
+            warning = (
+                f"{len(failed_chunks)} translation chunk(s) failed English-output validation; "
+                "their source text was preserved and the chunk IDs are recorded in structured JSON."
+            )
+            if warning not in document.warnings:
+                document.warnings.append(warning)
+
         return document, translated_md
+
+    def _physical_translation_segments(
+        self,
+        chunk: TranslationChunk,
+        block_by_id: dict[str, Block],
+    ) -> list[tuple[str, str, BlockType]]:
+        """Return source text for each independently placeable block in a grouped chunk."""
+        if len(chunk.block_ids) <= 1 or self._is_table_heavy_markup(chunk.source_text):
+            return []
+
+        segments: list[tuple[str, str, BlockType]] = []
+        seen: set[str] = set()
+        for block_id in chunk.block_ids:
+            if block_id in seen:
+                return []
+            block = block_by_id.get(block_id)
+            if block is None:
+                return []
+            source_text = str(block.metadata.get("source_text", block.text)).strip()
+            if not source_text:
+                return []
+            segments.append((block_id, source_text, block.block_type))
+            seen.add(block_id)
+        return segments
+
+    def _translate_physical_segments(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+        context: str,
+        source_language: str | None,
+        logical_source_text: str,
+        block_by_id: dict[str, Block],
+    ) -> list[str]:
+        targets: list[str] = []
+        shared_context = (
+            f"{context}\n"
+            "Translate only TEXT below. It belongs to the following continuous source passage; use that "
+            f"passage only for terminology and grammatical context:\n{logical_source_text}"
+        ).strip()
+        for batch in self._physical_segment_batches(segments):
+            if len(batch) == 1:
+                _, source_text, block_type = batch[0]
+                targets.append(
+                    self._translate_single_physical_segment(
+                        source_text,
+                        shared_context,
+                        source_language,
+                        block_type,
+                    )
+                )
+                continue
+            targets.extend(
+                self._translate_tagged_physical_segments(
+                    batch,
+                    context,
+                    source_language,
+                    shared_context,
+                    continuity_proven=self._physical_segments_form_continuous_paragraph(
+                        batch,
+                        block_by_id,
+                    ),
+                )
+            )
+        return targets
+
+    def _physical_segments_form_continuous_paragraph(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+        block_by_id: dict[str, Block],
+    ) -> bool:
+        """Require layout and textual evidence before moving text across boxes.
+
+        Adjacent chunks are batched for linguistic context, but adjacency does
+        not make them one paragraph. Redistribution is safe only for blocks
+        that the normal paragraph join accepts, or for an explicit hyphenated
+        word continuation across a column boundary. Missing geometry is
+        deliberately not guessed.
+        """
+
+        if len(segments) < 2 or any(
+            block_type != BlockType.PARAGRAPH for _, _, block_type in segments
+        ):
+            return False
+
+        document_positions = {
+            block_id: index for index, block_id in enumerate(block_by_id)
+        }
+        for previous_segment, current_segment in zip(
+            segments,
+            segments[1:],
+        ):
+            previous = block_by_id.get(previous_segment[0])
+            current = block_by_id.get(current_segment[0])
+            if previous is None or current is None:
+                return False
+            if previous.page_number != current.page_number:
+                return False
+            previous_position = document_positions.get(previous.id)
+            current_position = document_positions.get(current.id)
+            if (
+                previous_position is None
+                or current_position is None
+                or current_position != previous_position + 1
+                or current.reading_order_index <= previous.reading_order_index
+            ):
+                return False
+            previous_section = previous.metadata.get("section_hierarchy")
+            current_section = current.metadata.get("section_hierarchy")
+            if (
+                previous_section
+                and current_section
+                and previous_section != current_section
+            ):
+                return False
+            if self._belongs_to_same_paragraph(previous, current):
+                continue
+            if not self._is_explicit_cross_column_word_continuation(
+                previous,
+                current,
+                previous_segment[1],
+                current_segment[1],
+            ):
+                return False
+        return True
+
+    def _is_explicit_cross_column_word_continuation(
+        self,
+        previous: Block,
+        current: Block,
+        previous_source: str,
+        current_source: str,
+    ) -> bool:
+        if previous.bbox is None or current.bbox is None:
+            return False
+        previous_text = previous_source.rstrip()
+        current_text = current_source.lstrip()
+        if not re.search(r"[^\W\d_]\s*[-\u00ad]\s*$", previous_text, flags=re.UNICODE):
+            return False
+        if not re.match(r"[^\W\d_]", current_text, flags=re.UNICODE):
+            return False
+        first_letter = re.match(r"[^\W\d_]", current_text, flags=re.UNICODE)
+        if first_letter is None or not first_letter.group(0).islower():
+            return False
+
+        # A reading-order wrap must move right and upward into the next
+        # column. A same-column gap that failed the ordinary paragraph test is
+        # not rescued merely because the preceding block ends in a hyphen.
+        return (
+            current.bbox.x0 > previous.bbox.x0
+            and current.bbox.x0 >= previous.bbox.x1 - 2.0
+            and current.bbox.y0 < previous.bbox.y0
+        )
+
+    def _physical_segment_batches(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> list[list[tuple[str, str, BlockType]]]:
+        token_budget = max(128, int(self.settings.chunk_size or DEFAULT_CHUNK_SIZE))
+        token_budget = min(token_budget, self.PROSE_CHUNK_TOKEN_CAP)
+        token_budget = min(token_budget, max(128, int(self.settings.max_tokens * 0.75)))
+        batches: list[list[tuple[str, str, BlockType]]] = []
+        current: list[tuple[str, str, BlockType]] = []
+        current_tokens = 0
+        for segment in segments:
+            segment_tokens = self._token_count(segment[1]) + 8
+            if current and current_tokens + segment_tokens > token_budget:
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(segment)
+            current_tokens += segment_tokens
+        if current:
+            batches.append(current)
+        return batches
+
+    def _translate_single_physical_segment(
+        self,
+        source_text: str,
+        context: str,
+        source_language: str | None,
+        block_type: BlockType,
+    ) -> str:
+        return "\n\n".join(
+            self._translate_chunk_with_validation(
+                part,
+                context,
+                source_language,
+                block_type,
+            )
+            for part in self._split_to_token_budget(source_text)
+        )
+
+    def _translate_tagged_physical_segments(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+        context: str,
+        source_language: str | None,
+        shared_context: str,
+        *,
+        continuity_proven: bool,
+    ) -> list[str]:
+        tagged_source = self._tagged_segment_text(segments)
+        if continuity_proven:
+            segment_instruction = (
+                f"TEXT contains {len(segments)} ordered <{self._SEGMENT_TAG}> elements from one "
+                "proven continuous paragraph. First translate the complete paragraph mentally, then "
+                "distribute that translation across the same ordered elements. Their concatenated contents "
+                "must read as one fluent, grammatical English passage even when a boundary falls in the "
+                "middle of a sentence. The tags are placement boundaries, not word-for-word constraints, "
+                "so adjust English word order around adjacent boundaries when needed. Preserve every opening "
+                "tag, closing tag, index, order, and boundary marker exactly. Return no text outside the "
+                "elements."
+            )
+        else:
+            segment_instruction = (
+                f"TEXT contains {len(segments)} ordered <{self._SEGMENT_TAG}> physical regions that share "
+                "terminology context but are not proven to be one paragraph. Translate each element "
+                "independently. Do not move, merge, duplicate, or redistribute any clause or value between "
+                "elements. Preserve every opening tag, closing tag, index, order, and boundary marker exactly. "
+                "Return no text outside the elements."
+            )
+        strict_context = f"{context}\n{segment_instruction}".strip()
+        translated = self._translate_chunk(tagged_source, strict_context, source_language)
+        collapsed_mapping = self._tagged_translation_has_collapsed_region(
+            translated,
+            segments,
+        )
+        parsed = self._parse_segment_translation(translated, segments, source_language)
+        if parsed is not None:
+            return parsed
+
+        boundary_retry = (
+            "Neighboring wording may shift only as needed to keep their concatenation grammatical."
+            if continuity_proven
+            else "Do not shift wording or meaning from one element into another element."
+        )
+        retry_context = (
+            f"{strict_context}\n"
+            "The prior result did not preserve the segment mapping. Each input index must occur exactly "
+            f"once in the output. Do not omit or duplicate content. {boundary_retry} Return English only "
+            "and translate every substantive non-English phrase; do not repeat source-language prose."
+        )
+        retried = self._translate_chunk(tagged_source, retry_context, source_language)
+        collapsed_mapping = collapsed_mapping or self._tagged_translation_has_collapsed_region(
+            retried,
+            segments,
+        )
+        parsed = self._parse_segment_translation(retried, segments, source_language)
+        if parsed is not None:
+            return parsed
+
+        if collapsed_mapping and continuity_proven:
+            logical_source = self._join_paragraph_lines(
+                [source_text for _, source_text, _ in segments]
+            )
+            logical_context = (
+                f"{shared_context}\n"
+                "Translate this complete continuous passage once, without placement tags. "
+                "Do not repeat, summarize, or omit any clause."
+            )
+            logical_target = self._translate_chunk_with_validation(
+                logical_source,
+                logical_context,
+                source_language,
+                self._segment_validation_block_type(segments),
+            )
+            redistributed = self._redistribute_logical_translation(
+                logical_source,
+                logical_target,
+                segments,
+                source_language,
+                continuity_proven=True,
+            )
+            if redistributed is not None:
+                logger.info(
+                    "Redistributed a validated continuous translation across collapsed physical regions."
+                )
+                return redistributed
+
+        logger.warning(
+            "Grouped translation did not preserve physical block boundaries; retrying blocks separately."
+        )
+        fallback_targets = [
+            self._translate_single_physical_segment(
+                source_text,
+                shared_context,
+                source_language,
+                block_type,
+            )
+            for _, source_text, block_type in segments
+        ]
+        aggregate_issue = self._translation_acceptance_issue(
+            "\n\n".join(source_text for _, source_text, _ in segments),
+            "\n\n".join(fallback_targets),
+            source_language,
+            self._segment_validation_block_type(segments),
+        )
+        if aggregate_issue is not None:
+            logger.warning(
+                "Separate physical-block translations failed target-language validation (%s); "
+                "returning source text.",
+                aggregate_issue,
+            )
+            return [source_text for _, source_text, _ in segments]
+        return fallback_targets
+
+    def _tagged_segment_text(self, segments: list[tuple[str, str, BlockType]]) -> str:
+        return "\n".join(
+            f'<{self._SEGMENT_TAG} index="{index}">{source_text}</{self._SEGMENT_TAG}>'
+            for index, (_, source_text, _) in enumerate(segments)
+        )
+
+    def _parse_segment_translation(
+        self,
+        translated: str,
+        segments: list[tuple[str, str, BlockType]],
+        source_language: str | None,
+    ) -> list[str] | None:
+        targets = self._tagged_segment_targets(translated, len(segments))
+        if targets is None:
+            return None
+        if any(
+            not self._is_acceptable_chunk_translation(
+                source_text,
+                target,
+                source_language,
+                block_type,
+            )
+            for (_, source_text, block_type), target in zip(segments, targets, strict=True)
+        ):
+            return None
+        if (
+            self._translation_acceptance_issue(
+                "\n\n".join(source_text for _, source_text, _ in segments),
+                "\n\n".join(targets),
+                source_language,
+                self._segment_validation_block_type(segments),
+            )
+            is not None
+        ):
+            return None
+        return targets
+
+    def _tagged_segment_targets(
+        self,
+        translated: str,
+        expected_count: int,
+    ) -> list[str] | None:
+        matches = list(self._SEGMENT_RE.finditer(translated.strip()))
+        if len(matches) != expected_count:
+            return None
+        if [int(match.group("index")) for match in matches] != list(range(expected_count)):
+            return None
+        if self._SEGMENT_RE.sub("", translated).strip():
+            return None
+        return [match.group("body").strip() for match in matches]
+
+    def _tagged_translation_has_collapsed_region(
+        self,
+        translated: str,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> bool:
+        targets = self._tagged_segment_targets(translated, len(segments))
+        if targets is None:
+            return False
+        return any(
+            not self._is_valid_chunk_translation_structure(source_text, target, block_type)
+            for (_, source_text, block_type), target in zip(segments, targets, strict=True)
+        )
+
+    def _redistribute_logical_translation(
+        self,
+        logical_source: str,
+        logical_target: str,
+        segments: list[tuple[str, str, BlockType]],
+        source_language: str | None,
+        *,
+        continuity_proven: bool,
+    ) -> list[str] | None:
+        if not continuity_proven:
+            return None
+        block_type = self._segment_validation_block_type(segments)
+        if not self._is_acceptable_chunk_translation(
+            logical_source,
+            logical_target,
+            source_language,
+            block_type,
+        ):
+            return None
+
+        continuous_source, source_boundaries = self._continuous_source_with_boundaries(
+            segments
+        )
+        if self._normalized_whitespace(continuous_source) != self._normalized_whitespace(
+            logical_source
+        ):
+            return None
+
+        logical_target = self._normalized_whitespace(logical_target)
+        target_tokens = list(re.finditer(r"\S+", logical_target))
+        if len(target_tokens) < len(segments):
+            return None
+        source_weights = [
+            max(1, len(self._language_words(source_text)))
+            for _, source_text, _ in segments
+        ]
+        minimum_counts = [
+            max(1, math.ceil(weight * 0.20)) if weight >= 6 else 1
+            for weight in source_weights
+        ]
+        if sum(minimum_counts) > len(target_tokens):
+            return None
+
+        desired_boundaries = self._sentence_aligned_target_boundaries(
+            continuous_source,
+            logical_target,
+            source_boundaries,
+            target_tokens,
+        )
+        if desired_boundaries is None:
+            return None
+
+        token_boundaries: list[int] = []
+        previous_boundary = 0
+        for index, desired in enumerate(desired_boundaries):
+            minimum_boundary = previous_boundary + minimum_counts[index]
+            maximum_boundary = len(target_tokens) - sum(minimum_counts[index + 1 :])
+            boundary = max(minimum_boundary, min(desired, maximum_boundary))
+            if boundary <= previous_boundary:
+                return None
+            token_boundaries.append(boundary)
+            previous_boundary = boundary
+        counts = [
+            current - previous
+            for previous, current in zip(
+                [0, *token_boundaries],
+                [*token_boundaries, len(target_tokens)],
+                strict=True,
+            )
+        ]
+
+        redistributed: list[str] = []
+        token_index = 0
+        for count in counts:
+            start = 0 if token_index == 0 else target_tokens[token_index].start()
+            token_index += count
+            end = (
+                len(logical_target)
+                if token_index == len(target_tokens)
+                else target_tokens[token_index].start()
+            )
+            redistributed.append(logical_target[start:end].strip())
+
+        if any(
+            not self._is_valid_chunk_translation_structure(source_text, target, segment_type)
+            for (_, source_text, segment_type), target in zip(
+                segments,
+                redistributed,
+                strict=True,
+            )
+        ):
+            return None
+        if self._normalized_whitespace(" ".join(redistributed)) != logical_target:
+            return None
+        return redistributed
+
+    def _continuous_source_with_boundaries(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> tuple[str, list[int]]:
+        text = ""
+        boundaries: list[int] = []
+        for index, (_, source_text, _) in enumerate(segments):
+            source_text = self._normalized_whitespace(source_text)
+            if index == 0:
+                text = source_text
+                continue
+            if text.endswith(("-", "\u00ad")) and re.match(
+                r"[^\W\d_]",
+                source_text,
+                flags=re.UNICODE,
+            ):
+                text = text[:-1]
+                boundaries.append(len(text))
+                text += source_text
+            else:
+                text += " "
+                boundaries.append(len(text))
+                text += source_text
+        return text, boundaries
+
+    def _sentence_aligned_target_boundaries(
+        self,
+        source: str,
+        target: str,
+        source_boundaries: list[int],
+        target_tokens: list[re.Match[str]],
+    ) -> list[int] | None:
+        source_sentences = self._sentence_spans(source)
+        target_sentences = self._sentence_spans(target)
+        if not source_sentences or len(source_sentences) != len(target_sentences):
+            return None
+
+        desired: list[int] = []
+        prior = 0
+        for boundary in source_boundaries:
+            sentence_index = next(
+                (
+                    index
+                    for index, (start, end) in enumerate(source_sentences)
+                    if start <= boundary <= end
+                ),
+                None,
+            )
+            if sentence_index is None:
+                return None
+            source_start, source_end = source_sentences[sentence_index]
+            target_start, target_end = target_sentences[sentence_index]
+            sentence_token_indexes = [
+                index
+                for index, token in enumerate(target_tokens)
+                if token.start() >= target_start and token.end() <= target_end
+            ]
+            if not sentence_token_indexes:
+                return None
+            if boundary >= source_end:
+                candidate = sentence_token_indexes[-1] + 1
+            else:
+                source_prefix = source[source_start:boundary]
+                source_sentence = source[source_start:source_end]
+                prefix_letters = sum(character.isalpha() for character in source_prefix)
+                sentence_letters = sum(character.isalpha() for character in source_sentence)
+                if sentence_letters <= 0:
+                    return None
+                local_count = math.floor(
+                    len(sentence_token_indexes) * prefix_letters / sentence_letters + 0.5
+                )
+                candidate = sentence_token_indexes[0] + local_count
+            if candidate < prior:
+                return None
+            desired.append(candidate)
+            prior = candidate
+        return desired
+
+    def _sentence_spans(self, text: str) -> list[tuple[int, int]]:
+        spans: list[tuple[int, int]] = []
+        cursor = 0
+        for sentence in self._split_into_sentences(text):
+            start = text.find(sentence, cursor)
+            if start < 0:
+                return []
+            end = start + len(sentence)
+            spans.append((start, end))
+            cursor = end
+        return spans
+
+    def _normalized_whitespace(self, text: str) -> str:
+        return " ".join(text.strip().split())
+
+    def _segment_validation_block_type(
+        self,
+        segments: list[tuple[str, str, BlockType]],
+    ) -> BlockType | None:
+        block_types = {block_type for _, _, block_type in segments}
+        return next(iter(block_types)) if len(block_types) == 1 else BlockType.PARAGRAPH
+
+    def _segment_application_chunks(
+        self,
+        chunk: TranslationChunk,
+        segments: list[tuple[str, str, BlockType]],
+        targets: list[str],
+        *,
+        validation_issue: str | None = None,
+    ) -> list[TranslationChunk]:
+        application_chunks = [
+            chunk.model_copy(
+                update={
+                    "id": f"{chunk.id}-block{index + 1:02d}",
+                    "block_ids": [block_id],
+                    "source_text": source_text,
+                    "translated_text": target,
+                    "placement_group_id": chunk.id,
+                    "placement_index": index,
+                    "placement_count": len(segments),
+                    "source_token_count": self._token_count(source_text),
+                }
+            )
+            for index, ((block_id, source_text, _), target) in enumerate(
+                zip(segments, targets, strict=True)
+            )
+        ]
+        if validation_issue is not None:
+            for application_chunk in application_chunks:
+                self._mark_translation_failure(application_chunk, validation_issue)
+        return application_chunks
 
     def cleanup(self) -> None:
         self._model = None
@@ -332,6 +1307,10 @@ class MlxTranslator:
         for block in document.blocks:
             if self._is_marker_table_cell_block(block):
                 continue
+            if block.block_type == BlockType.FIGURE:
+                block.metadata["excluded_from_translation"] = True
+                block.metadata["translation_exclusion_reason"] = "figure_internal_text_preserved"
+                continue
             if not block.text.strip():
                 continue
 
@@ -339,14 +1318,20 @@ class MlxTranslator:
                 self._flush_paragraph_unit(pending, units, section_context)
                 pending = []
                 heading_text = block.text.strip()
-                units.append(TranslationUnit([block.id], heading_text, block.block_type, section_context))
+                units.append(
+                    TranslationUnit([block.id], heading_text, block.block_type, section_context)
+                )
                 section_context = heading_text
                 continue
 
             if block.block_type != BlockType.PARAGRAPH:
                 self._flush_paragraph_unit(pending, units, section_context)
                 pending = []
-                units.append(TranslationUnit([block.id], block.text.strip(), block.block_type, section_context))
+                units.append(
+                    TranslationUnit(
+                        [block.id], block.text.strip(), block.block_type, section_context
+                    )
+                )
                 continue
 
             if pending and not self._belongs_to_same_paragraph(pending[-1], block):
@@ -358,7 +1343,9 @@ class MlxTranslator:
         self._append_table_units(document, units, section_context)
         return units
 
-    def _append_table_units(self, document: DocumentModel, units: list[TranslationUnit], context: str) -> None:
+    def _append_table_units(
+        self, document: DocumentModel, units: list[TranslationUnit], context: str
+    ) -> None:
         for table_index, table in enumerate(document.tables, start=1):
             table_debug = getattr(table, "debug", {})
             if table_debug.get("render_from_block_text") or table_debug.get("marker_block_id"):
@@ -390,12 +1377,16 @@ class MlxTranslator:
                     )
                 )
 
-    def _flush_paragraph_unit(self, blocks: list[Block], units: list[TranslationUnit], context: str) -> None:
+    def _flush_paragraph_unit(
+        self, blocks: list[Block], units: list[TranslationUnit], context: str
+    ) -> None:
         if not blocks:
             return
         text = self._join_paragraph_lines([block.text for block in blocks])
         if text:
-            unit_type = BlockType.TABLE if self._is_table_heavy_markup(text) else BlockType.PARAGRAPH
+            unit_type = (
+                BlockType.TABLE if self._is_table_heavy_markup(text) else BlockType.PARAGRAPH
+            )
             if unit_type == BlockType.TABLE:
                 text = self._normalize_table_markup_for_translation(text)
             units.append(TranslationUnit([block.id for block in blocks], text, unit_type, context))
@@ -458,7 +1449,9 @@ class MlxTranslator:
             table = table_by_id.get(table_id)
             if table is None:
                 return
-            table.headers = self._split_table_translation(chunk.translated_text, chunk.source_text, len(table.headers))
+            table.headers = self._split_table_translation(
+                chunk.translated_text, chunk.source_text, len(table.headers)
+            )
             return
         if target_id.startswith(self.TABLE_ROW_PREFIX):
             suffix = target_id.removeprefix(self.TABLE_ROW_PREFIX)
@@ -477,7 +1470,11 @@ class MlxTranslator:
             table.rows[row_index] = translated_row
             if row_index < len(table.cells):
                 table.cells[row_index] = [
-                    cell.model_copy(update={"text": translated_row[idx] if idx < len(translated_row) else cell.text})
+                    cell.model_copy(
+                        update={
+                            "text": translated_row[idx] if idx < len(translated_row) else cell.text
+                        }
+                    )
                     for idx, cell in enumerate(table.cells[row_index])
                 ]
             return
@@ -486,10 +1483,28 @@ class MlxTranslator:
         if first is None:
             return
 
+        if chunk.status == self.TRANSLATION_FAILED_STATUS:
+            validation = {
+                "status": chunk.status,
+                "reason": chunk.reason,
+                "warnings": list(chunk.warnings),
+            }
+            for block_id in chunk.block_ids:
+                target_block = block_by_id.get(block_id)
+                if target_block is not None:
+                    target_block.metadata["translation_validation"] = validation
+
+        first.metadata.setdefault("source_text", first.text)
+        if chunk.placement_group_id is not None:
+            first.metadata["translation_placement_group_id"] = chunk.placement_group_id
+            first.metadata["translation_placement_index"] = chunk.placement_index
+            first.metadata["translation_placement_count"] = chunk.placement_count
+
         if chunk.chunk_type == "keywords" and len(chunk.block_ids) >= 2:
             body = block_by_id.get(chunk.block_ids[1])
             heading_text, separator, body_text = chunk.translated_text.strip().partition("\n")
             if separator and body is not None:
+                body.metadata.setdefault("source_text", body.text)
                 first.text = heading_text.strip()
                 body.text = body_text.strip()
                 first.metadata["translated_from_block_ids"] = chunk.block_ids
@@ -497,6 +1512,7 @@ class MlxTranslator:
                 for block_id in chunk.block_ids[2:]:
                     block = block_by_id.get(block_id)
                     if block is not None:
+                        block.metadata.setdefault("source_text", block.text)
                         block.text = ""
                         block.metadata["merged_into_block_id"] = body.id
                 return
@@ -510,6 +1526,7 @@ class MlxTranslator:
         for block_id in chunk.block_ids[1:]:
             block = block_by_id.get(block_id)
             if block is not None:
+                block.metadata.setdefault("source_text", block.text)
                 block.text = ""
                 block.metadata["merged_into_block_id"] = first.id
 
@@ -534,26 +1551,43 @@ class MlxTranslator:
                 out.append(chunk)
                 continue
 
+            failed_chunks = [
+                item for item in group if item.status == self.TRANSLATION_FAILED_STATUS
+            ]
+            warnings = list(dict.fromkeys(warning for item in group for warning in item.warnings))
             out.append(
                 chunk.model_copy(
                     update={
                         "id": group[0].id,
-                        "source_text": "\n\n".join(item.source_text.strip() for item in group if item.source_text.strip()),
-                        "translated_text": "\n\n".join(
-                            item.translated_text.strip() for item in group if item.translated_text.strip()
+                        "source_text": "\n\n".join(
+                            item.source_text.strip() for item in group if item.source_text.strip()
                         ),
+                        "translated_text": "\n\n".join(
+                            item.translated_text.strip()
+                            for item in group
+                            if item.translated_text.strip()
+                        ),
+                        "status": (
+                            self.TRANSLATION_FAILED_STATUS if failed_chunks else group[0].status
+                        ),
+                        "reason": (failed_chunks[0].reason if failed_chunks else group[0].reason),
+                        "warnings": warnings,
                     }
                 )
             )
         return out
 
     def _is_table_target(self, target_id: str) -> bool:
-        return target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(self.TABLE_ROW_PREFIX)
+        return target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(
+            self.TABLE_ROW_PREFIX
+        )
 
     def _is_marker_table_cell_block(self, block: Block) -> bool:
         return str((block.metadata or {}).get("marker_block_type", "")).lower() == "tablecell"
 
-    def _split_table_translation(self, translated_text: str, source_text: str, expected_cells: int) -> list[str]:
+    def _split_table_translation(
+        self, translated_text: str, source_text: str, expected_cells: int
+    ) -> list[str]:
         parts = [part.strip() for part in translated_text.split(self.TABLE_DELIMITER)]
         if len(parts) == expected_cells:
             return parts
@@ -604,6 +1638,8 @@ class MlxTranslator:
         self,
         chunks: list[TranslationChunk],
         chunk_block_types: dict[str, BlockType] | None = None,
+        *,
+        document: DocumentModel | None = None,
     ) -> list[TranslationChunk]:
         group_size = max(1, int(self.settings.chunk_group_size or 1))
         if group_size <= 1:
@@ -621,16 +1657,22 @@ class MlxTranslator:
                 continue
 
             group = [chunk]
-            group_token_count = int(chunk.source_token_count or self._token_count(chunk.source_text))
+            group_token_count = int(
+                chunk.source_token_count or self._token_count(chunk.source_text)
+            )
             index += 1
             while index < len(chunks) and len(group) < group_size:
                 candidate = chunks[index]
                 candidate_type = (chunk_block_types or {}).get(candidate.id)
-                candidate_tokens = int(candidate.source_token_count or self._token_count(candidate.source_text))
+                candidate_tokens = int(
+                    candidate.source_token_count or self._token_count(candidate.source_text)
+                )
                 if (
                     not self._can_merge_translation_chunk(candidate, candidate_type)
                     or candidate.context != chunk.context
                     or candidate.source_language != chunk.source_language
+                    or candidate.source_language_origin != chunk.source_language_origin
+                    or not self._chunks_share_safe_layout_region(group[-1], candidate, document)
                     or (group_token_count + candidate_tokens) > max_group_tokens
                 ):
                     break
@@ -645,14 +1687,69 @@ class MlxTranslator:
             merged.append(
                 TranslationChunk(
                     id=group[0].id,
-                    block_ids=self._unique_block_ids([block_id for item in group for block_id in item.block_ids]),
-                    source_text="\n\n".join(item.source_text.strip() for item in group if item.source_text.strip()),
+                    block_ids=self._unique_block_ids(
+                        [block_id for item in group for block_id in item.block_ids]
+                    ),
+                    source_text="\n\n".join(
+                        item.source_text.strip() for item in group if item.source_text.strip()
+                    ),
                     context=group[0].context,
                     source_language=group[0].source_language,
+                    source_language_origin=group[0].source_language_origin,
+                    source_language_confidence=min(
+                        (
+                            confidence
+                            for item in group
+                            if (confidence := item.source_language_confidence) is not None
+                        ),
+                        default=None,
+                    ),
                     source_token_count=group_token_count,
+                    page_start=group[0].page_start,
+                    page_end=group[0].page_end,
                 )
             )
         return merged
+
+    def _chunks_share_safe_layout_region(
+        self,
+        previous: TranslationChunk,
+        current: TranslationChunk,
+        document: DocumentModel | None,
+    ) -> bool:
+        if (
+            previous.page_start is None
+            or previous.page_end is None
+            or current.page_start is None
+            or current.page_end is None
+        ):
+            return False
+        if not (previous.page_start == previous.page_end == current.page_start == current.page_end):
+            return False
+        if previous.block_ids == current.block_ids:
+            # Token-budget fragments from the same source region remain safe to
+            # coalesce into one translation request.
+            return True
+        if document is None:
+            return True
+
+        positions = {block.id: index for index, block in enumerate(document.blocks)}
+        previous_positions = [
+            positions[block_id] for block_id in previous.block_ids if block_id in positions
+        ]
+        current_positions = [
+            positions[block_id] for block_id in current.block_ids if block_id in positions
+        ]
+        if not previous_positions or not current_positions:
+            return False
+        previous_end = max(previous_positions)
+        current_start = min(current_positions)
+        if current_start <= previous_end:
+            return False
+        return not any(
+            block.block_type in {BlockType.FIGURE, BlockType.EQUATION}
+            for block in document.blocks[previous_end + 1 : current_start]
+        )
 
     def _unique_block_ids(self, block_ids: list[str]) -> list[str]:
         seen: set[str] = set()
@@ -664,7 +1761,9 @@ class MlxTranslator:
             unique.append(block_id)
         return unique
 
-    def _can_merge_translation_chunk(self, chunk: TranslationChunk, block_type: BlockType | None) -> bool:
+    def _can_merge_translation_chunk(
+        self, chunk: TranslationChunk, block_type: BlockType | None
+    ) -> bool:
         if not chunk.block_ids or self._is_table_target(chunk.block_ids[0]):
             return False
         if self._is_table_heavy_markup(chunk.source_text):
@@ -709,7 +1808,7 @@ class MlxTranslator:
 
             # If punctuation is followed by a quote/bracket, skip it when checking the boundary.
             after = idx + 1
-            while after < len(compact) and compact[after] in '\'"”’)]}':
+            while after < len(compact) and compact[after] in "'\"”’)]}":
                 after += 1
 
             if after < len(compact) and not compact[after].isspace():
@@ -799,18 +1898,405 @@ class MlxTranslator:
         compact = self._text_for_language_detection(text)
         if len(compact) < 24:
             return None
-        try:
-            return detect(compact)
-        except Exception:
-            return None
+        language, _ = self._detect_language_with_confidence(compact)
+        return language
 
     def _is_already_english(self, chunk: TranslationChunk) -> bool:
-        if chunk.source_language == "en":
-            return self._looks_like_english_text(chunk.source_text)
         text = chunk.source_text.strip()
-        if not text or chunk.source_language is not None:
+        if not text or self._is_nontranslatable_identifier(text):
+            return True
+        # Mixed-language papers commonly use standard English section labels
+        # even when the surrounding document language is non-English.
+        if self._looks_like_english_text(text):
+            return True
+        source_language = self._base_language(chunk.source_language)
+        if source_language == "en":
+            if self._source_language_is_authoritative(chunk):
+                return True
             return False
+        if source_language is not None:
+            # Document-level language can leak onto short OCR chunks. Override it
+            # only when the chunk itself is long enough for a high-confidence call.
+            return self._is_confident_english_source(text)
         return self._looks_like_english_text(text)
+
+    def _source_language_is_authoritative(self, chunk: TranslationChunk) -> bool:
+        if chunk.source_language_origin not in {"block", "nearby_context"}:
+            return False
+        if chunk.source_language_confidence is None:
+            return False
+        threshold = (
+            self._ENGLISH_SOURCE_CONFIDENCE
+            if self._base_language(chunk.source_language) == "en"
+            else self._NON_ENGLISH_OUTPUT_CONFIDENCE
+        )
+        return chunk.source_language_confidence >= threshold
+
+    def _detect_language_with_confidence(self, text: str) -> tuple[str | None, float | None]:
+        compact = self._text_for_language_detection(text)
+        if not compact:
+            return None, None
+        if detect_langs is not None:
+            try:
+                predictions = detect_langs(compact)
+                if predictions:
+                    top = predictions[0]
+                    return str(top.lang).lower(), float(top.prob)
+            except Exception:
+                pass
+        try:
+            return str(detect(compact)).lower(), None
+        except Exception:
+            return None, None
+
+    def _is_confident_english_source(self, text: str) -> bool:
+        compact = self._text_for_language_detection(text)
+        words = self._language_words(compact)
+        if len(words) < 3 or sum(len(word) for word in words) < 18:
+            return False
+        language, confidence = self._detect_language_with_confidence(compact)
+        return (
+            language == "en"
+            and confidence is not None
+            and confidence >= self._ENGLISH_SOURCE_CONFIDENCE
+        )
+
+    def _translation_acceptance_issue(
+        self,
+        source: str,
+        translated: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
+    ) -> str | None:
+        if not self._source_requires_english_translation(
+            source,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+        ):
+            return None
+
+        source_normalized = self._normalized_language_text(source)
+        translated_normalized = self._normalized_language_text(translated)
+        if source_normalized and source_normalized == translated_normalized:
+            if block_type == BlockType.TABLE and self._normalized_table_cell(
+                source
+            ) != self._normalized_table_cell(translated):
+                return None
+            return "translation_output_matches_source"
+        if block_type != BlockType.TABLE and self._has_high_source_overlap(
+            source_normalized,
+            translated_normalized,
+        ):
+            return "translation_output_high_source_overlap"
+        if self._looks_like_english_text(translated):
+            return None
+        translated_words = self._language_words(translated_normalized)
+        if len(translated_words) <= 4 or sum(len(word) for word in translated_words) < 24:
+            # Statistical language identifiers are unstable on short phrases
+            # (for example, English "Sampling" is often labelled Tagalog).
+            # Identity and source-overlap checks above remain deterministic.
+            return None
+
+        target_language, target_confidence = self._detect_language_with_confidence(
+            translated_normalized
+        )
+        if (
+            target_language is not None
+            and target_language != "en"
+            and target_confidence is not None
+            and target_confidence >= self._NON_ENGLISH_OUTPUT_CONFIDENCE
+        ):
+            return "translation_output_not_english"
+        return None
+
+    def _source_requires_english_translation(
+        self,
+        source: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
+    ) -> bool:
+        if not self._is_substantive_language_text(source, block_type):
+            return self._short_source_requires_english_translation(
+                source,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            )
+        if self._is_confident_english_source(source):
+            return False
+
+        normalized_source_language = self._base_language(source_language)
+        if normalized_source_language == "en":
+            return False
+        if normalized_source_language is not None:
+            return True
+
+        detected_language, confidence = self._detect_language_with_confidence(source)
+        return (
+            detected_language is not None
+            and detected_language != "en"
+            and confidence is not None
+            and confidence >= self._NON_ENGLISH_OUTPUT_CONFIDENCE
+        )
+
+    def _short_source_requires_english_translation(
+        self,
+        source: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
+    ) -> bool:
+        if block_type not in {
+            BlockType.CAPTION,
+            BlockType.FOOTNOTE,
+            BlockType.HEADER,
+            BlockType.HEADING,
+            BlockType.LIST,
+            BlockType.PARAGRAPH,
+            BlockType.TABLE,
+        }:
+            return False
+        source_language = self._base_language(source_language)
+        if source_language is None or source_language == "en":
+            return False
+        if self._is_nontranslatable_identifier(source):
+            return False
+
+        compact = self._text_for_language_detection(html.unescape(source))
+        words = self._language_words(compact)
+        alpha_count = sum(len(word) for word in words)
+        if block_type == BlockType.TABLE and not self._table_cell_requires_translation(compact):
+            # Statistical cells frequently contain only compact study-defined
+            # codes (for example MzFa / FzMb) and standard abbreviations. They
+            # are intentionally preserved even when a language detector assigns
+            # the surrounding document language to the cell.
+            return False
+        if block_type == BlockType.HEADING:
+            has_enough_language = len(words) >= 1 and alpha_count >= 6
+        elif block_type == BlockType.TABLE:
+            # A short label can be the only source-language content left in an
+            # otherwise English table, so validate cells independently.
+            # Numeric cells and compact scientific abbreviations remain below
+            # this threshold and may stay verbatim.
+            has_enough_language = len(words) >= 1 and alpha_count >= 5
+        elif block_type in {BlockType.CAPTION, BlockType.FOOTNOTE, BlockType.HEADER}:
+            has_enough_language = len(words) >= 2 and alpha_count >= 8
+        elif block_type == BlockType.PARAGRAPH:
+            # OCR sometimes labels a short section heading as body text. A
+            # high-confidence single non-English word is still translatable.
+            has_enough_language = (len(words) >= 2 and alpha_count >= 10) or (
+                len(words) == 1 and alpha_count >= 8
+            )
+        else:
+            has_enough_language = len(words) >= 3 and alpha_count >= 12
+        if not has_enough_language:
+            return False
+        if self._looks_like_name_or_citation(compact, words):
+            return False
+        if self._looks_like_english_text(compact):
+            return False
+
+        if source_language_authoritative:
+            return True
+
+        detected_language, confidence = self._detect_language_with_confidence(compact)
+        return bool(
+            detected_language is not None
+            and detected_language != "en"
+            and confidence is not None
+            and confidence >= self._NON_ENGLISH_OUTPUT_CONFIDENCE
+        )
+
+    def _is_substantive_language_text(
+        self,
+        text: str,
+        block_type: BlockType | None,
+    ) -> bool:
+        if block_type in {BlockType.EQUATION, BlockType.REFERENCE}:
+            return False
+        if self._is_nontranslatable_identifier(text):
+            return False
+
+        compact = self._text_for_language_detection(html.unescape(text))
+        words = self._language_words(compact)
+        alpha_count = sum(len(word) for word in words)
+        if block_type == BlockType.TABLE:
+            # Scientific tables often contain more delimiters, numbers, and
+            # empty cells than letters. Judge the labels themselves instead of
+            # letting table syntax dilute the language signal.
+            return len(words) >= 4 and alpha_count >= 22
+        visible_count = len(re.sub(r"\s+", "", compact))
+        if not words or visible_count == 0 or alpha_count / visible_count < 0.50:
+            return False
+        if self._looks_like_name_or_citation(compact, words):
+            return False
+
+        if block_type == BlockType.HEADING:
+            return len(words) >= 8 and alpha_count >= 50
+        return (len(words) >= 6 and alpha_count >= 30) or (len(words) >= 4 and alpha_count >= 45)
+
+    def _is_nontranslatable_identifier(self, text: str) -> bool:
+        candidate = html.unescape(text).strip().strip("<>()[]{}.,;")
+        return bool(
+            re.fullmatch(r"(?is)(?:https?://|ftp://|www\.)\S+", candidate)
+            or re.fullmatch(r"(?i)[^\s@]+@[^\s@]+\.[^\s@]+", candidate)
+        )
+
+    def _looks_like_name_or_citation(self, text: str, words: list[str]) -> bool:
+        if re.search(r"(?i)\b(?:doi|isbn|issn)\s*(?::|/|\d)", text):
+            return True
+        if re.search(r"\b(?:19|20)\d{2}\b", text) and re.search(r"(?i)\bet\s+al\.?\b", text):
+            return True
+        if self._looks_like_bibliographic_locator(text):
+            return True
+        if self._looks_like_multi_author_list(text):
+            return True
+        if self._looks_like_contact_metadata(text, words):
+            return True
+        original_words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+        capitalized = sum(1 for word in original_words if word[:1].isupper())
+        if (
+            re.match(r"^\s*\d+\s+", text)
+            and len(original_words) <= 20
+            and text.count(",") >= 1
+            and original_words
+            and capitalized / len(original_words) >= 0.60
+        ):
+            # Numbered author affiliations and institution addresses are names,
+            # not prose. Rewording them can corrupt searchable organisation and
+            # place names while an unchanged result is entirely valid.
+            return True
+        return bool(
+            len(words) <= 12
+            and text.count(",") >= 2
+            and original_words
+            and capitalized / len(original_words) >= 0.70
+        )
+
+    def _looks_like_contact_metadata(self, text: str, words: list[str]) -> bool:
+        """Recognize compact journal contact blocks without exempting ordinary prose."""
+        if len(words) > 40 or re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", text) is None:
+            return False
+
+        signals = (
+            re.search(
+                r"(?i)\b(?:correspondence|correspondencia|correspondance|"
+                r"korrespondenz|contact|contatto|contato|address|adresse|"
+                r"direcci[oó]n|indirizzo|endere[cç]o|morada)\b",
+                text,
+            )
+            is not None,
+            re.search(
+                r"(?i)\b(?:postal(?:\s+code)?|postcode|zip|c\.?\s*p\.?)\s*[:.-]?\s*\d{4,10}\b",
+                text,
+            )
+            is not None,
+            re.search(
+                r"(?i)(?:^|[\s,;])(?:c/|r/|av\.?|str\.?|st\.?)\s*[^\s,;]",
+                text,
+            )
+            is not None,
+            re.search(r"(?i)\b(?:tel(?:ephone|[ée]fono)?|phone|fax|mobile)\b", text)
+            is not None,
+        )
+        return sum(signals) >= 2
+
+    def _looks_like_bibliographic_locator(self, text: str) -> bool:
+        if re.search(r"\b(?:19|20)\d{2}\b", text) is None:
+            return False
+        locator_patterns = (
+            r"(?i)\bvol(?:ume)?\.?\s*\d+",
+            r"(?i)\b(?:n|no|num(?:ber)?|issue)\s*[.°º#]*\s*\d+",
+            r"(?i)\b(?:p{1,2}|pag(?:e|es|ina|inas)?)\.?\s*\d+",
+        )
+        return sum(re.search(pattern, text) is not None for pattern in locator_patterns) >= 2
+
+    def _looks_like_multi_author_list(self, text: str) -> bool:
+        segments = [segment.strip() for segment in re.split(r"[,;]", text) if segment.strip()]
+        if len(segments) < 3:
+            return False
+        author_segments = 0
+        for segment in segments:
+            initials = re.findall(
+                r"(?<![^\W\d_])([^\W\d_])\.",
+                segment,
+                flags=re.UNICODE,
+            )
+            name_words = re.findall(r"[^\W\d_]{2,}", segment, flags=re.UNICODE)
+            if (
+                any(initial.isupper() for initial in initials)
+                and any(word[:1].isupper() for word in name_words)
+                and len(name_words) <= 9
+            ):
+                author_segments += 1
+        return author_segments >= 3 and author_segments / len(segments) >= 0.70
+
+    def _normalized_language_text(self, text: str) -> str:
+        return " ".join(self._language_words(self._text_for_language_detection(text)))
+
+    def _language_words(self, text: str) -> list[str]:
+        return [
+            word.casefold()
+            for word in re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
+            if len(word) >= 2
+        ]
+
+    def _has_high_source_overlap(self, source: str, translated: str) -> bool:
+        if not source or not translated:
+            return False
+        source_words = source.split()
+        translated_words = translated.split()
+        if not source_words or not translated_words:
+            return False
+
+        source_counts = Counter(source_words)
+        translated_counts = Counter(translated_words)
+        shared = sum((source_counts & translated_counts).values())
+        source_coverage = shared / len(source_words)
+        length_ratio = len(translated_words) / len(source_words)
+        similarity = SequenceMatcher(None, source, translated).ratio()
+        return similarity >= 0.92 or (source_coverage >= 0.90 and 0.75 <= length_ratio <= 1.35)
+
+    def _mark_translation_failure(
+        self,
+        chunk: TranslationChunk,
+        issue: str,
+    ) -> None:
+        warning_by_issue = {
+            "translation_output_matches_source": (
+                "Translation output matched substantive non-English source text after retry."
+            ),
+            "translation_output_high_source_overlap": (
+                "Translation output retained too much substantive source-language text after retry."
+            ),
+            "translation_output_not_english": (
+                "Translation output was confidently detected as non-English after retry."
+            ),
+            "translation_structure_invalid": (
+                "Translation output did not preserve the required source structure after retry."
+            ),
+            "translation_table_structure_invalid": (
+                "Translation output did not preserve the table's row, cell, section, or span structure after retry."
+            ),
+            "translation_table_cell_missing": (
+                "Translation output omitted content from one or more source table cells after retry."
+            ),
+        }
+        chunk.status = self.TRANSLATION_FAILED_STATUS
+        chunk.reason = issue
+        warning = warning_by_issue.get(issue, f"Translation validation failed: {issue}.")
+        if warning not in chunk.warnings:
+            chunk.warnings.append(warning)
+
+    def _base_language(self, language: str | None) -> str | None:
+        normalized = self._normalize_lang_code(language)
+        return normalized.split("-", maxsplit=1)[0].lower() if normalized else None
 
     def _translate_chunk(
         self,
@@ -838,7 +2324,9 @@ class MlxTranslator:
             translated = str(out).strip()
             return self._postprocess_translated_text(translated)
         except Exception as exc:
-            logger.warning("Chunk translation failed; returning source text for this chunk: %s", exc)
+            logger.warning(
+                "Chunk translation failed; returning source text for this chunk: %s", exc
+            )
             return text
 
     def _translate_chunk_with_validation(
@@ -847,23 +2335,229 @@ class MlxTranslator:
         context: str,
         source_language: str | None,
         block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
     ) -> str:
         translated = self._translate_chunk(text, context, source_language)
-        if self._is_valid_chunk_translation_structure(text, translated, block_type):
+        if self._is_acceptable_chunk_translation(
+            text,
+            translated,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+        ):
             return translated
 
         retry_context = (
             f"{context}\n"
+            "The previous output was not an acceptable English translation. Return English only and "
+            "translate every substantive source-language phrase; do not repeat source-language prose. "
             "Preserve the source structure exactly: keep paragraph boundaries, list boundaries, headings, "
-            "Markdown markers, citations, numbers, and line breaks that separate logical blocks. "
+            "Markdown markers, citations, numeric values, and line breaks that "
+            "separate logical blocks. Preserve every numeric value exactly. "
             "Do not summarize, omit, or collapse content."
         ).strip()
         retried = self._translate_chunk(text, retry_context, source_language)
-        if self._is_valid_chunk_translation_structure(text, retried, block_type):
+        if self._is_acceptable_chunk_translation(
+            text,
+            retried,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+        ):
             return retried
 
-        logger.warning("Chunk translation failed structure validation after retry; returning source text.")
+        issue = self._chunk_translation_issue(
+            text,
+            retried,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+        )
+        if self._should_disambiguate_short_heading(
+            text,
+            source_language,
+            block_type,
+            issue,
+        ):
+            disambiguation_context = (
+                f"{retry_context}\n"
+                "The prior character-for-character copy of this short heading was rejected. "
+                "Interpret TEXT in its stated source language and use the nearby source context to "
+                "resolve its intended semantic category and grammatical number. Return a natural "
+                "English heading that is not character-for-character identical to TEXT. If the usual "
+                "English spelling would be identical, use a faithful context-appropriate English "
+                "synonym instead. Return only the heading."
+            )
+            disambiguated = self._translate_chunk(
+                text,
+                disambiguation_context,
+                source_language,
+            )
+            if self._is_acceptable_chunk_translation(
+                text,
+                disambiguated,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            ):
+                return disambiguated
+            retried = disambiguated
+            issue = self._chunk_translation_issue(
+                text,
+                retried,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            )
+            structural_fallback = self._structural_heading_fallback(context)
+            if structural_fallback is not None and self._is_acceptable_chunk_translation(
+                text,
+                structural_fallback,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            ):
+                logger.info(
+                    "Used structural affiliation heading fallback after repeated homograph output."
+                )
+                return structural_fallback
+        logger.warning(
+            "Chunk translation failed validation after English-only retry (%s); returning source text.",
+            issue or "unknown_validation_failure",
+        )
         return text
+
+    def _should_disambiguate_short_heading(
+        self,
+        source: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        issue: str | None,
+    ) -> bool:
+        if (
+            block_type != BlockType.HEADING
+            or self._base_language(source_language) in {None, "en"}
+            or issue
+            not in {
+                "translation_output_matches_source",
+                "translation_output_high_source_overlap",
+            }
+        ):
+            return False
+        words = self._language_words(self._text_for_language_detection(source))
+        return 1 <= len(words) <= 6 and sum(len(word) for word in words) <= 60
+
+    def _structural_heading_fallback(self, context: str) -> str | None:
+        numbered_lines = [
+            line.strip()
+            for line in context.splitlines()
+            if re.match(r"^\s*\d+[.)]?\s+\S", line)
+        ]
+        if len(numbered_lines) < 2:
+            return None
+        if not all(
+            self._looks_like_name_or_citation(line, self._language_words(line))
+            for line in numbered_lines[:3]
+        ):
+            return None
+        return "Affiliations"
+
+    def _is_acceptable_chunk_translation(
+        self,
+        source: str,
+        translated: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
+    ) -> bool:
+        return (
+            self._chunk_translation_issue(
+                source,
+                translated,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            )
+            is None
+        )
+
+    def _chunk_translation_issue(
+        self,
+        source: str,
+        translated: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool = False,
+    ) -> str | None:
+        if not self._is_valid_chunk_translation_structure(source, translated, block_type):
+            return "translation_structure_invalid"
+        if self.TABLE_DELIMITER in source:
+            for source_cell, translated_cell in zip(
+                source.split(self.TABLE_DELIMITER),
+                translated.split(self.TABLE_DELIMITER),
+                strict=True,
+            ):
+                issue = self._translation_acceptance_issue(
+                    source_cell,
+                    translated_cell,
+                    source_language,
+                    BlockType.TABLE,
+                    source_language_authoritative=source_language_authoritative,
+                )
+                if issue is not None:
+                    return issue
+        if block_type == BlockType.TABLE and "|" in source:
+            # Flattened OCR Markdown has no dependable line boundaries here,
+            # but pipe and separator counts remain exact topology invariants.
+            if source.count("|") != translated.count("|"):
+                return "translation_table_structure_invalid"
+            if source.count("---") != translated.count("---"):
+                return "translation_table_structure_invalid"
+        return self._translation_acceptance_issue(
+            source,
+            translated,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+        )
+
+    def _ordered_acronyms(self, text: str) -> list[str]:
+        """Return acronyms whose surrounding syntax marks them as stable.
+
+        Uppercase typography alone is not acronym evidence: headings and table
+        labels commonly contain ordinary words such as ``HOMBRES`` or
+        ``HOMMES``. Protect slash-delimited sequences and compact acronyms
+        explicitly introduced in parentheses instead.
+        """
+
+        visible = self._TAG_RE.sub(" ", html.unescape(text))
+        token_pattern = r"[A-Z][A-Z0-9]{1,4}"
+        results: list[tuple[int, str]] = []
+        occupied: list[tuple[int, int]] = []
+
+        slash_pattern = re.compile(
+            rf"(?<![\w])(?P<sequence>{token_pattern}(?:\s*/\s*{token_pattern})+)(?![\w])"
+        )
+        for sequence in slash_pattern.finditer(visible):
+            occupied.append((sequence.start(), sequence.end()))
+            for token in re.finditer(token_pattern, sequence.group("sequence")):
+                results.append((sequence.start("sequence") + token.start(), token.group(0)))
+
+        for group in re.finditer(r"\((?P<body>[^()]{0,120})\)", visible):
+            body = group.group("body")
+            if "=" in body:
+                # Statistical labels such as (DT=11.2) may correctly change
+                # to their English counterpart (SD=11.2).
+                continue
+            for token in re.finditer(rf"(?<![\w]){token_pattern}(?![\w])", body):
+                absolute_start = group.start("body") + token.start()
+                if any(start <= absolute_start < end for start, end in occupied):
+                    continue
+                results.append((absolute_start, token.group(0)))
+        return [token for _, token in sorted(results)]
 
     def _is_valid_chunk_translation_structure(
         self,
@@ -878,11 +2572,46 @@ class MlxTranslator:
         if not translated:
             return False
 
+        source_words = self._language_words(self._text_for_language_detection(source))
+        source_alpha_count = sum(len(word) for word in source_words)
+        if len(source_words) >= 3 and source_alpha_count >= 12:
+            translated_words = self._language_words(
+                self._text_for_language_detection(translated)
+            )
+            translated_alpha_count = sum(len(word) for word in translated_words)
+            minimum_target_words = (
+                max(2, math.ceil(len(source_words) * 0.20))
+                if len(source_words) >= 6
+                else 1
+            )
+            minimum_target_alpha = (
+                max(4, math.ceil(source_alpha_count * 0.12))
+                if len(source_words) >= 6
+                else 2
+            )
+            if (
+                len(translated_words) < minimum_target_words
+                or translated_alpha_count < minimum_target_alpha
+            ):
+                # Every independently placeable source region must retain some
+                # language content. A grouped response can otherwise move all
+                # meaning into a neighbour and leave this box as punctuation.
+                return False
+
         if len(source) >= 200 and len(translated) < max(40, int(len(source) * 0.20)):
             return False
 
         source_paragraphs = self._paragraph_count(source)
         translated_paragraphs = self._paragraph_count(translated)
+        if block_type in {
+            BlockType.CAPTION,
+            BlockType.FOOTNOTE,
+            BlockType.HEADER,
+            BlockType.HEADING,
+            BlockType.PARAGRAPH,
+            BlockType.REFERENCE,
+        } and translated_paragraphs != source_paragraphs:
+            return False
         if source_paragraphs >= 3 and translated_paragraphs < max(2, source_paragraphs // 2):
             return False
 
@@ -893,6 +2622,21 @@ class MlxTranslator:
         source_heading_count = self._markdown_heading_count(source)
         if source_heading_count and self._markdown_heading_count(translated) < source_heading_count:
             return False
+
+        if self.TABLE_DELIMITER in source:
+            source_cells = source.split(self.TABLE_DELIMITER)
+            translated_cells = translated.split(self.TABLE_DELIMITER)
+            if len(source_cells) != len(translated_cells):
+                return False
+            if any(
+                self._is_significant_table_cell(source_cell) and not translated_cell.strip()
+                for source_cell, translated_cell in zip(
+                    source_cells,
+                    translated_cells,
+                    strict=True,
+                )
+            ):
+                return False
 
         if block_type == BlockType.HEADING and "\n\n" in translated:
             return False
@@ -907,13 +2651,16 @@ class MlxTranslator:
     def _markdown_heading_count(self, text: str) -> int:
         return len(re.findall(r"(?m)^\s{0,3}#{1,6}\s+\S", text))
 
-    def _translate_table_markup_chunk(self, text: str, context: str, source_language: str | None) -> str:
+    def _translate_table_markup_chunk(
+        self, text: str, context: str, source_language: str | None
+    ) -> str:
         text = self._normalize_table_markup_for_translation(text)
         max_tokens = self._table_output_budget(text)
         strict_context = (
             f"{context}\n"
             "TEXT contains an HTML table. Keep all HTML tags and attributes intact. "
-            "Return a complete table with closing </table>."
+            "Return a complete table with closing </table>. "
+            f"{self._COMPACT_TABLE_TRANSLATION_GUIDANCE}"
         ).strip()
         translated = self._translate_chunk(
             text,
@@ -921,12 +2668,14 @@ class MlxTranslator:
             source_language,
             force_max_tokens=max_tokens,
         )
-        if self._is_valid_table_markup_translation(text, translated):
+        if self._is_acceptable_table_translation(text, translated, source_language):
             return translated
 
         retry_context = (
             f"{strict_context}\n"
-            "Do not truncate output. Keep the same number of rows and cells."
+            "The previous output was not an acceptable English translation. Return English only, "
+            "translate every substantive non-English table label or sentence, and do not repeat "
+            "source-language prose. Do not truncate output. Keep the same number of rows and cells."
         )
         retried = self._translate_chunk(
             text,
@@ -934,11 +2683,11 @@ class MlxTranslator:
             source_language,
             force_max_tokens=max_tokens,
         )
-        if self._is_valid_table_markup_translation(text, retried):
+        if self._is_acceptable_table_translation(text, retried, source_language):
             return retried
 
         fallback = self._translate_table_by_row_groups(text, context, source_language)
-        if fallback and self._is_valid_table_markup_translation(text, fallback):
+        if fallback and self._is_acceptable_table_translation(text, fallback, source_language):
             return fallback
 
         logger.warning("Table translation remained invalid after retries; using source table text.")
@@ -985,7 +2734,7 @@ class MlxTranslator:
     def _insert_missing_row_close(self, segment: str) -> str:
         table_close = re.search(r"(?is)</table\s*>", segment)
         if table_close is not None:
-            return f"{segment[:table_close.start()]}</tr>{segment[table_close.start():]}"
+            return f"{segment[: table_close.start()]}</tr>{segment[table_close.start() :]}"
         return f"{segment}</tr>"
 
     def _table_output_budget(self, text: str) -> int:
@@ -993,7 +2742,9 @@ class MlxTranslator:
         estimated = int(source_tokens * 2.2) + 256
         return max(self.settings.max_tokens, min(self.TABLE_OUTPUT_MAX_TOKENS, estimated))
 
-    def _translate_table_by_row_groups(self, text: str, context: str, source_language: str | None) -> str | None:
+    def _translate_table_by_row_groups(
+        self, text: str, context: str, source_language: str | None
+    ) -> str | None:
         split_match = self._TABLE_SPLIT_RE.match(text.strip())
         if split_match is None:
             return None
@@ -1001,43 +2752,246 @@ class MlxTranslator:
         table_html = split_match.group("table")
         after = split_match.group("after")
 
-        parsed = self._parse_table_rows(table_html)
-        if parsed is None:
+        source_topology = self._table_markup_topology(table_html)
+        table_open_match = self._TABLE_OPEN_RE.search(table_html)
+        row_matches = list(self._TABLE_ROW_RE.finditer(table_html))
+        if (
+            source_topology is None
+            or table_open_match is None
+            or len(row_matches) != len(source_topology.rows)
+        ):
             return None
-        prefix, rows, suffix = parsed
 
-        translated_rows: list[str] = []
-        for start in range(0, len(rows), self.TABLE_ROW_GROUP_SIZE):
-            group_rows = rows[start : start + self.TABLE_ROW_GROUP_SIZE]
-            group_table = prefix + "".join(group_rows) + suffix
-            group_context = (
-                f"{context}\n"
-                "Translate this HTML table to English and keep tags intact. "
-                "Return complete table markup."
-            ).strip()
-            translated_group = self._translate_chunk(
-                group_table,
-                group_context,
-                source_language,
-                force_max_tokens=self._table_output_budget(group_table),
+        rows = [match.group(0) for match in row_matches]
+        section_open_tags = self._table_section_open_tags(table_html)
+        translated_rows: dict[int, str] = {}
+        start = 0
+        while start < len(rows):
+            section = source_topology.rows[start].section
+            end = start + 1
+            while (
+                end < len(rows)
+                and end - start < self.TABLE_ROW_GROUP_SIZE
+                and source_topology.rows[end].section == section
+            ):
+                end += 1
+
+            group_translated_rows = self._translate_table_row_group(
+                rows=rows,
+                start=start,
+                end=end,
+                section=section,
+                table_open=table_open_match.group(0),
+                section_open_tags=section_open_tags,
+                context=context,
+                source_language=source_language,
             )
-            if not self._is_valid_table_markup_translation(group_table, translated_group):
-                translated_rows.extend(group_rows)
-                continue
+            if group_translated_rows is None:
+                return None
+            translated_rows.update(
+                {
+                    row_index: translated_row
+                    for row_index, translated_row in zip(
+                        range(start, end),
+                        group_translated_rows,
+                        strict=True,
+                    )
+                }
+            )
+            start = end
 
-            parsed_group = self._parse_table_rows(translated_group)
-            if parsed_group is None:
-                translated_rows.extend(group_rows)
-                continue
-            _, group_translated_rows, _ = parsed_group
-            if len(group_translated_rows) != len(group_rows):
-                translated_rows.extend(group_rows)
-                continue
-            translated_rows.extend(group_translated_rows)
-
-        if not translated_rows:
+        if len(translated_rows) != len(rows):
             return None
-        return before + prefix + "".join(translated_rows) + suffix + after
+
+        rebuilt_parts: list[str] = []
+        cursor = 0
+        for row_index, row_match in enumerate(row_matches):
+            rebuilt_parts.append(table_html[cursor : row_match.start()])
+            rebuilt_parts.append(translated_rows[row_index])
+            cursor = row_match.end()
+        rebuilt_parts.append(table_html[cursor:])
+        rebuilt_table = "".join(rebuilt_parts)
+        if not self._has_valid_table_markup_structure(table_html, rebuilt_table):
+            return None
+        return before + rebuilt_table + after
+
+    def _translate_table_row_group(
+        self,
+        *,
+        rows: list[str],
+        start: int,
+        end: int,
+        section: tuple[str, int] | None,
+        table_open: str,
+        section_open_tags: dict[tuple[str, int], str],
+        context: str,
+        source_language: str | None,
+    ) -> list[str] | None:
+        """Translate a row group, bisecting it when a model damages the group.
+
+        Whole-table retries are useful for context, but repeating an invalid
+        seven-row request as an eight-row fallback is not a fallback at all.
+        Bounded groups retain nearby row context; recursive bisection isolates a
+        difficult row while preserving the original table shell and topology.
+        """
+
+        group_rows = rows[start:end]
+        section_open = ""
+        section_close = ""
+        if section is not None:
+            section_open = section_open_tags.get(section, "")
+            if not section_open:
+                return None
+            section_close = f"</{section[0]}>"
+        group_table = (
+            table_open
+            + section_open
+            + "".join(group_rows)
+            + section_close
+            + "</table>"
+        )
+        group_context = (
+            f"{context}\n"
+            "Translate this HTML table to English and keep tags intact. "
+            "Return complete table markup. "
+            f"{self._COMPACT_TABLE_TRANSLATION_GUIDANCE}"
+        ).strip()
+        translated_group = self._translate_chunk(
+            group_table,
+            group_context,
+            source_language,
+            force_max_tokens=self._table_output_budget(group_table),
+        )
+        if self._is_acceptable_table_translation(
+            group_table,
+            translated_group,
+            source_language,
+        ):
+            translated_table = self._extract_primary_table(translated_group)
+            parsed_group = (
+                self._parse_table_rows(translated_table)
+                if translated_table is not None
+                else None
+            )
+            if parsed_group is not None:
+                _, translated_rows, _ = parsed_group
+                if len(translated_rows) == len(group_rows):
+                    return translated_rows
+
+        if end - start <= 1:
+            return None
+        midpoint = start + (end - start) // 2
+        left = self._translate_table_row_group(
+            rows=rows,
+            start=start,
+            end=midpoint,
+            section=section,
+            table_open=table_open,
+            section_open_tags=section_open_tags,
+            context=context,
+            source_language=source_language,
+        )
+        if left is None:
+            return None
+        right = self._translate_table_row_group(
+            rows=rows,
+            start=midpoint,
+            end=end,
+            section=section,
+            table_open=table_open,
+            section_open_tags=section_open_tags,
+            context=context,
+            source_language=source_language,
+        )
+        if right is None:
+            return None
+        return left + right
+
+    def _table_section_open_tags(self, table_html: str) -> dict[tuple[str, int], str]:
+        section_counts: Counter[str] = Counter()
+        section_tags: dict[tuple[str, int], str] = {}
+        for match in self._TABLE_SECTION_OPEN_RE.finditer(table_html):
+            tag = match.group("tag").casefold()
+            occurrence = section_counts[tag]
+            section_counts[tag] += 1
+            section_tags[(tag, occurrence)] = match.group(0)
+        return section_tags
+
+    def _is_acceptable_table_translation(
+        self,
+        source_text: str,
+        translated_text: str,
+        source_language: str | None,
+    ) -> bool:
+        return (
+            self._table_translation_issue(
+                source_text,
+                translated_text,
+                source_language,
+            )
+            is None
+        )
+
+    def _table_translation_issue(
+        self,
+        source_text: str,
+        translated_text: str,
+        source_language: str | None,
+    ) -> str | None:
+        if not self._has_valid_table_markup_structure(source_text, translated_text):
+            return "translation_table_structure_invalid"
+
+        source_table = self._extract_primary_table(source_text)
+        translated_table = self._extract_primary_table(translated_text)
+        if source_table is None or translated_table is None:
+            return "translation_table_structure_invalid"
+        if not self._table_nonempty_cells_preserved(source_table, translated_table):
+            return "translation_table_cell_missing"
+        if (
+            self._base_language(source_language) not in {None, "en"}
+            and self._normalized_table_cell(source_table)
+            == self._normalized_table_cell(translated_table)
+            and any(
+                self._table_cell_requires_translation(cell)
+                for cell in self._table_cell_texts(source_table)
+            )
+        ):
+            return "translation_output_matches_source"
+        return self._translation_acceptance_issue(
+            source_table,
+            translated_table,
+            source_language,
+            BlockType.TABLE,
+        )
+
+    def _normalized_table_cell(self, text: str) -> str:
+        return " ".join(html.unescape(text).split()).casefold()
+
+    def _table_cell_requires_translation(self, text: str) -> bool:
+        if self._is_nontranslatable_identifier(text):
+            return False
+        words = re.findall(r"[^\W\d_]+", html.unescape(text), flags=re.UNICODE)
+        if not words:
+            return False
+        return not all(self._looks_like_table_abbreviation(word) for word in words)
+
+    def _looks_like_table_abbreviation(self, word: str) -> bool:
+        letters = [character for character in word if character.isalpha()]
+        cased_letters = [
+            character
+            for character in letters
+            if character.islower() or character.isupper()
+        ]
+        uppercase_count = sum(character.isupper() for character in cased_letters)
+        return bool(
+            letters
+            and len(letters) <= 6
+            and cased_letters
+            and (
+                all(character.isupper() for character in cased_letters)
+                or uppercase_count >= 2
+            )
+        )
 
     def _parse_table_rows(self, html: str) -> tuple[str, list[str], str] | None:
         parts = self._TABLE_PARTS_RE.match(html.strip())
@@ -1052,30 +3006,64 @@ class MlxTranslator:
         return prefix, rows, suffix
 
     def _is_valid_table_markup_translation(self, source_text: str, translated_text: str) -> bool:
+        if not self._has_valid_table_markup_structure(source_text, translated_text):
+            return False
+        source_table = self._extract_primary_table(source_text)
+        translated_table = self._extract_primary_table(translated_text)
+        if source_table is None or translated_table is None:
+            return False
+        return self._table_nonempty_cells_preserved(source_table, translated_table)
+
+    def _has_valid_table_markup_structure(
+        self,
+        source_text: str,
+        translated_text: str,
+    ) -> bool:
         if not self._is_table_heavy_markup(source_text):
             return True
         source_table = self._extract_primary_table(source_text)
         translated_table = self._extract_primary_table(translated_text)
         if source_table is None or translated_table is None:
             return False
-        if source_text.strip().lower().endswith("</table>") and not translated_text.strip().lower().endswith("</table>"):
+        if source_text.strip().lower().endswith(
+            "</table>"
+        ) and not translated_text.strip().lower().endswith("</table>"):
             return False
         for tag in ("table", "tr", "td", "th"):
             source_open, source_close = self._count_tag_pair(source_table, tag)
             translated_open, translated_close = self._count_tag_pair(translated_table, tag)
             if source_open != translated_open or source_close != translated_close:
                 if tag in {"td", "th"}:
-                    source_cells = self._count_tag_pair(source_table, "td")[0] + self._count_tag_pair(source_table, "th")[0]
-                    translated_cells = self._count_tag_pair(translated_table, "td")[0] + self._count_tag_pair(
-                        translated_table, "th"
-                    )[0]
+                    source_cells = (
+                        self._count_tag_pair(source_table, "td")[0]
+                        + self._count_tag_pair(source_table, "th")[0]
+                    )
+                    translated_cells = (
+                        self._count_tag_pair(translated_table, "td")[0]
+                        + self._count_tag_pair(translated_table, "th")[0]
+                    )
                     if source_cells != translated_cells:
                         return False
                     continue
                 return False
-        if not self._table_nonempty_cells_preserved(source_table, translated_table):
+        source_rows = self._parse_table_rows(source_table)
+        translated_rows = self._parse_table_rows(translated_table)
+        if source_rows is None or translated_rows is None:
+            return False
+        source_topology = self._table_markup_topology(source_table)
+        translated_topology = self._table_markup_topology(translated_table)
+        if source_topology is None or source_topology != translated_topology:
             return False
         return True
+
+    def _table_markup_topology(self, table_html: str) -> _TableMarkupTopology | None:
+        parser = _StrictTableTopologyParser()
+        try:
+            parser.feed(table_html)
+            parser.close()
+        except Exception:
+            return None
+        return parser.topology()
 
     def _extract_primary_table(self, text: str) -> str | None:
         match = self._TABLE_BLOCK_RE.search(text or "")
@@ -1108,12 +3096,22 @@ class MlxTranslator:
         stripped = text.strip()
         if not stripped:
             return False
-        return bool(re.search(r"[0-9A-Za-zÀ-ÖØ-öø-ÿ]", stripped))
+        return any(character.isalnum() for character in stripped)
 
-    def _build_prompt(self, text: str, context: str = "", source_language: str | None = None) -> str:
-        
+    def _build_prompt(
+        self, text: str, context: str = "", source_language: str | None = None
+    ) -> str:
         system = self._system_prompt()
-        user = f"\nTEXT:\n{text}"
+        details: list[str] = []
+        if source_language:
+            details.append(f"SOURCE LANGUAGE: {source_language}")
+        if context.strip():
+            details.append(
+                "CONTEXT AND OUTPUT INSTRUCTIONS (use for consistency; do not reproduce unless explicitly "
+                f"requested):\n{context.strip()}"
+            )
+        details.append(f"TEXT:\n{text}")
+        user = "\n\n".join(details)
         return self._format_chat_prompt(system, user)
 
     def _system_prompt(self) -> str:
@@ -1121,7 +3119,7 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "units, numbers, and figure references. "
+            "units, numeric values, and figure references. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
             "Translate short section headings and titles as well."
         )
@@ -1187,22 +3185,118 @@ class MlxTranslator:
         compact = self._text_for_language_detection(text)
         if not compact:
             return None
-        try:
-            return detect(compact)
-        except Exception:
-            return None
+        language, _ = self._detect_language_with_confidence(compact)
+        return language
 
     def _chunk_source_language(self, text: str, block_type: BlockType) -> str | None:
+        return self._chunk_language_resolution(text, block_type, "").language
+
+    def _chunk_language_resolution(
+        self,
+        text: str,
+        block_type: BlockType,
+        nearby_context: str,
+    ) -> _LanguageResolution:
+        compact = self._text_for_language_detection(text)
+        words = self._language_words(compact)
+        is_short_heading = (
+            block_type == BlockType.HEADING
+            and len(words) <= 6
+            and sum(len(word) for word in words) <= 60
+        )
+        if is_short_heading and nearby_context:
+            contextual_text = self._text_for_language_detection(
+                f"{text}\n{nearby_context}"
+            )
+            contextual_words = self._language_words(contextual_text)
+            if len(contextual_words) >= 4 and sum(len(word) for word in contextual_words) >= 24:
+                language, confidence = self._detect_language_with_confidence(contextual_text)
+                confidence_threshold = (
+                    self._ENGLISH_SOURCE_CONFIDENCE
+                    if self._base_language(language) == "en"
+                    else self._NON_ENGLISH_OUTPUT_CONFIDENCE
+                )
+                if (
+                    language is not None
+                    and confidence is not None
+                    and confidence >= confidence_threshold
+                ):
+                    return _LanguageResolution(
+                        self._normalize_lang_code(language),
+                        "nearby_context",
+                        confidence,
+                    )
+
         detected = self._detect_text_language(text)
-        if detected:
-            return detected
+        if detected is not None:
+            confidence_language, confidence = self._detect_language_with_confidence(compact)
+            if self._base_language(confidence_language) != self._base_language(detected):
+                confidence = None
+            return _LanguageResolution(
+                self._normalize_lang_code(detected),
+                "block",
+                confidence,
+            )
 
         # Avoid inheriting document-level language for short headings and markup-heavy chunks:
         # they are often misclassified as English and then incorrectly skipped.
         if block_type == BlockType.HEADING or self._contains_inline_markup(text):
-            return self._detect_text_language_relaxed(text)
+            language = self._detect_text_language_relaxed(text)
+            confidence_language, confidence = self._detect_language_with_confidence(compact)
+            if self._base_language(confidence_language) != self._base_language(language):
+                confidence = None
+            return _LanguageResolution(
+                self._normalize_lang_code(language),
+                "block",
+                confidence,
+            )
 
-        return self._document_language
+        return _LanguageResolution(self._document_language, "document", None)
+
+    def _nearby_heading_context(
+        self,
+        document: DocumentModel,
+        block_ids: list[str],
+        block_type: BlockType,
+    ) -> str:
+        if block_type != BlockType.HEADING or not block_ids:
+            return ""
+        positions = {block.id: index for index, block in enumerate(document.blocks)}
+        start_positions = [positions[block_id] for block_id in block_ids if block_id in positions]
+        if not start_positions:
+            return ""
+        anchor = document.blocks[min(start_positions)]
+        pieces: list[str] = []
+        for candidate in document.blocks[max(start_positions) + 1 :]:
+            if candidate.page_number != anchor.page_number:
+                break
+            if candidate.block_type == BlockType.HEADING:
+                break
+            if candidate.block_type in {
+                BlockType.EQUATION,
+                BlockType.FIGURE,
+                BlockType.FOOTER,
+                BlockType.HEADER,
+                BlockType.PAGE_NUMBER,
+            }:
+                continue
+            candidate_text = candidate.text.strip()
+            if not candidate_text or self._is_marker_table_cell_block(candidate):
+                continue
+            pieces.append(candidate_text[:400])
+            if len(pieces) >= 2 or sum(len(piece) for piece in pieces) >= 600:
+                break
+        return "\n".join(pieces)
+
+    def _context_with_nearby_source(self, context: str, nearby_context: str) -> str:
+        if not nearby_context:
+            return context
+        note = (
+            "Nearby source text for language and terminology disambiguation only; "
+            "do not translate, reproduce, or summarize it unless it also appears in TEXT:\n"
+            f"{nearby_context}"
+        )
+        return f"{context}\n{note}".strip()
 
     def _text_for_language_detection(self, text: str) -> str:
         normalized = self._TAG_RE.sub(" ", text)
@@ -1236,7 +3330,9 @@ class MlxTranslator:
             return False
         if self._contains_inline_markup(text):
             return False
-        if any(ord(ch) > 127 for ch in compact):
+        # Typography such as en dashes and curly quotes is common in English
+        # titles; accented alphabetic text remains a conservative non-English cue.
+        if any(ord(ch) > 127 and ch.isalpha() for ch in compact):
             return False
 
         words = re.findall(r"[A-Za-z]+", compact.lower())
@@ -1248,8 +3344,11 @@ class MlxTranslator:
 
         hint_hits = sum(1 for word in words if word in self._ENGLISH_HINT_WORDS)
         if len(words) <= 4:
-            return hint_hits >= 1
-        return hint_hits >= max(2, len(words) // 8)
+            if hint_hits >= 1:
+                return True
+        elif hint_hits >= max(2, len(words) // 8):
+            return True
+        return self._is_confident_english_source(compact)
 
     def _is_qwen35_model_name(self, model_name: str | None) -> bool:
         normalized = (model_name or "").lower()
@@ -1265,26 +3364,38 @@ class MlxTranslator:
             cleaned = re.sub(r"(?is)<think>.*?</think>\s*", "", cleaned).strip()
         return cleaned or text
 
-    def _chunk_block_type(self, chunk: TranslationChunk, block_by_id: dict[str, Block]) -> BlockType | None:
+    def _chunk_block_type(
+        self, chunk: TranslationChunk, block_by_id: dict[str, Block]
+    ) -> BlockType | None:
         if chunk.chunk_type == "keywords":
             return BlockType.PARAGRAPH
         if not chunk.block_ids:
             return None
         target_id = chunk.block_ids[0]
-        if target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(self.TABLE_ROW_PREFIX):
+        if target_id.startswith(self.TABLE_HEADER_PREFIX) or target_id.startswith(
+            self.TABLE_ROW_PREFIX
+        ):
             return BlockType.TABLE
         block = block_by_id.get(target_id)
         return block.block_type if block is not None else None
 
     def _augment_context_for_block_type(self, context: str, block_type: BlockType | None) -> str:
-        if block_type != BlockType.HEADING:
+        if block_type == BlockType.HEADING:
+            note = (
+                "TEXT is a section heading/title. Translate it to natural English while "
+                "preserving the heading intent."
+            )
+        elif block_type == BlockType.TABLE:
+            note = (
+                "TEXT is a table. Preserve every row, cell, empty cell, pipe delimiter, "
+                "number, and span in the same order; translate only natural-language cell text. "
+                f"{self._COMPACT_TABLE_TRANSLATION_GUIDANCE}"
+            )
+        else:
             return context
-        heading_note = (
-            "TEXT is a section heading/title. Translate it to natural English while preserving the heading intent."
-        )
         if not context.strip():
-            return heading_note
-        return f"{context}\n{heading_note}"
+            return note
+        return f"{context}\n{note}"
 
     def _normalize_lang_code(self, code: str | None) -> str | None:
         if not code:
@@ -1304,7 +3415,12 @@ class MlxTranslator:
             return aliases[normalized]
         if len(normalized) == 2 and normalized.isalpha():
             return normalized
-        if len(normalized) == 5 and normalized[2] == "-" and normalized[:2].isalpha() and normalized[3:].isalpha():
+        if (
+            len(normalized) == 5
+            and normalized[2] == "-"
+            and normalized[:2].isalpha()
+            and normalized[3:].isalpha()
+        ):
             return f"{normalized[:2]}-{normalized[3:].upper()}"
         return None
 

@@ -39,11 +39,58 @@ class Reconstructor:
     table {{ width: 100%; border-collapse: collapse; margin: .8em 0; font-size: 9.5pt; break-inside: auto; column-span: all; }}
     thead {{ display: table-header-group; }}
     tr {{ break-inside: avoid; }}
-    th,td {{ border: 1px solid #777; padding: 4px 6px; vertical-align: top; }}
+    th,td {{ border: 1px solid #777; padding: 4px 6px; vertical-align: top; overflow-wrap: anywhere; hyphens: auto; }}
     th {{ background: #f0f0f0; }}
     .table-block {{ column-span: all; border: 1px solid #777; padding: 6px 8px; margin: .8em 0; font-size: 9.5pt; white-space: pre-wrap; break-inside: avoid; }}
-    img {{ max-width: 100%; page-break-inside: avoid; break-inside: avoid; }}
+    img {{ max-width: 100%; height: auto; page-break-inside: avoid; break-inside: avoid; }}
     figure, blockquote, pre {{ break-inside: avoid; }}
+    figure.document-figure {{
+      column-span: all;
+      margin: .9em auto 1.1em;
+      max-width: 100%;
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }}
+    figure.document-figure img {{ display: block; margin: 0 auto; max-height: 225mm; object-fit: contain; }}
+    figure.document-figure figcaption {{
+      font-size: 9.5pt;
+      line-height: 1.3;
+      margin: .45em auto 0;
+      max-width: 95%;
+      text-align: left;
+      page-break-before: avoid;
+      break-before: avoid;
+    }}
+    figure.document-table {{
+      column-span: all;
+      display: block;
+      margin: .9em 0 1.1em;
+      max-width: 100%;
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }}
+    figure.document-table table {{
+      table-layout: fixed;
+      margin: 0;
+      page-break-inside: avoid;
+      break-inside: avoid;
+    }}
+    figure.document-table figcaption {{
+      font-size: 9.5pt;
+      font-style: italic;
+      line-height: 1.3;
+      margin: .45em 0 0;
+      text-align: left;
+      page-break-before: avoid;
+      break-before: avoid;
+    }}
+    figure.document-table .table-notes {{ display: block; margin-top: .35em; }}
+    figure.document-table--long,
+    figure.document-table--long table,
+    figure.document-table--long tbody {{
+      page-break-inside: auto;
+      break-inside: auto;
+    }}
     em {{ color: #2d2d2d; }}
     small {{ color: #666; font-size: 9pt; }}
     .page-marker {{ column-span: all; break-before: page; height: 0; overflow: hidden; }}

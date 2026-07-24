@@ -22,6 +22,7 @@ from app.services.pdf_extraction.models import (
     PDFTypeDetectionResult,
 )
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
+from app.services.pdf_extraction.table_repair import MarkerTableRepairService
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,12 @@ class PDFExtractor:
         detector: PDFTypeDetector | None = None,
         document_builder: MarkerDocumentBuilder | None = None,
         local_vlm_service: LocalVLMRepairService | None = None,
+        table_repair_service: MarkerTableRepairService | None = None,
     ) -> None:
         self.detector = detector or PDFTypeDetector()
         self.document_builder = document_builder or MarkerDocumentBuilder()
         self.local_vlm_service = local_vlm_service or LocalVLMRepairService()
+        self.table_repair_service = table_repair_service or MarkerTableRepairService()
 
     def extract(
         self,
@@ -140,6 +143,15 @@ class PDFExtractor:
                 parser_metadata=parser_metadata,
                 warnings=warnings,
             )
+
+            table_repair = self.table_repair_service.repair(pdf_path, document)
+            warnings.extend(table_repair.warnings)
+            parser_metadata["table_repair"] = table_repair.as_metadata()
+            document.metadata.translation["table_repair"] = table_repair.as_metadata()
+            document.warnings = list(warnings)
+            if table_repair.repaired_count:
+                markdown = AppMarkdownBuilder().build(document)
+                chunks = self.document_builder.chunks_from_blocks(document.blocks)
 
             repaired_count = 0
             if use_local_vlm_repair:
@@ -293,7 +305,11 @@ class PDFExtractor:
             message = f"Marker failed with exit code {process.returncode}: {stderr[-4000:] or stdout[-4000:]}"
             raise MarkerExecutionError(message, process.returncode, stdout, stderr)
 
-        payload_path = self._find_marker_payload(output_dir, output_format)
+        payload_path = self._find_marker_payload(
+            output_dir,
+            output_format,
+            source_stem=pdf_path.stem,
+        )
         if payload_path is None:
             self._write_marker_failure(output_dir, cmd, process.returncode or 0, stdout, stderr)
             raise RuntimeError(f"Marker completed but no {output_format} output was found in {output_dir}")
@@ -391,15 +407,73 @@ class PDFExtractor:
         detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()
         return detail[-1][-500:] if detail else str(exc)[-500:]
 
-    def _find_marker_payload(self, output_dir: Path, output_format: str) -> Path | None:
+    def _find_marker_payload(
+        self,
+        output_dir: Path,
+        output_format: str,
+        *,
+        source_stem: str | None = None,
+    ) -> Path | None:
         suffix = ".json" if output_format in {"json", "chunks"} else ".md"
         candidates = sorted(output_dir.rglob(f"*{suffix}"), key=lambda path: (len(path.parts), path.name))
-        if output_format in {"json", "chunks"}:
+        if output_format == "json":
             candidates = [
                 path for path in candidates
-                if path.name not in {"metadata.json", "debug_data.json"} and "debug" not in path.parts
-            ] or candidates
+                if path.name
+                not in {
+                    "blocks.json",
+                    "metadata.json",
+                    "debug_data.json",
+                }
+                and not path.name.endswith("_meta.json")
+                and "debug" not in path.parts
+                and self._is_canonical_marker_json(path)
+            ]
+        elif output_format == "chunks":
+            candidates = [
+                path
+                for path in candidates
+                if path.name not in {"blocks.json", "metadata.json", "debug_data.json"}
+                and not path.name.endswith("_meta.json")
+                and "debug" not in path.parts
+            ]
+        if source_stem:
+            exact = [path for path in candidates if path.stem == source_stem]
+            if exact:
+                return exact[0]
         return candidates[0] if candidates else None
+
+    def _is_canonical_marker_json(self, path: Path) -> bool:
+        """Reject Marker's numeric debug graph before it reaches the semantic builder."""
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+
+        def is_page(value: object) -> bool:
+            return bool(
+                isinstance(value, dict)
+                and str(value.get("block_type", "")).casefold() == "page"
+                and isinstance(value.get("children"), list)
+            )
+
+        if isinstance(payload, list):
+            return bool(payload) and all(is_page(item) for item in payload)
+        if not isinstance(payload, dict):
+            return False
+        block_type = str(payload.get("block_type", "")).casefold()
+        if block_type == "page":
+            return is_page(payload)
+        if block_type == "document":
+            children = payload.get("children")
+            return bool(
+                isinstance(children, list)
+                and children
+                and all(is_page(item) for item in children)
+            )
+        pages = payload.get("pages")
+        return bool(isinstance(pages, list) and pages and all(is_page(item) for item in pages))
 
     def _default_marker_bin(self) -> str:
         isolated_marker = BASE_DIR / ".venv-marker" / "bin" / "marker_single"

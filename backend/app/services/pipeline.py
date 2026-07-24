@@ -25,7 +25,9 @@ from app.config import (
 )
 from app.models.schema import DocumentModel
 from app.models.schema import JobStage
+from app.services.figure_extractor import FigureExtractionService
 from app.services.job_store import JobStore
+from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction import PDFExtractor
 from app.services.pdf_extraction.models import PDFTypeDetectionResult
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
@@ -41,6 +43,7 @@ class TranslationPipeline:
         self.job_store = job_store
         self.pdf_extractor = PDFExtractor()
         self.qwen_ocr_fallback = QwenFullPageOCRFallback()
+        self.figure_extractor = FigureExtractionService()
         self._lock = threading.RLock()
         self._cancelled_jobs: set[str] = set()
         self._active_processes: dict[str, list[subprocess.Popen]] = {}
@@ -263,6 +266,18 @@ class TranslationPipeline:
             ):
                 return
 
+            with profiler.step("figure_extraction"):
+                result.document = self.figure_extractor.extract(
+                    pdf_path=pdf_path,
+                    document=result.document,
+                    artifact_dir=artifacts_dir / "figures",
+                    extraction_metadata=result.metadata,
+                )
+                result.markdown = MarkdownBuilder().build(result.document)
+                result.pages = [page.model_dump() for page in result.document.pages]
+                result.blocks = [block.model_dump() for block in result.document.blocks]
+                result.warnings = list(result.document.warnings)
+
             with profiler.step("marker_artifact_write"):
                 json_path.write_text(result.document.model_dump_json(indent=2), encoding="utf-8")
                 source_md_path.write_text(result.markdown.strip() + "\n", encoding="utf-8")
@@ -321,31 +336,40 @@ class TranslationPipeline:
             logger.info("Translation started")
             logger.info("Translation chunks: %s", len(result.chunks))
             translation_started = time.perf_counter()
+            translation_progress = 0.7
 
             def on_chunk_translated(index: int, total: int, preview: str) -> None:
-                partial_progress = 0.7 + (0.18 * (index / max(total, 1)))
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=True),
+                )
                 safe_preview = preview if preview else "(empty output)"
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.88), 3),
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: {safe_preview}",
                 )
 
             def on_chunk_started(index: int, total: int) -> None:
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=False),
+                )
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=0.7,
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: translating...",
                 )
 
             def on_table_progress(index: int, total: int, label: str) -> None:
-                partial_progress = 0.88 + (0.08 * (index / max(total, 1)))
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.96), 3),
+                    progress=translation_progress,
                     message=f"Tables {index}/{total}: {label}",
                 )
 
@@ -369,6 +393,11 @@ class TranslationPipeline:
                 return
 
             translated_document = DocumentModel.model_validate_json(json_path.read_text(encoding="utf-8"))
+            # Translation can add safe-retention warnings (for example when an
+            # English-only retry still returns source-language prose). Surface
+            # those through the normal job-details warning channel as well as
+            # the structured artifact.
+            result.warnings = list(translated_document.warnings)
             comparison_json, comparison_md = write_translation_comparison_report(
                 source_path=source_md_path,
                 translated_path=md_path,
@@ -487,6 +516,17 @@ class TranslationPipeline:
             pages = int(event.get("pages") or 0)
             return 0.5, f"Qwen OCR completed for {pages} page(s)"
         return None
+
+    def _translation_chunk_progress(
+        self,
+        index: int,
+        total: int,
+        *,
+        completed: bool,
+    ) -> float:
+        completed_chunks = index if completed else index - 1
+        fraction = max(0, completed_chunks) / max(total, 1)
+        return round(min(0.7 + (0.18 * fraction), 0.88), 3)
 
     def _update_status(self, job_id: str, **updates: object) -> bool:
         try:
