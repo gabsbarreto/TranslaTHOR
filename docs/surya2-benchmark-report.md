@@ -231,6 +231,20 @@ Use direct Surya 2 full-page OCR for scans and poor/hidden OCR. Keep
 keep `marker_surya` only for regression and documents where its postprocessing
 is known to help. Do not make the block-level Surya 2 strategy the default.
 
+### Reconstruction integration added after the benchmark
+
+The `surya2afterreconstruction` integration adds conservative original-layout
+overlays for Surya 2 raster-only text blocks. Synthetic integration tests
+verify identity coordinate conversion, raster foreground-row masking,
+searchable translated text insertion, pixel-identical preservation of a
+nearby figure, and unchanged fallback for a nonuniform visual region.
+
+These reconstruction tests were added after the OCR timings and do not alter
+the benchmark table above. Image-only Surya tables without validated cell
+geometry remain unchanged in original-layout output, and the private
+regression corpus still requires a fresh live end-to-end run before this path
+should be treated as production-complete.
+
 ## Verification
 
 Before implementation, the unmodified starting commit passed:

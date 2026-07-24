@@ -1735,6 +1735,233 @@ def test_hidden_ocr_missing_bbox_without_hidden_text_retains_page_unchanged(
     assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
 
 
+def _create_surya2_image_only_scan(path: Path) -> tuple[BoundingBox, BoundingBox]:
+    page_width = 360
+    page_height = 180
+    scale = 2
+    image = Image.new("RGB", (page_width * scale, page_height * scale), "white")
+    drawing = ImageDraw.Draw(image)
+    drawing.text(
+        (70, 65),
+        "Contenido original para traducir",
+        fill=(15, 15, 15),
+    )
+    drawing.rectangle((460, 50, 660, 190), fill=(32, 92, 176))
+    drawing.line((480, 165, 635, 80), fill=(245, 210, 45), width=7)
+    drawing.text((505, 105), "VISUAL", fill="white")
+    image_path = path.with_suffix(".png")
+    image.save(image_path)
+
+    pdf = fitz.open()
+    page = pdf.new_page(width=page_width, height=page_height)
+    page.insert_image(page.rect, filename=str(image_path))
+    pdf.save(path)
+    pdf.close()
+    return (
+        BoundingBox(x0=30, y0=25, x1=220, y1=62),
+        BoundingBox(x0=230, y0=25, x1=330, y1=95),
+    )
+
+
+def _surya2_image_scan_document(
+    filename: str,
+    *,
+    text_bbox: BoundingBox,
+    figure_bbox: BoundingBox,
+) -> DocumentModel:
+    source_text = "Contenido original para traducir"
+    text_block = Block(
+        id="surya2-text",
+        page_number=1,
+        block_type=BlockType.PARAGRAPH,
+        text="Translated source content",
+        bbox=text_bbox,
+        reading_order_index=0,
+        source_type=SourceType.OCR,
+        style_hints={"font_size": 10},
+        metadata={
+            "parser": "surya2_llamacpp",
+            "ocr_engine": "surya2_llamacpp",
+            "source_text": source_text,
+            "translated_from_block_ids": ["surya2-text"],
+            "surya_page_width": 360,
+            "surya_page_height": 180,
+            "coordinate_space": "pdf_points_top_left",
+        },
+    )
+    figure_block = Block(
+        id="surya2-figure",
+        page_number=1,
+        block_type=BlockType.FIGURE,
+        text="",
+        bbox=figure_bbox,
+        reading_order_index=1,
+        source_type=SourceType.OCR,
+        skipped=True,
+        metadata={
+            "parser": "surya2_llamacpp",
+            "ocr_engine": "surya2_llamacpp",
+            "surya_page_width": 360,
+            "surya_page_height": 180,
+            "coordinate_space": "pdf_points_top_left",
+        },
+    )
+    return DocumentModel(
+        metadata=DocumentMetadata(filename=filename, page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=360,
+                height=180,
+                has_embedded_text=False,
+                embedded_text_quality=0,
+                extraction_mode=SourceType.OCR,
+            )
+        ],
+        blocks=[text_block, figure_block],
+        figures=[
+            FigureAsset(
+                id="surya2-figure-asset",
+                page_number=1,
+                bbox=figure_bbox,
+                source_block_ids=["surya2-figure"],
+            )
+        ],
+    )
+
+
+def test_surya2_image_only_scan_uses_raster_text_masks_and_preserves_visuals(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surya2-image-only.pdf"
+    output = tmp_path / "surya2-image-only-translated.pdf"
+    text_bbox, figure_bbox = _create_surya2_image_only_scan(source)
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=_surya2_image_scan_document(
+            source.name,
+            text_bbox=text_bbox,
+            figure_bbox=figure_bbox,
+        ),
+        report_path=tmp_path / "surya2-image-only-report.json",
+    )
+
+    assert report["status"] == "complete"
+    assert report["pages"][0]["reconstruction_strategy"] == "surya2_image_overlay"
+    assert report["surya2_image_overlay_pages"] == 1
+    assert report["surya2_image_text_masks"] >= 1
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["reconstruction_strategy"] == "surya2_image_text_overlay"
+    assert replaced["bbox"] == text_bbox.model_dump()
+    assert replaced["source_text_masks"]
+    assert replaced["coordinate_metadata"][0]["scale_x"] == 1
+    assert replaced["coordinate_metadata"][0]["scale_y"] == 1
+    raster_metadata = replaced["coordinate_metadata"][-1]
+    assert raster_metadata["geometry_source"] == "surya2_pdf_bbox"
+    assert raster_metadata["mask_source"] == "surya2_raster_foreground_rows"
+
+    with fitz.open(output) as translated:
+        assert "Translated source content" in translated[0].get_text("text")
+
+    source_image = _render_rgb(source)
+    output_image = _render_rgb(output)
+    figure_pixels = (
+        round(figure_bbox.x0 * 2),
+        round(figure_bbox.y0 * 2),
+        round(figure_bbox.x1 * 2),
+        round(figure_bbox.y1 * 2),
+    )
+    assert ImageChops.difference(
+        source_image.crop(figure_pixels),
+        output_image.crop(figure_pixels),
+    ).getbbox() is None
+
+
+def test_surya2_image_only_scan_rejects_nonuniform_visual_text_region(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surya2-unsafe-image-only.pdf"
+    output = tmp_path / "surya2-unsafe-image-only-output.pdf"
+    _text_bbox, figure_bbox = _create_surya2_image_only_scan(source)
+    document = _surya2_image_scan_document(
+        source.name,
+        text_bbox=figure_bbox,
+        figure_bbox=BoundingBox(x0=335, y0=120, x1=355, y1=175),
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "surya2-unsafe-image-only-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["regions_replaced"] == 0
+    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
+    assert skipped["reason"] == "surya2_image_scan_background_not_uniform_or_light"
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_surya2_image_only_scan_retains_table_without_cell_geometry(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surya2-image-only-table.pdf"
+    output = tmp_path / "surya2-image-only-table-output.pdf"
+    text_bbox, figure_bbox = _create_surya2_image_only_scan(source)
+    document = _surya2_image_scan_document(
+        source.name,
+        text_bbox=text_bbox,
+        figure_bbox=figure_bbox,
+    )
+    table_block = Block(
+        id="surya2-table",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text="<table><tr><td>Translated</td></tr></table>",
+        bbox=BoundingBox(x0=30, y0=105, x1=210, y1=160),
+        reading_order_index=2,
+        source_type=SourceType.OCR,
+        metadata={
+            "parser": "surya2_llamacpp",
+            "ocr_engine": "surya2_llamacpp",
+            "source_text": "<table><tr><td>Origen</td></tr></table>",
+            "translated_from_block_ids": ["surya2-table"],
+            "surya_page_width": 360,
+            "surya_page_height": 180,
+        },
+    )
+    document.blocks.append(table_block)
+    document.tables.append(
+        TableModel(
+            id="surya2-table-model",
+            page_numbers=[1],
+            page=1,
+            bbox=table_block.bbox,
+            rows=[["Origen"]],
+            debug={"source_block_id": table_block.id},
+        )
+    )
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "surya2-image-only-table-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["regions_replaced"] == 1
+    skipped_table = next(
+        region
+        for region in report["regions"]
+        if region["block_ids"] == ["surya2-table"]
+    )
+    assert skipped_table["reason"] == "surya2_image_scan_table_requires_cell_geometry"
+
+
 def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
     tmp_path: Path,
 ) -> None:

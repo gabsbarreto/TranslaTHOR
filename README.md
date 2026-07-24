@@ -58,11 +58,15 @@ backend/
         markdown_builder.py          # Marker output -> structured document
         table_repair.py              # Validated PyMuPDF repair for collapsed Marker tables
         qwen_ocr_fallback.py         # Full-page Qwen OCR integration
+        surya2_adapter.py             # Surya 2 output -> shared document schema
+        surya2_extractor.py           # Direct Surya 2 extraction orchestration
+        surya2_runtime.py             # Persistent isolated worker lifecycle
 scripts/
   run_dev.sh
   setup_local_runtime.sh
   qwen_ocr_worker.py
   surya_layout_worker.py
+  surya2_worker.py
 frontend/
   index.html
   app.js
@@ -98,6 +102,11 @@ workspace/jobs/                     # Per-job inputs and generated artifacts
   shape and complete PDF grid agree, while rules, arrows, numbers, and unchanged cells remain on the
   source page. The table operation is atomic, so one unsafe or overflowing cell retains the entire
   source table.
+  For a Surya 2 raster-only scan, PDF-space Surya boxes provide the placement boundary and a local
+  raster pass finds dark source-glyph rows on a light, uniform background. Only those row masks are
+  covered before translated searchable text is inserted. Dense, dark, nonuniform, missing, or
+  overflowing regions remain unchanged. Figures and equations remain locked, and image-only tables
+  without trustworthy cell geometry are retained for safety.
   Figures, graphs, equations, logos, colours, lines, page sizes, crop boxes, rotation, and
   decorations come from the original pages. A JSON reconstruction report records every replacement,
   skip, fallback page, text scale, overflow, raster figure fallback, low-confidence association, and
@@ -121,8 +130,11 @@ The reconstruction report becomes available after the original-layout PDF is gen
 
 ## Browser Workflow
 
-The normal interface requires no model or extraction configuration. Drop or select one or more
-PDFs and the server applies its configured automatic extraction and local translation defaults.
+The normal interface exposes only the poor-text/scanned OCR choice. Surya 2 through `llama.cpp` is
+selected by default; Surya + Qwen remains available as a text-critical fallback, and the legacy
+Marker OCR path remains available for comparison. Drop or select one or more PDFs and the server
+applies the remaining automatic extraction and local translation defaults. Good born-digital PDFs
+always continue through Marker text-layer extraction regardless of the selected scan engine.
 
 - **Current activity** shows the stage, progress, filename, short job ID, and number of documents
   waiting.
@@ -261,9 +273,11 @@ ten-case specification is always tested.
 
 ## Reconstruction Limitations
 
-- Scanned and image-only pages without a reliable hidden text layer are retained unchanged. This
-  version does not perform general background inpainting and will never place translated text over
-  visible source text that has not first been safely covered.
+- Surya 2 image-only scans can replace text blocks only when the Surya PDF-space box contains
+  raster foreground rows on a light, sufficiently uniform background. The mask is derived from
+  source pixels and recorded in the reconstruction report. Dense, dark, nonuniform, missing, or
+  overflowing regions are retained unchanged. This is conservative masking, not general
+  background inpainting.
 - Hidden-OCR pages can replace body text when the complete source passage has one unambiguous match
   to a spatially contiguous hidden-OCR line lane. The stored Surya box is an auditable position hint
   rather than the final authority, because a missed or merged region can shift later reading-order
@@ -275,9 +289,11 @@ ten-case specification is always tested.
   require table geometry, already-English passages, and suspicious translation-script changes are
   retained and reported. A page with any retained translatable region is reported as partial, and
   the readable PDF remains the safe full-translation fallback.
-- Image-only scans without hidden OCR still require a future pixel-level text detector and
-  inpainting stage. Surya boxes alone are not treated as sufficient evidence for destructive
-  masking, because they describe layout regions rather than exact character strokes.
+- Image-only OCR from Qwen or legacy Marker still requires hidden text geometry for original-layout
+  replacement. The pixel-mask strategy is intentionally restricted to Surya 2 blocks because its
+  adapter preserves the tested polygon, PDF-space box, raw label, and reading order contract.
+  Image-only Surya tables also remain unchanged unless trustworthy cell geometry is available;
+  their translated structured content remains available in the readable PDF.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
 - Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.

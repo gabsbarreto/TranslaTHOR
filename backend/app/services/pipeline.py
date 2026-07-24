@@ -29,7 +29,7 @@ from app.services.figure_extractor import FigureExtractionService
 from app.services.job_store import JobStore
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction import PDFExtractor
-from app.services.pdf_extraction.models import PDFTypeDetectionResult
+from app.services.pdf_extraction.models import MarkerMode, PDFTypeDetectionResult
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
 from app.services.pdf_extraction.surya2_extractor import Surya2LlamaCppExtractor
 from app.services.profiler import PipelineProfiler
@@ -227,6 +227,33 @@ class TranslationPipeline:
                         on_ocr_progress=on_qwen_progress,
                     )
             else:
+                def on_marker_detection_complete(
+                    detected: PDFTypeDetectionResult,
+                    marker_mode: MarkerMode,
+                ) -> None:
+                    self._update_status(
+                        job_id,
+                        stage=JobStage.EXTRACTION,
+                        progress=0.14,
+                        message=(
+                            f"PDF classified as {detected.classification}; "
+                            f"running Marker mode {marker_mode}"
+                        ),
+                        translation={
+                            **translation_metadata,
+                            "pdf_classification": detected.classification,
+                            "marker_mode": marker_mode,
+                            "ocr_used": marker_mode
+                            in {"force_ocr", "strip_existing_ocr_force_ocr"},
+                            "force_ocr": marker_mode
+                            in {"force_ocr", "strip_existing_ocr_force_ocr"},
+                            "strip_existing_ocr": (
+                                marker_mode == "strip_existing_ocr_force_ocr"
+                            ),
+                            "warnings": detected.warnings,
+                        },
+                    )
+
                 with profiler.step("marker_extraction"):
                     marker_extraction_mode = self._marker_extraction_mode(
                         extraction_mode,
@@ -247,26 +274,7 @@ class TranslationPipeline:
                         on_process_finished=lambda process: self._unregister_process(
                             job_id, process
                         ),
-                        on_detection_complete=lambda detection, marker_mode: self._update_status(
-                            job_id,
-                            stage=JobStage.EXTRACTION,
-                            progress=0.14,
-                            message=(
-                                f"PDF classified as {detection.classification}; "
-                                f"running Marker mode {marker_mode}"
-                            ),
-                            translation={
-                                **translation_metadata,
-                                "pdf_classification": detection.classification,
-                                "marker_mode": marker_mode,
-                                "ocr_used": marker_mode
-                                in {"force_ocr", "strip_existing_ocr_force_ocr"},
-                                "force_ocr": marker_mode
-                                in {"force_ocr", "strip_existing_ocr_force_ocr"},
-                                "strip_existing_ocr": marker_mode == "strip_existing_ocr_force_ocr",
-                                "warnings": detection.warnings,
-                            },
-                        ),
+                        on_detection_complete=on_marker_detection_complete,
                     )
                 if self._is_cancelled(job_id):
                     self._mark_cancelled(job_id)
@@ -560,7 +568,7 @@ class TranslationPipeline:
             return False
         if str(settings.get("extraction_mode", "auto")) not in {"auto", "auto_repair"}:
             return False
-        return result.pdf_classification != "digital_good_text"
+        return bool(result.pdf_classification != "digital_good_text")
 
     def _should_bypass_marker_for_qwen(
         self, detection: PDFTypeDetectionResult, settings: dict

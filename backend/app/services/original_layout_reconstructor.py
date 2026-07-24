@@ -13,7 +13,7 @@ from itertools import combinations
 from pathlib import Path
 from typing import Any
 
-import fitz
+import fitz  # type: ignore[import-untyped]
 
 from app.models.schema import (
     Block,
@@ -170,10 +170,13 @@ class OriginalLayoutReconstructor:
                     continue
 
                 scan_overlay = strategy in {"ocr_text_overlay", "ocr_table_overlay"}
+                surya2_image_overlay = strategy == "surya2_image_overlay"
                 scan_table_only = strategy == "ocr_table_overlay"
                 page_report["reconstruction_strategy"] = strategy
-                if scan_overlay:
+                if scan_overlay or surya2_image_overlay:
                     report["scan_overlay_pages"] += 1
+                if surya2_image_overlay:
+                    report["surya2_image_overlay_pages"] += 1
 
                 replacements = self._replacement_regions(
                     page=page,
@@ -187,6 +190,7 @@ class OriginalLayoutReconstructor:
                     page_report=page_report,
                     scan_overlay=scan_overlay,
                     scan_table_only=scan_table_only,
+                    surya2_image_overlay=surya2_image_overlay,
                 )
                 guarded_replacements: list[_ReplacementRegion] = []
                 for region in replacements:
@@ -374,6 +378,10 @@ class OriginalLayoutReconstructor:
                     report["regions_replaced"] += 1
                     page_report["regions_replaced"] += 1
                     report["scan_text_masks"] += len(region.redaction_bboxes or [])
+                    if region.reconstruction_strategy == "surya2_image_text_overlay":
+                        report["surya2_image_text_masks"] += len(
+                            region.redaction_bboxes or []
+                        )
                     report["regions"].append({**entry, "status": "replaced"})
                 raster_table_ids = {
                     str(metadata["table_block_id"])
@@ -466,6 +474,8 @@ class OriginalLayoutReconstructor:
             "scan_text_masks": 0,
             "scan_text_regions_aligned": 0,
             "scan_text_regions_alignment_failed": 0,
+            "surya2_image_overlay_pages": 0,
+            "surya2_image_text_masks": 0,
             "raster_tables_reconstructed": 0,
             "safe_fallback": "readable_pdf",
             "minimum_text_scale": self.minimum_scale,
@@ -524,9 +534,24 @@ class OriginalLayoutReconstructor:
                 if translated_tables and not translated_body:
                     return "ocr_table_overlay", ""
                 return "ocr_text_overlay", ""
+            surya2_blocks = [
+                block
+                for block in blocks
+                if str(block.metadata.get("ocr_engine", "")).casefold()
+                == "surya2_llamacpp"
+                or str(block.metadata.get("parser", "")).casefold()
+                == "surya2_llamacpp"
+            ]
+            if any(
+                block.bbox is not None
+                and block.block_type not in self.locked_block_types
+                for block in surya2_blocks
+            ):
+                return "surya2_image_overlay", ""
             return (
                 "unsupported",
-                "The OCR page has no usable hidden text geometry for source-glyph alignment; it was retained unchanged.",
+                "The OCR page has neither usable hidden text geometry nor Surya 2 image-region "
+                "geometry for a safe translated overlay; it was retained unchanged.",
             )
         if not metadata.has_embedded_text or metadata.embedded_text_quality < 0.35:
             return (
@@ -624,6 +649,7 @@ class OriginalLayoutReconstructor:
         page_report: dict[str, Any],
         scan_overlay: bool = False,
         scan_table_only: bool = False,
+        surya2_image_overlay: bool = False,
     ) -> list[_ReplacementRegion]:
         block_by_id = {block.id: block for block in all_blocks}
         consumed: set[str] = set()
@@ -686,6 +712,15 @@ class OriginalLayoutReconstructor:
                 )
                 continue
             if block.block_type == BlockType.TABLE:
+                if surya2_image_overlay:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="surya2_image_scan_table_requires_cell_geometry",
+                        bbox=self._block_pdf_bbox(page, block),
+                    )
+                    continue
                 validation = block.metadata.get("translation_validation")
                 if (
                     isinstance(validation, dict)
@@ -729,12 +764,12 @@ class OriginalLayoutReconstructor:
                 continue
 
             if recovered_text is not None:
-                translated_from = [block.id]
+                translated_from: list[str] = [block.id]
                 source_blocks = [block]
                 translated_text = recovered_text
             else:
-                translated_from = block.metadata.get("translated_from_block_ids")
-                if not isinstance(translated_from, list) or not translated_from:
+                translated_from_value = block.metadata.get("translated_from_block_ids")
+                if not isinstance(translated_from_value, list) or not translated_from_value:
                     self._skip_block(
                         report,
                         page_report,
@@ -748,6 +783,7 @@ class OriginalLayoutReconstructor:
                         ),
                     )
                     continue
+                translated_from = [str(value) for value in translated_from_value]
                 source_blocks = [
                     block_by_id[block_id] for block_id in translated_from if block_id in block_by_id
                 ]
@@ -823,7 +859,7 @@ class OriginalLayoutReconstructor:
             ):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
-            if not scan_overlay:
+            if not scan_overlay and not surya2_image_overlay:
                 source_validation = self._embedded_source_text_validation(
                     page,
                     bbox,
@@ -848,7 +884,7 @@ class OriginalLayoutReconstructor:
                         "source_text_validation": source_validation,
                     }
                 )
-            if scan_overlay and not source_text:
+            if (scan_overlay or surya2_image_overlay) and not source_text:
                 self._skip_block(
                     report,
                     page_report,
@@ -858,7 +894,7 @@ class OriginalLayoutReconstructor:
                 )
                 continue
             scan_match: _HiddenOCRMatch | None = None
-            if scan_overlay:
+            if scan_overlay or surya2_image_overlay:
                 if self._source_text_is_probably_english(source_text):
                     # The application targets English. Re-typesetting an
                     # already-English passage only introduces scan artefacts
@@ -873,6 +909,7 @@ class OriginalLayoutReconstructor:
                         bbox=None if recover_bbox_from_hidden_ocr else bbox,
                     )
                     continue
+            if scan_overlay:
                 scan_match, match_metadata = self._match_hidden_ocr_lines(
                     page,
                     source_text,
@@ -984,6 +1021,51 @@ class OriginalLayoutReconstructor:
                 )
                 claimed_scan_lines.update(scan_match.keys)
                 report["scan_text_regions_aligned"] += 1
+            elif surya2_image_overlay:
+                fill, background_metadata = self._scan_background_fill(page, bbox)
+                if fill is None:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="surya2_image_scan_background_not_uniform_or_light",
+                        bbox=bbox,
+                        alignment_diagnostics={
+                            "scan_background": background_metadata,
+                        },
+                    )
+                    continue
+                masks, mask_metadata = self._surya2_image_text_masks(
+                    page,
+                    bbox,
+                    background_fill=fill,
+                )
+                if not masks:
+                    self._skip_block(
+                        report,
+                        page_report,
+                        block,
+                        reason="surya2_image_scan_text_mask_not_reliable",
+                        bbox=bbox,
+                        alignment_diagnostics={
+                            "scan_background": background_metadata,
+                            "raster_text_mask": mask_metadata,
+                        },
+                    )
+                    continue
+                replacement.redaction_bboxes = masks
+                replacement.redaction_fill = fill
+                replacement.reconstruction_strategy = "surya2_image_text_overlay"
+                replacement.coordinate_metadata.append(
+                    {
+                        "geometry_source": "surya2_pdf_bbox",
+                        "coordinate_space": "pdf_points_top_left",
+                        "surya2_region_bbox_pdf": bbox.model_dump(),
+                        "mask_source": "surya2_raster_foreground_rows",
+                        "scan_background": background_metadata,
+                        "raster_text_mask": mask_metadata,
+                    }
+                )
             replacements.append(replacement)
 
         if (
@@ -1505,7 +1587,7 @@ class OriginalLayoutReconstructor:
         *,
         tolerance: float,
     ) -> bool:
-        return (
+        return bool(
             rectangle.x0 < container.x0 - tolerance
             or rectangle.y0 < container.y0 - tolerance
             or rectangle.x1 > container.x1 + tolerance
@@ -1538,24 +1620,29 @@ class OriginalLayoutReconstructor:
                 candidate_rect = fitz.Rect(table.bbox)
                 overlap = fitz.Rect(candidate_rect & table_rect).get_area()
                 union_area = candidate_rect.get_area() + table_rect.get_area() - overlap
-                rows = [
+                candidate_rows = [
                     [fitz.Rect(cell) for cell in row.cells if cell is not None]
                     for row in table.rows
                 ]
-                alignment = self._align_table_rows(page, source_rows, source_rows, rows)
+                alignment = self._align_table_rows(
+                    page,
+                    source_rows,
+                    source_rows,
+                    candidate_rows,
+                )
                 if (
-                    not rows
+                    not candidate_rows
                     or int(table.col_count) != expected_columns
-                    or len(rows) > expected_rows
+                    or len(candidate_rows) > expected_rows
                     or overlap / max(1.0, union_area) < 0.65
                     or alignment is None
                     or not self._table_alignment_has_full_cell_coverage(page, alignment)
                 ):
                     continue
-                candidates.append((overlap, rows))
+                candidates.append((overlap, candidate_rows))
             if candidates:
-                _overlap, rows = max(candidates, key=lambda item: item[0])
-                return rows, "pymupdf_find_tables_lines_strict"
+                _overlap, detected_rows = max(candidates, key=lambda item: item[0])
+                return detected_rows, "pymupdf_find_tables_lines_strict"
         except Exception as exc:
             logger.debug("PyMuPDF table grid detection failed: %s", exc)
 
@@ -1605,32 +1692,42 @@ class OriginalLayoutReconstructor:
                     and rectangle.height > table_rect.height * 0.8
                 ):
                     continue
-                key = tuple(round(float(value), 2) for value in rectangle)
+                key = (
+                    round(float(rectangle.x0), 2),
+                    round(float(rectangle.y0), 2),
+                    round(float(rectangle.x1), 2),
+                    round(float(rectangle.y1), 2),
+                )
                 rectangles[key] = rectangle
 
-        rows: list[list[fitz.Rect]] = []
+        detected_rows = []
         for rectangle in sorted(
             rectangles.values(),
             key=lambda value: (round(value.y0, 1), value.x0),
         ):
             if (
-                not rows
-                or abs(rows[-1][0].y0 - rectangle.y0) > 1.0
-                or abs(rows[-1][0].y1 - rectangle.y1) > 1.0
+                not detected_rows
+                or abs(detected_rows[-1][0].y0 - rectangle.y0) > 1.0
+                or abs(detected_rows[-1][0].y1 - rectangle.y1) > 1.0
             ):
-                rows.append([rectangle])
+                detected_rows.append([rectangle])
             else:
-                rows[-1].append(rectangle)
-        for row in rows:
+                detected_rows[-1].append(rectangle)
+        for row in detected_rows:
             row.sort(key=lambda value: value.x0)
-        rectangle_alignment = self._align_table_rows(page, source_rows, source_rows, rows)
+        rectangle_alignment = self._align_table_rows(
+            page,
+            source_rows,
+            source_rows,
+            detected_rows,
+        )
         if (
-            rows
-            and len(rows) <= expected_rows
+            detected_rows
+            and len(detected_rows) <= expected_rows
             and rectangle_alignment is not None
             and self._table_alignment_has_full_cell_coverage(page, rectangle_alignment)
         ):
-            return rows, "pdf_vector_cell_rectangles"
+            return detected_rows, "pdf_vector_cell_rectangles"
 
         xs = self._cluster_coordinates(verticals)
         ys = self._cluster_coordinates(horizontals)
@@ -2664,11 +2761,15 @@ class OriginalLayoutReconstructor:
         background_candidate_ratio = len(background_candidates) / total
         histogram: dict[tuple[int, int, int], int] = {}
         for red, green, blue in background_candidates:
-            key = tuple(min(255, int(round(channel / 8.0) * 8)) for channel in (red, green, blue))
+            key = (
+                min(255, int(round(red / 8.0) * 8)),
+                min(255, int(round(green / 8.0) * 8)),
+                min(255, int(round(blue / 8.0) * 8)),
+            )
             histogram[key] = histogram.get(key, 0) + 1
         if not histogram:
             return None, {"reason": "no_light_background_candidates"}
-        mode_bucket = max(histogram, key=histogram.get)
+        mode_bucket = max(histogram, key=lambda bucket: histogram[bucket])
         bucket_pixels = [
             pixel
             for pixel in background_candidates
@@ -2708,6 +2809,158 @@ class OriginalLayoutReconstructor:
             metadata["reason"] = "background_not_uniform_or_light"
             return None, metadata
         return tuple(channel / 255.0 for channel in mode), metadata
+
+    def _surya2_image_text_masks(
+        self,
+        page: fitz.Page,
+        bbox: BoundingBox,
+        *,
+        background_fill: tuple[float, float, float],
+    ) -> tuple[list[BoundingBox], dict[str, Any]]:
+        """Locate dark source-glyph rows inside a Surya 2 image-region box.
+
+        Image-only scans have no PDF word geometry to redact. Surya supplies the
+        containing text region, while this raster pass limits the fill to rows
+        that actually contain foreground pixels. Dense or ambiguous regions are
+        rejected instead of painting over diagrams or photographic content.
+        """
+
+        rectangle = self._fitz_rect(bbox)
+        render_scale = 2.0
+        try:
+            pixmap = page.get_pixmap(
+                matrix=fitz.Matrix(render_scale, render_scale),
+                clip=rectangle,
+                colorspace=fitz.csRGB,
+                alpha=False,
+            )
+        except Exception as exc:
+            return [], {"reason": f"render_failed:{type(exc).__name__}"}
+        if (
+            pixmap.width < 2
+            or pixmap.height < 2
+            or not pixmap.samples
+            or len(pixmap.samples) != pixmap.width * pixmap.height * 3
+        ):
+            return [], {"reason": "empty_or_invalid_render"}
+
+        background = tuple(
+            min(255, max(0, round(channel * 255.0))) for channel in background_fill
+        )
+        background_luminance = (
+            0.2126 * background[0]
+            + 0.7152 * background[1]
+            + 0.0722 * background[2]
+        )
+        luminance_limit = min(210.0, background_luminance - 28.0)
+        foreground_by_row: list[list[int]] = [[] for _ in range(pixmap.height)]
+        samples = pixmap.samples
+        foreground_count = 0
+        for pixel_index in range(pixmap.width * pixmap.height):
+            offset = pixel_index * 3
+            red, green, blue = samples[offset : offset + 3]
+            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
+            colour_distance = max(
+                abs(red - background[0]),
+                abs(green - background[1]),
+                abs(blue - background[2]),
+            )
+            if luminance <= luminance_limit and colour_distance >= 24:
+                row = pixel_index // pixmap.width
+                column = pixel_index % pixmap.width
+                foreground_by_row[row].append(column)
+                foreground_count += 1
+
+        pixel_count = pixmap.width * pixmap.height
+        foreground_ratio = foreground_count / pixel_count
+        metadata: dict[str, Any] = {
+            "render_scale": render_scale,
+            "render_width": pixmap.width,
+            "render_height": pixmap.height,
+            "background_rgb": list(background),
+            "background_luminance": round(background_luminance, 3),
+            "foreground_pixel_ratio": round(foreground_ratio, 6),
+            "threshold": {
+                "minimum_foreground_pixel_ratio": 0.0005,
+                "maximum_foreground_pixel_ratio": 0.22,
+                "minimum_colour_distance": 24,
+                "maximum_foreground_luminance": round(luminance_limit, 3),
+            },
+        }
+        if foreground_ratio < 0.0005:
+            metadata["reason"] = "foreground_too_sparse"
+            return [], metadata
+        if foreground_ratio > 0.22:
+            metadata["reason"] = "foreground_too_dense_for_text"
+            return [], metadata
+
+        minimum_row_pixels = max(2, math.ceil(pixmap.width * 0.0025))
+        active_rows = [
+            index
+            for index, columns in enumerate(foreground_by_row)
+            if len(columns) >= minimum_row_pixels
+        ]
+        if not active_rows:
+            metadata["reason"] = "no_text_rows"
+            return [], metadata
+
+        groups: list[list[int]] = [[active_rows[0]]]
+        for row in active_rows[1:]:
+            if row - groups[-1][-1] <= 3:
+                groups[-1].append(row)
+            else:
+                groups.append([row])
+
+        scale_x = pixmap.width / max(rectangle.width, 1.0)
+        scale_y = pixmap.height / max(rectangle.height, 1.0)
+        masks: list[BoundingBox] = []
+        rejected_tall_groups = 0
+        maximum_group_height = max(36, round(pixmap.height * 0.5))
+        for rows in groups:
+            first_row = rows[0]
+            last_row = rows[-1]
+            group_height = last_row - first_row + 1
+            if group_height > maximum_group_height:
+                rejected_tall_groups += 1
+                continue
+            columns = [
+                column
+                for row in range(first_row, last_row + 1)
+                for column in foreground_by_row[row]
+            ]
+            if not columns:
+                continue
+            left = max(0.0, min(columns) / scale_x - 1.5)
+            right = min(rectangle.width, (max(columns) + 1) / scale_x + 1.5)
+            top = max(0.0, first_row / scale_y - 1.2)
+            bottom = min(rectangle.height, (last_row + 1) / scale_y + 1.2)
+            if right - left < 1.0 or bottom - top < 1.0:
+                continue
+            masks.append(
+                BoundingBox(
+                    x0=float(rectangle.x0 + left),
+                    y0=float(rectangle.y0 + top),
+                    x1=float(rectangle.x0 + right),
+                    y1=float(rectangle.y0 + bottom),
+                )
+            )
+
+        metadata.update(
+            {
+                "active_row_count": len(active_rows),
+                "row_group_count": len(groups),
+                "accepted_mask_count": len(masks),
+                "rejected_tall_group_count": rejected_tall_groups,
+                "minimum_active_row_pixels": minimum_row_pixels,
+            }
+        )
+        if not masks:
+            metadata["reason"] = "no_reliable_text_line_masks"
+            return [], metadata
+        if rejected_tall_groups:
+            metadata["reason"] = "dense_foreground_group_rejected"
+            return [], metadata
+        return self._clamp_scan_masks(masks, bbox, guard=0.25), metadata
 
     def _scan_cell_text_masks(
         self,

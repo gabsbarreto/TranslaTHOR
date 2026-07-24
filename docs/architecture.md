@@ -139,6 +139,33 @@ tests cover non-square scaling, boundary clamping, reading order, and visual
 blocks. Each live run writes image-space overlays for manual coordinate
 inspection.
 
+## Original-layout reconstruction after Surya 2
+
+Reconstruction still consumes only the shared translated `DocumentModel`.
+The integration branch adds a Surya-specific strategy for raster-only pages
+that have no removable PDF text and no hidden-OCR word geometry:
+
+1. `Surya2DocumentAdapter` converts every region to top-left PDF points before
+   translation. The reconstruction coordinate converter therefore applies an
+   auditable identity scale instead of scaling the box a second time.
+2. Figure and equation boxes become locked regions. Redaction guards prevent
+   masks from crossing into those visuals.
+3. For a translated text block, the source page is rendered only inside its
+   Surya box. The dominant light background colour and dark foreground rows
+   are measured.
+4. Only foreground-row masks are filled, then translated searchable text is
+   inserted into the original Surya box. Dense, dark, nonuniform, missing, or
+   overflowing regions are retained unchanged and reported.
+5. Image-only tables are retained unless trustworthy cell geometry is
+   available. Surya 2 table HTML preserves readable/reflowed output, but a
+   table-wide raster mask is not considered safe original-layout
+   reconstruction.
+
+Hidden-OCR scans continue to use the stricter source-text-to-PDF-word
+alignment path. The raster strategy is selected only for blocks explicitly
+identified as `surya2_llamacpp`; Qwen and legacy Marker jobs do not silently
+change reconstruction behavior.
+
 ## Official references
 
 - [Surya repository and v2 usage](https://github.com/datalab-to/surya)

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-import fitz
+import fitz  # type: ignore[import-untyped]
 
 from app.models.schema import (
     Block,
