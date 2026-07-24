@@ -2947,50 +2947,21 @@ class MlxTranslator:
             return "translation_table_structure_invalid"
         if not self._table_nonempty_cells_preserved(source_table, translated_table):
             return "translation_table_cell_missing"
-        if self._unchanged_non_english_table_requires_translation(
+        if (
+            self._base_language(source_language) not in {None, "en"}
+            and self._normalized_table_cell(source_table)
+            == self._normalized_table_cell(translated_table)
+            and any(
+                self._table_cell_requires_translation(cell)
+                for cell in self._table_cell_texts(source_table)
+            )
+        ):
+            return "translation_output_matches_source"
+        return self._translation_acceptance_issue(
             source_table,
             translated_table,
             source_language,
-        ):
-            return "translation_output_matches_source"
-
-        for source_cell, translated_cell in zip(
-            self._table_cell_texts(source_table),
-            self._table_cell_texts(translated_table),
-            strict=True,
-        ):
-            issue = self._translation_acceptance_issue(
-                source_cell,
-                translated_cell,
-                source_language,
-                BlockType.TABLE,
-            )
-            if issue is not None:
-                return issue
-        return None
-
-    def _unchanged_non_english_table_requires_translation(
-        self,
-        source_table: str,
-        translated_table: str,
-        source_language: str | None,
-    ) -> bool:
-        language = self._base_language(source_language)
-        if language is None or language == "en":
-            return False
-        source_cells = self._table_cell_texts(source_table)
-        translated_cells = self._table_cell_texts(translated_table)
-        if len(source_cells) != len(translated_cells):
-            return False
-        return any(
-            self._normalized_table_cell(source_cell)
-            == self._normalized_table_cell(translated_cell)
-            and self._table_cell_requires_translation(source_cell)
-            for source_cell, translated_cell in zip(
-                source_cells,
-                translated_cells,
-                strict=True,
-            )
+            BlockType.TABLE,
         )
 
     def _normalized_table_cell(self, text: str) -> str:

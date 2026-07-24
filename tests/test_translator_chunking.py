@@ -1403,7 +1403,7 @@ def test_delimited_table_translation_preserves_cell_boundaries() -> None:
     )
 
 
-def test_table_validation_rejects_a_significant_untranslated_cell() -> None:
+def test_table_validation_accepts_a_partially_unchanged_table() -> None:
     source = (
         "<table><tr><td>Los pacientes reciben tratamiento hormonal continuado</td>"
         "<td>El seguimiento clinico sigue siendo necesario</td></tr></table>"
@@ -1425,11 +1425,11 @@ def test_table_validation_rejects_a_significant_untranslated_cell() -> None:
             partially_translated,
             "es",
         )
-        is False
+        is True
     )
 
 
-def test_table_validation_rejects_short_untranslated_label_in_mixed_table() -> None:
+def test_table_validation_accepts_short_unchanged_label_in_mixed_table() -> None:
     source = (
         "<table><thead><tr><th>Treatment</th><th>Edad media</th></tr></thead>"
         "<tbody><tr><td>Terapia hormonal</td><td>32</td></tr></tbody></table>"
@@ -1448,10 +1448,7 @@ def test_table_validation_rejects_short_untranslated_label_in_mixed_table() -> N
 
     translator._detect_language_with_confidence = fake_detect  # type: ignore[method-assign]
 
-    assert (
-        translator._table_translation_issue(source, partially_translated, "es")
-        == "translation_output_matches_source"
-    )
+    assert translator._table_translation_issue(source, partially_translated, "es") is None
 
 
 def test_table_validation_accepts_translated_cells_despite_html_and_abbreviation_overlap() -> None:
@@ -1477,17 +1474,14 @@ def test_table_validation_accepts_translated_cells_despite_html_and_abbreviation
     assert translator._table_translation_issue(source, translated, "es") is None
 
 
-def test_table_cell_validation_allows_close_medical_cognates_when_changed() -> None:
+def test_table_validation_allows_close_medical_cognates_and_unchanged_cells() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = "<table><tr><td>Hiperprolactinemia</td><td>Edad media</td></tr></table>"
     translated = "<table><tr><td>Hyperprolactinemia</td><td>Mean age</td></tr></table>"
     copied = "<table><tr><td>Hyperprolactinemia</td><td>Edad media</td></tr></table>"
 
     assert translator._table_translation_issue(source, translated, "es") is None
-    assert (
-        translator._table_translation_issue(source, copied, "es")
-        == "translation_output_matches_source"
-    )
+    assert translator._table_translation_issue(source, copied, "es") is None
 
 
 def test_table_validation_rejects_cell_tag_role_changes() -> None:
