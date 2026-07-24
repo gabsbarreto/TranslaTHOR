@@ -1,11 +1,13 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.venv-surya2/
 .env.local
 workspace/jobs/
 workspace/ocr_region_debug/
 workspace/regression_corpus/
 workspace/regression_runs/
 workspace/tests/
+workspace/benchmarks/
 *.pyc
 .DS_Store

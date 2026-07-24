@@ -86,7 +86,9 @@ def test_pdf_type_detector_classifies_scanned_image_only(tmp_path: Path) -> None
     assert result.image_dominant_page_count == 1
 
 
-def test_pdf_type_detector_treats_full_page_image_with_selectable_text_as_hidden_ocr(tmp_path: Path) -> None:
+def test_pdf_type_detector_treats_full_page_image_with_selectable_text_as_hidden_ocr(
+    tmp_path: Path,
+) -> None:
     pdf_path = tmp_path / "hidden_ocr.pdf"
     png_path = tmp_path / "page.png"
     pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 1200, 1600), False)
@@ -115,7 +117,9 @@ def test_pdf_type_detector_treats_full_page_image_with_selectable_text_as_hidden
     assert result.metadata["hidden_ocr_page_count"] == 2
 
 
-def test_marker_subprocess_failure_is_clear(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_marker_subprocess_failure_is_clear(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     extractor = PDFExtractor(detector=_FakeDetector("digital_good_text"))
     monkeypatch.setenv("MARKER_BIN", "/usr/bin/false")
 
@@ -260,7 +264,9 @@ def test_marker_builder_rejects_numeric_debug_object_graph() -> None:
         )
 
 
-def test_marker_force_ocr_accelerator_failure_retries_on_cpu(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_marker_force_ocr_accelerator_failure_retries_on_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker_bin = tmp_path / "fake_marker_retry_cpu.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
@@ -409,7 +415,9 @@ def test_marker_builder_ignores_tablegroup_wrapper_tables() -> None:
         warnings=[],
     )
 
-    assert all((block.metadata or {}).get("marker_block_type") != "TableGroup" for block in document.blocks)
+    assert all(
+        (block.metadata or {}).get("marker_block_type") != "TableGroup" for block in document.blocks
+    )
     assert len(document.tables) == 1
     assert "structured-table" not in markdown
     assert "### Table 1" not in markdown
@@ -562,7 +570,9 @@ def test_marker_builder_normalizes_one_column_table_caption_html() -> None:
     assert all("<td>modeli</td>" not in chunk.original_text for chunk in chunks)
 
 
-def test_bad_hidden_ocr_falls_back_to_normal_marker_if_forced_ocr_fails(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_bad_hidden_ocr_falls_back_to_normal_marker_if_forced_ocr_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker_bin = tmp_path / "fake_marker_fallback_normal.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
@@ -599,7 +609,9 @@ if "--force_ocr" in sys.argv:
     assert any("Falling back to Marker normal mode" in warning for warning in result.warnings)
 
 
-def test_auto_bad_hidden_ocr_uses_marker_text_only_first_pass(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_auto_bad_hidden_ocr_uses_marker_text_only_first_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker_bin = tmp_path / "fake_marker_text_only.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
@@ -635,7 +647,9 @@ out.mkdir(parents=True, exist_ok=True)
     assert result.metadata["marker_mode"] == "text_only"
 
 
-def test_marker_output_becomes_document_and_chunks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_marker_output_becomes_document_and_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker_bin = tmp_path / "fake_marker.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
@@ -676,7 +690,24 @@ out.mkdir(parents=True, exist_ok=True)
     assert result.chunks[0].original_text == "Texto de exemplo para traduzir."
 
 
-def test_marker_table_cells_are_not_duplicated_as_text_blocks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_marker_payload_selection_prefers_document_over_debug_blocks(
+    tmp_path: Path,
+) -> None:
+    output_dir = tmp_path / "marker" / "document"
+    output_dir.mkdir(parents=True)
+    (output_dir / "blocks.json").write_text("[]", encoding="utf-8")
+    document_path = output_dir / "document.json"
+    document_path.write_text(
+        json.dumps({"block_type": "Document", "children": []}),
+        encoding="utf-8",
+    )
+
+    assert PDFExtractor()._find_marker_payload(tmp_path / "marker", "json") == document_path
+
+
+def test_marker_table_cells_are_not_duplicated_as_text_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     marker_bin = tmp_path / "fake_marker_table.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
@@ -1025,7 +1056,9 @@ def test_local_vlm_repair_server_unavailable_does_not_raise() -> None:
 
 
 def test_local_vlm_selects_portuguese_hidden_ocr_candidates() -> None:
-    service = LocalVLMRepairService(LocalVLMConfig(False, "http://127.0.0.1:9/v1", "", "not-needed", 1, 0))
+    service = LocalVLMRepairService(
+        LocalVLMConfig(False, "http://127.0.0.1:9/v1", "", "not-needed", 1, 0)
+    )
     block = _paragraph_block(
         "p1",
         (
@@ -1150,7 +1183,7 @@ def test_qwen_fallback_surya_prompt_requests_numbered_region_wrappers() -> None:
     prompt = QwenFullPageOCRFallback()._surya_overlay_prompt("Base OCR rules.")
 
     assert prompt.startswith("Base OCR rules.")
-    assert 'SURYA <number>: <type>' in prompt
+    assert "SURYA <number>: <type>" in prompt
     assert '<region index="<number>" type="<type>">' in prompt
     assert "page headers, and page footers" in prompt
 
@@ -1176,7 +1209,10 @@ def test_qwen_fallback_runs_surya_worker_with_marker_environment(
     fallback = QwenFullPageOCRFallback()
     monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
     monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
-    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen",
+        fake_popen,
+    )
 
     def fake_communicate(*_args, **_kwargs):
         output_dir.mkdir(parents=True, exist_ok=True)

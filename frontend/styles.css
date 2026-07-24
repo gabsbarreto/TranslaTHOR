@@ -91,6 +91,31 @@ h4 { font-size: .9rem; margin-bottom: 8px; }
   transition: background-color .15s ease, border-color .15s ease, box-shadow .15s ease;
 }
 
+.upload-options {
+  display: grid;
+  gap: 6px;
+  margin: 18px 0;
+  max-width: 680px;
+}
+
+.upload-options label {
+  font-weight: 700;
+}
+
+.upload-options select {
+  width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 9px 11px;
+  background: #fff;
+  color: var(--text);
+  font: inherit;
+}
+
+.upload-options small {
+  color: var(--muted);
+}
+
 .dropzone:hover,
 .dropzone.dragover {
   background: #e8f7ed;

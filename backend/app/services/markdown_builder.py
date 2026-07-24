@@ -44,6 +44,10 @@ class MarkdownBuilder:
             figure.caption_block_id
             for figure in document.figures
             if figure.caption_block_id
+            and (
+                self._available_asset(figure.vector_path)
+                or self._available_asset(figure.image_path)
+            )
         }
         associated_caption_ids.update(
             caption.id for caption in table_caption_by_id.values()
@@ -300,7 +304,11 @@ class MarkdownBuilder:
     ) -> TableModel | None:
         for table in page_tables:
             debug = getattr(table, "debug", {})
-            if debug.get("marker_block_id") == block.id or debug.get("source_block_id") == block.id:
+            if block.id in {
+                debug.get("marker_block_id"),
+                debug.get("source_block_id"),
+                debug.get("surya2_block_id"),
+            }:
                 return table
         return next(
             (table for table in page_tables if table.id not in rendered_table_ids),
@@ -690,7 +698,10 @@ class MarkdownBuilder:
     def _table_html(self, table: TableModel) -> str:
         rows = table.cells or []
         if not rows and table.rows:
-            rows = [[type("Cell", (), {"text": c, "rowspan": 1, "colspan": 1})() for c in r] for r in table.rows]
+            rows = [
+                [type("Cell", (), {"text": c, "rowspan": 1, "colspan": 1})() for c in r]
+                for r in table.rows
+            ]
 
         lines: list[str] = ['<table class="structured-table">']
         if table.headers:

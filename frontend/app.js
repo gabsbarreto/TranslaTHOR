@@ -14,6 +14,7 @@ const state = {
 };
 
 const fileInput = document.getElementById("fileInput");
+const ocrEngineInput = document.getElementById("ocrEngine");
 const dropzone = document.getElementById("dropzone");
 const appStatusEl = document.getElementById("appStatus");
 const currentActivityEl = document.getElementById("currentActivity");
@@ -105,6 +106,7 @@ async function handleUploadedFiles(fileList) {
 async function submitUploadBatch(files) {
   const form = new FormData();
   for (const file of files) form.append("files", file, file.name);
+  form.append("ocr_engine", ocrEngineInput?.value || "surya2_llamacpp");
 
   const response = await fetch("/api/jobs", { method: "POST", body: form });
   const data = await parseJsonResponse(response);
@@ -114,6 +116,7 @@ async function submitUploadBatch(files) {
 
 function setUploadDisabled(disabled) {
   if (fileInput) fileInput.disabled = disabled;
+  if (ocrEngineInput) ocrEngineInput.disabled = disabled;
   dropzone?.classList.toggle("disabled", disabled);
   dropzone?.setAttribute("aria-busy", String(disabled));
 }

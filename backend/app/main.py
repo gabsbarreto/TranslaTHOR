@@ -8,6 +8,7 @@ import types
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from app.config import (
     AVAILABLE_TRANSLATION_MODELS,
+    AVAILABLE_OCR_ENGINES,
     DEFAULT_CHUNK_SIZE,
     DEFAULT_EXTRACTION_MODE,
     DEFAULT_LLM_MIN_P,
@@ -25,6 +27,7 @@ from app.config import (
     DEFAULT_LLM_TOP_K,
     DEFAULT_LLM_TOP_P,
     DEFAULT_OUTPUT_MODE,
+    DEFAULT_OCR_ENGINE,
     DEFAULT_QWEN_OCR_BASE_SIZE,
     DEFAULT_QWEN_OCR_BATCH_SIZE,
     DEFAULT_QWEN_OCR_CROP_MODE,
@@ -46,6 +49,8 @@ from app.config import (
     DEFAULT_QWEN_OCR_TOP_P,
     DEFAULT_TRANSLATION_CHUNK_GROUP_SIZE,
     DEFAULT_TRANSLATION_MODEL,
+    DEFAULT_SURYA2_DPI,
+    DEFAULT_SURYA2_STRATEGY,
     ENABLE_LOCAL_VLM_REPAIR,
     ENABLE_QWEN_OCR_FALLBACK,
     FRONTEND_DIR,
@@ -82,9 +87,12 @@ except Exception:
 
 
 @asynccontextmanager
-async def lifespan(_app: FastAPI):
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     job_store.reconcile_stale_jobs()
-    yield
+    try:
+        yield
+    finally:
+        pipeline.shutdown()
 
 
 app = FastAPI(title="Local PDF Translation App", lifespan=lifespan)
@@ -205,6 +213,7 @@ async def create_job(
     output_mode: str = Form(DEFAULT_OUTPUT_MODE),
     profile_pipeline: bool = Form(False),
     extraction_mode: str = Form(DEFAULT_EXTRACTION_MODE),
+    ocr_engine: str = Form(DEFAULT_OCR_ENGINE),
     use_local_vlm_repair: bool = Form(ENABLE_LOCAL_VLM_REPAIR),
     keep_debug_artifacts: bool = Form(KEEP_EXTRACTION_DEBUG_ARTIFACTS),
 ) -> dict:
@@ -223,6 +232,7 @@ async def create_job(
             output_mode=output_mode,
             profile_pipeline=profile_pipeline,
             extraction_mode=extraction_mode,
+            ocr_engine=ocr_engine,
             use_local_vlm_repair=use_local_vlm_repair,
             keep_debug_artifacts=keep_debug_artifacts,
         )
@@ -567,6 +577,7 @@ def _build_job_settings(
     output_mode: str,
     profile_pipeline: bool,
     extraction_mode: str,
+    ocr_engine: str,
     use_local_vlm_repair: bool,
     keep_debug_artifacts: bool,
 ) -> dict:
@@ -576,6 +587,7 @@ def _build_job_settings(
         if extraction_mode in {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair"}
         else DEFAULT_EXTRACTION_MODE
     )
+    selected_ocr_engine = ocr_engine if ocr_engine in AVAILABLE_OCR_ENGINES else DEFAULT_OCR_ENGINE
     return {
         "chunk_size": chunk_size,
         "translation_chunk_group_size": DEFAULT_TRANSLATION_CHUNK_GROUP_SIZE,
@@ -590,9 +602,12 @@ def _build_job_settings(
         "output_mode": output_mode,
         "profile_pipeline": profile_pipeline,
         "extraction_mode": selected_mode,
+        "ocr_engine": selected_ocr_engine,
         "use_local_vlm_repair": bool(use_local_vlm_repair),
         "keep_debug_artifacts": bool(keep_debug_artifacts),
         "marker_timeout_seconds": MARKER_TIMEOUT_SECONDS,
+        "surya2_dpi": DEFAULT_SURYA2_DPI,
+        "surya2_strategy": DEFAULT_SURYA2_STRATEGY,
         "qwen_ocr_fallback": ENABLE_QWEN_OCR_FALLBACK,
         "qwen_ocr_model": DEFAULT_QWEN_OCR_MODEL,
         "qwen_ocr_max_tokens": DEFAULT_QWEN_OCR_MAX_TOKENS,

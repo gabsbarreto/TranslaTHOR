@@ -9,7 +9,7 @@ if ! command -v brew >/dev/null 2>&1; then
   exit 1
 fi
 
-brew install cairo pango gdk-pixbuf libffi
+brew install cairo pango gdk-pixbuf libffi llama.cpp
 
 python3 -m venv .venv
 .venv/bin/python -m pip install -U pip
@@ -30,3 +30,4 @@ upsert_env() {
 }
 
 echo "Local runtime is ready."
+echo "Run scripts/setup_surya2_runtime.sh to create the isolated Surya 2 environment."

@@ -54,6 +54,11 @@ class Block(BaseModel):
     style_hints: dict[str, Any] = Field(default_factory=dict)
     source_type: SourceType
     language: str | None = None
+    raw_label: str | None = None
+    html: str | None = None
+    polygon: list[list[float]] | None = None
+    skipped: bool = False
+    error: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

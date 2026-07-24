@@ -12,6 +12,16 @@
         <h1 id="pageTitle">TranslaTHOR</h1>
         <p class="sub">Translate PDFs locally while preserving their structure and figures.</p>
 
+        <div class="upload-options">
+          <label for="ocrEngine">Poor-text and scanned PDF OCR</label>
+          <select id="ocrEngine">
+            <option value="surya2_llamacpp" selected>Surya 2 + llama.cpp (recommended)</option>
+            <option value="surya_qwen_mlx">Surya + Qwen through mlx-vlm (text-critical fallback)</option>
+            <option value="marker_surya">Surya + Marker (legacy comparison)</option>
+          </select>
+          <small>Good born-digital PDFs continue through Marker text-layer extraction.</small>
+        </div>
+
         <label id="dropzone" class="dropzone" for="fileInput">
           <input
             id="fileInput"
@@ -82,6 +92,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260715-ui" defer></script>
+    <script src="/app.js?v=20260724-surya2-reconstruction" defer></script>
   </body>
 </html>

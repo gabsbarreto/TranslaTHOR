@@ -1,0 +1,9 @@
+# Isolated Surya 2 runtime.  Keep this separate from the legacy Marker/Surya v1
+# and mlx-vlm environments because Surya 2 requires Transformers 5.
+surya-ocr==0.22.1
+torch==2.11.0
+torchvision==0.26.0
+transformers==5.12.1
+pillow==10.4.0
+pypdfium2==5.10.1
+huggingface-hub==1.5.0
