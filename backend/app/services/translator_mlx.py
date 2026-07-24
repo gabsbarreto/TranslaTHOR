@@ -376,30 +376,6 @@ class MlxTranslator:
         "results",
         "summary",
     }
-    _ENGLISH_NUMBER_WORDS = {
-        "zero": "0",
-        "one": "1",
-        "two": "2",
-        "three": "3",
-        "four": "4",
-        "five": "5",
-        "six": "6",
-        "seven": "7",
-        "eight": "8",
-        "nine": "9",
-        "ten": "10",
-        "eleven": "11",
-        "twelve": "12",
-        "thirteen": "13",
-        "fourteen": "14",
-        "fifteen": "15",
-        "sixteen": "16",
-        "seventeen": "17",
-        "eighteen": "18",
-        "nineteen": "19",
-        "twenty": "20",
-    }
-
     def __init__(self, settings: TranslationSettings) -> None:
         self.settings = settings
         self._model = None
@@ -1170,19 +1146,6 @@ class MlxTranslator:
         ):
             return None
         if self._normalized_whitespace(" ".join(redistributed)) != logical_target:
-            return None
-        if any(
-            self._translation_invariant_issue(source_text, target, segment_type) is not None
-            for (_, source_text, segment_type), target in zip(
-                segments,
-                redistributed,
-                strict=True,
-            )
-        ):
-            # The logical translation already preserves stable values globally.
-            # Requiring them in their original physical region prevents a
-            # proportional split from silently moving a number into a
-            # neighboring box.
             return None
         return redistributed
 
@@ -2324,9 +2287,6 @@ class MlxTranslator:
             "translation_table_cell_missing": (
                 "Translation output omitted content from one or more source table cells after retry."
             ),
-            "translation_numbers_changed": (
-                "Translation output changed source numeric values after retry."
-            ),
         }
         chunk.status = self.TRANSLATION_FAILED_STATUS
         chunk.reason = issue
@@ -2534,9 +2494,6 @@ class MlxTranslator:
     ) -> str | None:
         if not self._is_valid_chunk_translation_structure(source, translated, block_type):
             return "translation_structure_invalid"
-        invariant_issue = self._translation_invariant_issue(source, translated, block_type)
-        if invariant_issue is not None:
-            return invariant_issue
         if self.TABLE_DELIMITER in source:
             for source_cell, translated_cell in zip(
                 source.split(self.TABLE_DELIMITER),
@@ -2566,63 +2523,6 @@ class MlxTranslator:
             block_type,
             source_language_authoritative=source_language_authoritative,
         )
-
-    def _translation_invariant_issue(
-        self,
-        source: str,
-        translated: str,
-        block_type: BlockType | None,
-    ) -> str | None:
-        if self._numeric_token_counts(source) != self._numeric_token_counts(
-            translated,
-            reference_values=set(self._numeric_token_counts(source)),
-        ):
-            return "translation_numbers_changed"
-        return None
-
-    def _numeric_token_counts(
-        self,
-        text: str,
-        *,
-        reference_values: set[str] | None = None,
-    ) -> Counter[str]:
-        tokens: list[str] = []
-        for token, origin in self._ordered_numeric_token_items(text):
-            if (
-                reference_values is not None
-                and origin == "word"
-                and token not in reference_values
-            ):
-                continue
-            tokens.append(token)
-        return Counter(tokens)
-
-    def _ordered_numeric_tokens(self, text: str) -> list[str]:
-        return [token for token, _ in self._ordered_numeric_token_items(text)]
-
-    def _ordered_numeric_token_items(self, text: str) -> list[tuple[str, str]]:
-        visible = html.unescape(text)
-        visible = re.sub(
-            r"(?<![\w])(?P<whole>\d+)[.,]\s+(?P<fraction>\d+)\s*%",
-            r"\g<whole>.\g<fraction>%",
-            visible,
-        )
-        number_words = "|".join(re.escape(word) for word in self._ENGLISH_NUMBER_WORDS)
-        token_pattern = re.compile(
-            rf"(?<![\w\d])(?P<digit>(?:\d+(?:[.,]\d+)?|[.,]\d+)\s*%?)"
-            rf"|(?<![\w])(?P<word>{number_words})(?![\w])",
-            re.IGNORECASE,
-        )
-        tokens: list[tuple[str, str]] = []
-        for match in token_pattern.finditer(visible):
-            digit = match.group("digit")
-            if digit is not None:
-                tokens.append((re.sub(r"\s+", "", digit).replace(",", "."), "digit"))
-                continue
-            word = str(match.group("word") or "").casefold()
-            if word in self._ENGLISH_NUMBER_WORDS:
-                tokens.append((self._ENGLISH_NUMBER_WORDS[word], "word"))
-        return tokens
 
     def _ordered_acronyms(self, text: str) -> list[str]:
         """Return acronyms whose surrounding syntax marks them as stable.

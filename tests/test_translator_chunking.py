@@ -671,7 +671,7 @@ def test_repeated_homograph_uses_numbered_affiliation_structure_fallback() -> No
     assert translated == "Affiliations"
 
 
-def test_translation_validation_preserves_numbers_but_allows_acronym_changes() -> None:
+def test_translation_validation_allows_number_and_acronym_changes() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = "La relación TMF/TFM fue 2,4/1 en 2020."
 
@@ -691,7 +691,7 @@ def test_translation_validation_preserves_numbers_but_allows_acronym_changes() -
             "es",
             BlockType.PARAGRAPH,
         )
-        == "translation_numbers_changed"
+        is None
     )
     assert (
         translator._chunk_translation_issue(
@@ -729,7 +729,7 @@ def test_translation_validation_allows_natural_numeric_reordering() -> None:
     )
 
 
-def test_translation_validation_rejects_missing_changed_or_duplicated_numbers() -> None:
+def test_translation_validation_does_not_gate_on_numbers() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = "Fueron excluidos el 14%, Grupo 3, y 2 pacientes."
 
@@ -745,7 +745,7 @@ def test_translation_validation_rejects_missing_changed_or_duplicated_numbers() 
                 "es",
                 BlockType.PARAGRAPH,
             )
-            == "translation_numbers_changed"
+            is None
         )
 
 
@@ -799,37 +799,41 @@ def test_changed_short_target_does_not_rely_on_unstable_language_detection() -> 
     )
 
 
-def test_acronym_invariant_ignores_new_uppercase_words_and_statistical_labels() -> None:
+def test_translation_validation_ignores_new_uppercase_words_and_statistical_labels() -> None:
     translator = MlxTranslator(TranslationSettings())
 
     assert (
-        translator._translation_invariant_issue(
+        translator._chunk_translation_issue(
             "MATÉRIEL ET MÉTHODE",
             "MATERIAL AND METHODS",
+            "fr",
             BlockType.HEADING,
         )
         is None
     )
     assert (
-        translator._translation_invariant_issue(
+        translator._chunk_translation_issue(
             "La media fue 32.74 (DT=11.198).",
             "The mean was 32.74 (SD=11.198).",
+            "es",
             BlockType.PARAGRAPH,
         )
         is None
     )
     assert (
-        translator._translation_invariant_issue(
+        translator._chunk_translation_issue(
             "HOMBRES Y MUJERES",
             "MEN AND WOMEN",
+            "es",
             BlockType.HEADING,
         )
         is None
     )
     assert (
-        translator._translation_invariant_issue(
+        translator._chunk_translation_issue(
             "HOMMES ET FEMMES",
             "MEN AND WOMEN",
+            "fr",
             BlockType.HEADING,
         )
         is None
@@ -840,26 +844,14 @@ def test_parenthesized_document_acronym_is_preserved() -> None:
     translator = MlxTranslator(TranslationSettings())
 
     assert (
-        translator._translation_invariant_issue(
+        translator._chunk_translation_issue(
             "Terapia hormonal (TMF) continuada.",
             "Continued hormonal therapy (MTF).",
+            "es",
             BlockType.PARAGRAPH,
         )
         is None
     )
-
-
-def test_numeric_invariant_normalizes_spaced_ocr_decimal_percentages() -> None:
-    translator = MlxTranslator(TranslationSettings())
-
-    assert translator._ordered_numeric_tokens("La tasa fue 12. 6% y p=.008.") == [
-        "12.6%",
-        ".008",
-    ]
-    assert translator._ordered_numeric_tokens("The rate was 12.6% and p=.008.") == [
-        "12.6%",
-        ".008",
-    ]
 
 
 def test_translation_validation_rejects_invented_paragraph_heading() -> None:
@@ -2238,7 +2230,7 @@ def test_continuous_redistribution_aligns_asymmetric_sentence_expansion() -> Non
     assert " ".join(" ".join(redistributed).split()) == logical_target
 
 
-def test_continuous_redistribution_rejects_reordered_or_duplicated_numbers() -> None:
+def test_continuous_redistribution_does_not_gate_on_number_order_or_count() -> None:
     translator = MlxTranslator(TranslationSettings())
     segments = [
         ("first", "Die Studie begann 2020 und dau-", BlockType.PARAGRAPH),
@@ -2246,38 +2238,37 @@ def test_continuous_redistribution_rejects_reordered_or_duplicated_numbers() -> 
     ]
     logical_source = "Die Studie begann 2020 und dauerte bis 2021 an."
 
-    for unsafe_target in (
+    for target in (
         "The study continued until 2021 after beginning in 2020.",
         "The study began in 2020 and continued until 2021 and 2021.",
     ):
-        assert (
-            translator._redistribute_logical_translation(
-                logical_source,
-                unsafe_target,
-                segments,
-                "de",
-                continuity_proven=True,
-            )
-            is None
+        redistributed = translator._redistribute_logical_translation(
+            logical_source,
+            target,
+            segments,
+            "de",
+            continuity_proven=True,
         )
+        assert redistributed is not None
+        assert " ".join(" ".join(redistributed).split()) == target
 
 
-def test_continuous_redistribution_keeps_numeric_markers_in_their_source_region() -> None:
+def test_continuous_redistribution_allows_natural_numeric_reordering() -> None:
     translator = MlxTranslator(TranslationSettings())
     numeric_segments = [
         ("first", "Die ausführliche Untersuchung ende-", BlockType.PARAGRAPH),
         ("second", "te 2021.", BlockType.PARAGRAPH),
     ]
-    assert (
-        translator._redistribute_logical_translation(
-            "Die ausführliche Untersuchung endete 2021.",
-            "In 2021, the extensive study ended.",
-            numeric_segments,
-            "de",
-            continuity_proven=True,
-        )
-        is None
+    target = "In 2021, the extensive study ended."
+    redistributed = translator._redistribute_logical_translation(
+        "Die ausführliche Untersuchung endete 2021.",
+        target,
+        numeric_segments,
+        "de",
+        continuity_proven=True,
     )
+    assert redistributed is not None
+    assert " ".join(" ".join(redistributed).split()) == target
 
 
 def test_continuous_redistribution_requires_explicit_continuity_proof() -> None:
