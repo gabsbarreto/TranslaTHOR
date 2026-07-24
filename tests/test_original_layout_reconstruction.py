@@ -1468,6 +1468,61 @@ def test_table_row_similarity_rejects_short_header_substring_in_wrong_cell(
     assert reconstructor._table_cell_text_similarity("men", "Women") == 0.0
 
 
+def test_table_cell_similarity_accepts_one_short_hidden_ocr_confusion() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+
+    assert reconstructor._table_cell_text_similarity("0m", "Om") == 0.9
+    assert reconstructor._table_cell_text_similarity("15", "IS") == 0.0
+
+
+def test_semantic_table_geometry_supports_stacked_colspan_tables(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "semantic-colspan-tables.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=240)
+    for y, left, right in (
+        (35, "Contraindicaciones del tratamiento", ""),
+        (60, "Absolutas", "Relativas"),
+        (82, "HTA severa", "Migraña refractaria"),
+        (120, "Contraindicaciones androgénicas", ""),
+        (145, "Absolutas", "Relativas"),
+        (167, "Hepatopatía", "Dislipemia"),
+    ):
+        page.insert_text((38, y), left, fontsize=8)
+        if right:
+            page.insert_text((168, y), right, fontsize=8)
+    pdf.save(source)
+    pdf.close()
+
+    source_markup = (
+        '<table><tr><th colspan="2">Contraindicaciones del tratamiento</th></tr>'
+        "<tr><td>Absolutas</td><td>Relativas</td></tr>"
+        "<tr><td>HTA severa</td><td>Migraña refractaria</td></tr></table><br/>"
+        '<table><tr><th colspan="2">Contraindicaciones androgénicas</th></tr>'
+        "<tr><td>Absolutas</td><td>Relativas</td></tr>"
+        "<tr><td>Hepatopatía</td><td>Dislipemia</td></tr></table>"
+    )
+    reconstructor = OriginalLayoutReconstructor()
+    source_rows = reconstructor._parse_table_rows(source_markup)
+    table_rect = fitz.Rect(30, 20, 270, 185)
+
+    with fitz.open(source) as opened:
+        rows = reconstructor._semantic_text_table_grid_rows(
+            page=opened[0],
+            table_rect=table_rect,
+            search_rect=table_rect,
+            source_rows=source_rows,
+        )
+
+    assert [len(row) for row in rows] == [1, 2, 2, 1, 2, 2]
+    assert rows[0][0].x0 == table_rect.x0
+    assert rows[0][0].x1 == table_rect.x1
+    assert rows[3][0].x0 == table_rect.x0
+    assert rows[3][0].x1 == table_rect.x1
+    assert rows[1][0].x1 == rows[1][1].x0
+
+
 def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) -> None:
     source = tmp_path / "mismatched-horizontal-table.pdf"
     _source_markup, _translated_markup, block, _x_edges, _y_edges = _horizontal_rule_table_source(
@@ -2292,6 +2347,20 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
         approved,
     )
     assert outside_difference.getbbox() is None
+
+
+def test_hidden_ocr_structural_label_normalizes_roman_numeral_one_confusion() -> None:
+    reconstructor = OriginalLayoutReconstructor()
+
+    assert reconstructor._hidden_ocr_alignment_text(
+        "TABLA III"
+    ) == reconstructor._hidden_ocr_alignment_text("TABLA 111")
+    assert reconstructor._hidden_ocr_alignment_text(
+        "FIGURA IV"
+    ) == reconstructor._hidden_ocr_alignment_text("FIGURA 1V")
+    assert reconstructor._hidden_ocr_alignment_text(
+        "Resultado 111"
+    ) != reconstructor._hidden_ocr_alignment_text("Resultado III")
 
 
 def test_redaction_guard_preserves_figure_when_caption_box_touches_boundary(

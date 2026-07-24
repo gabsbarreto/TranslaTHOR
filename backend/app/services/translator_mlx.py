@@ -107,9 +107,7 @@ class _StrictTableTopologyParser(HTMLParser):
         self.current_row: list[_TableCellTopology] | None = None
         self.current_row_attributes: tuple[tuple[str, str], ...] = ()
         self.current_cell: _TableCellTopology | None = None
-        self.section_attributes: list[
-            tuple[str, int, tuple[tuple[str, str], ...]]
-        ] = []
+        self.section_attributes: list[tuple[str, int, tuple[tuple[str, str], ...]]] = []
         self.rows: list[_TableRowTopology] = []
         self.section_events: list[tuple[str, str, int]] = []
         self._section_counts: Counter[str] = Counter()
@@ -286,8 +284,9 @@ class MlxTranslator:
     _COMPACT_TABLE_TRANSLATION_GUIDANCE = (
         "Keep table labels as concise as the source so they fit their original cells. "
         "Do not expand source abbreviations; use an equally concise standard English abbreviation "
-        "when unambiguous, otherwise preserve the source abbreviation. Prefer compact labels over "
-        "explanatory phrases."
+        "when unambiguous, otherwise preserve the source abbreviation. Never abbreviate or truncate "
+        "an ordinary source word: when the source spells a term out, spell out its English translation. "
+        "Prefer compact labels over explanatory phrases."
     )
     _TAG_RE = re.compile(r"<[^>]+>")
     _ENTITY_RE = re.compile(r"&[a-zA-Z0-9#]+;")
@@ -376,11 +375,26 @@ class MlxTranslator:
         "results",
         "summary",
     }
+    _SPANISH_STRUCTURAL_HEADINGS = {
+        "bibliografía": "References",
+        "conclusión": "Conclusion",
+        "conclusiones": "Conclusions",
+        "dirección del autor": "Author Contact",
+        "discusión": "Discussion",
+        "introducción": "Introduction",
+        "material y método": "Materials and Methods",
+        "material y métodos": "Materials and Methods",
+        "referencias": "References",
+        "resultados": "Results",
+        "resumen": "Abstract",
+    }
+
     def __init__(self, settings: TranslationSettings) -> None:
         self.settings = settings
         self._model = None
         self._tokenizer = None
         self._document_language: str | None = None
+        self._document_defined_acronyms: set[str] = set()
         self._last_load_error: str | None = None
 
     def _ensure_loaded(self) -> bool:
@@ -411,6 +425,13 @@ class MlxTranslator:
 
     def build_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
         self._document_language = self._normalize_lang_code(document.metadata.detected_language)
+        self._document_defined_acronyms = {
+            acronym
+            for block in document.blocks
+            for acronym in self._ordered_acronyms(
+                str(block.metadata.get("source_text", block.text))
+            )
+        }
         if document.metadata.translation.get("ocr_logical_chunks_prepared"):
             return self._prepared_logical_chunks(document)
 
@@ -575,7 +596,15 @@ class MlxTranslator:
                 BlockType.PAGE_NUMBER,
                 BlockType.REFERENCE,
             }
-            is_english = loaded and (preserve_verbatim or self._is_already_english(chunk))
+            structural_translation = self._structural_label_translation(
+                chunk.source_text,
+                chunk.source_language,
+                block_type,
+            )
+            is_english = loaded and (
+                preserve_verbatim
+                or (structural_translation is None and self._is_already_english(chunk))
+            )
             validation_issue: str | None = None
 
             if on_chunk_started is not None:
@@ -740,6 +769,7 @@ class MlxTranslator:
                     context,
                     source_language,
                     shared_context,
+                    block_by_id,
                     continuity_proven=self._physical_segments_form_continuous_paragraph(
                         batch,
                         block_by_id,
@@ -767,9 +797,7 @@ class MlxTranslator:
         ):
             return False
 
-        document_positions = {
-            block_id: index for index, block_id in enumerate(block_by_id)
-        }
+        document_positions = {block_id: index for index, block_id in enumerate(block_by_id)}
         for previous_segment, current_segment in zip(
             segments,
             segments[1:],
@@ -791,15 +819,11 @@ class MlxTranslator:
                 return False
             previous_section = previous.metadata.get("section_hierarchy")
             current_section = current.metadata.get("section_hierarchy")
-            if (
-                previous_section
-                and current_section
-                and previous_section != current_section
-            ):
+            if previous_section and current_section and previous_section != current_section:
                 return False
             if self._belongs_to_same_paragraph(previous, current):
                 continue
-            if not self._is_explicit_cross_column_word_continuation(
+            if not self._is_explicit_cross_column_continuation(
                 previous,
                 current,
                 previous_segment[1],
@@ -808,7 +832,7 @@ class MlxTranslator:
                 return False
         return True
 
-    def _is_explicit_cross_column_word_continuation(
+    def _is_explicit_cross_column_continuation(
         self,
         previous: Block,
         current: Block,
@@ -819,17 +843,19 @@ class MlxTranslator:
             return False
         previous_text = previous_source.rstrip()
         current_text = current_source.lstrip()
-        if not re.search(r"[^\W\d_]\s*[-\u00ad]\s*$", previous_text, flags=re.UNICODE):
-            return False
-        if not re.match(r"[^\W\d_]", current_text, flags=re.UNICODE):
-            return False
         first_letter = re.match(r"[^\W\d_]", current_text, flags=re.UNICODE)
         if first_letter is None or not first_letter.group(0).islower():
             return False
+        if previous_text.endswith((".", "!", "?", "”", "“", '"', "'", "’", ")", "]")):
+            return False
+        if not re.search(r"[^\W\d_]\s*[-\u00ad]?\s*$", previous_text, flags=re.UNICODE):
+            return False
 
         # A reading-order wrap must move right and upward into the next
-        # column. A same-column gap that failed the ordinary paragraph test is
-        # not rescued merely because the preceding block ends in a hyphen.
+        # column. The OCR logical parser has already required a non-terminal
+        # first region and a lowercase continuation. This catches both a split
+        # word ("expe-" / "rience") and an ordinary sentence split
+        # ("attitude" / "due to ...") without joining unrelated paragraphs.
         return (
             current.bbox.x0 > previous.bbox.x0
             and current.bbox.x0 >= previous.bbox.x1 - 2.0
@@ -881,9 +907,39 @@ class MlxTranslator:
         context: str,
         source_language: str | None,
         shared_context: str,
+        block_by_id: dict[str, Block],
         *,
         continuity_proven: bool,
     ) -> list[str]:
+        if continuity_proven:
+            logical_source = self._join_paragraph_lines(
+                [source_text for _, source_text, _ in segments]
+            )
+            logical_context = (
+                f"{shared_context}\n"
+                "Translate this complete continuous passage exactly once, without placement tags. "
+                "Do not complete any part twice, repeat, summarize, or omit any clause."
+            )
+            logical_target = self._translate_chunk_with_validation(
+                logical_source,
+                logical_context,
+                source_language,
+                self._segment_validation_block_type(segments),
+            )
+            redistributed = self._redistribute_logical_translation(
+                logical_source,
+                logical_target,
+                segments,
+                source_language,
+                block_by_id,
+                continuity_proven=True,
+            )
+            if redistributed is not None:
+                logger.info(
+                    "Translated a continuous passage once and redistributed it across physical regions."
+                )
+                return redistributed
+
         tagged_source = self._tagged_segment_text(segments)
         if continuity_proven:
             segment_instruction = (
@@ -954,6 +1010,7 @@ class MlxTranslator:
                 logical_target,
                 segments,
                 source_language,
+                block_by_id,
                 continuity_proven=True,
             )
             if redistributed is not None:
@@ -1059,6 +1116,7 @@ class MlxTranslator:
         logical_target: str,
         segments: list[tuple[str, str, BlockType]],
         source_language: str | None,
+        block_by_id: dict[str, Block],
         *,
         continuity_proven: bool,
     ) -> list[str] | None:
@@ -1073,9 +1131,7 @@ class MlxTranslator:
         ):
             return None
 
-        continuous_source, source_boundaries = self._continuous_source_with_boundaries(
-            segments
-        )
+        continuous_source, source_boundaries = self._continuous_source_with_boundaries(segments)
         if self._normalized_whitespace(continuous_source) != self._normalized_whitespace(
             logical_source
         ):
@@ -1086,12 +1142,10 @@ class MlxTranslator:
         if len(target_tokens) < len(segments):
             return None
         source_weights = [
-            max(1, len(self._language_words(source_text)))
-            for _, source_text, _ in segments
+            max(1, len(self._language_words(source_text))) for _, source_text, _ in segments
         ]
         minimum_counts = [
-            max(1, math.ceil(weight * 0.20)) if weight >= 6 else 1
-            for weight in source_weights
+            max(1, math.ceil(weight * 0.20)) if weight >= 6 else 1 for weight in source_weights
         ]
         if sum(minimum_counts) > len(target_tokens):
             return None
@@ -1104,6 +1158,29 @@ class MlxTranslator:
         )
         if desired_boundaries is None:
             return None
+        if len(segments) >= 2:
+            previous_id, previous_source, _ = segments[-2]
+            current_id, current_source, _ = segments[-1]
+            previous_block = block_by_id.get(previous_id)
+            current_block = block_by_id.get(current_id)
+            if (
+                previous_block is not None
+                and current_block is not None
+                and not previous_source.rstrip().endswith(("-", "\u00ad"))
+                and len(self._language_words(current_source)) <= 4
+                and self._is_explicit_cross_column_continuation(
+                    previous_block,
+                    current_block,
+                    previous_source,
+                    current_source,
+                )
+            ):
+                # A compact tail such as "por etilo-dependencia" may expand
+                # into several English words despite occupying a one-line box.
+                # The passage is continuous, so keep only the validator's
+                # minimum token count in that final physical region and place
+                # the preceding English words in the larger prior region.
+                desired_boundaries[-1] = len(target_tokens) - minimum_counts[-1]
 
         token_boundaries: list[int] = []
         previous_boundary = 0
@@ -1970,6 +2047,15 @@ class MlxTranslator:
         *,
         source_language_authoritative: bool = False,
     ) -> str | None:
+        structural_translation = self._structural_label_translation(
+            source,
+            source_language,
+            block_type,
+        )
+        if structural_translation is not None and self._normalized_language_text(
+            translated
+        ) == self._normalized_language_text(structural_translation):
+            return None
         if not self._source_requires_english_translation(
             source,
             source_language,
@@ -2157,6 +2243,8 @@ class MlxTranslator:
             return True
         if self._looks_like_multi_author_list(text):
             return True
+        if self._looks_like_single_author_name(text):
+            return True
         if self._looks_like_contact_metadata(text, words):
             return True
         original_words = re.findall(r"[^\W\d_]+", text, flags=re.UNICODE)
@@ -2178,6 +2266,33 @@ class MlxTranslator:
             and original_words
             and capitalized / len(original_words) >= 0.70
         )
+
+    def _looks_like_single_author_name(self, text: str) -> bool:
+        """Recognize a compact personal name followed by one or more initials."""
+
+        candidate = html.unescape(text).strip()
+        if not re.search(r"(?:^|\s)(?:[A-ZÀ-ÖØ-Þ]\.){1,4}$", candidate):
+            return False
+        name_part = re.sub(r"(?:^|\s)(?:[A-ZÀ-ÖØ-Þ]\.){1,4}$", "", candidate).strip()
+        name_words = re.findall(r"[^\W\d_]+", name_part, flags=re.UNICODE)
+        if not 1 <= len(name_words) <= 8:
+            return False
+        particles = {
+            "da",
+            "de",
+            "del",
+            "della",
+            "der",
+            "di",
+            "dos",
+            "du",
+            "la",
+            "le",
+            "van",
+            "von",
+        }
+        substantive = [word for word in name_words if word.casefold() not in particles]
+        return bool(substantive) and all(word[:1].isupper() for word in substantive)
 
     def _looks_like_contact_metadata(self, text: str, words: list[str]) -> bool:
         """Recognize compact journal contact blocks without exempting ordinary prose."""
@@ -2202,8 +2317,7 @@ class MlxTranslator:
                 text,
             )
             is not None,
-            re.search(r"(?i)\b(?:tel(?:ephone|[ée]fono)?|phone|fax|mobile)\b", text)
-            is not None,
+            re.search(r"(?i)\b(?:tel(?:ephone|[ée]fono)?|phone|fax|mobile)\b", text) is not None,
         )
         return sum(signals) >= 2
 
@@ -2235,7 +2349,44 @@ class MlxTranslator:
                 and len(name_words) <= 9
             ):
                 author_segments += 1
-        return author_segments >= 3 and author_segments / len(segments) >= 0.70
+        if author_segments >= 3 and author_segments / len(segments) >= 0.70:
+            return True
+
+        # Some journals print full given names rather than initials. Require a
+        # long comma-separated sequence whose substantive words all retain
+        # personal-name capitalization, while allowing surname particles and a
+        # final language-specific conjunction. This deliberately rejects prose
+        # lists containing ordinary lower-case verbs or nouns.
+        name_particles = {
+            "and",
+            "da",
+            "de",
+            "del",
+            "della",
+            "der",
+            "di",
+            "dos",
+            "du",
+            "e",
+            "et",
+            "la",
+            "le",
+            "und",
+            "van",
+            "von",
+            "y",
+        }
+        full_name_segments = 0
+        for segment in segments:
+            name_words = re.findall(r"[^\W\d_]+", segment, flags=re.UNICODE)
+            substantive = [word for word in name_words if word.casefold() not in name_particles]
+            if (
+                2 <= len(substantive) <= 6
+                and len(name_words) <= 9
+                and all(word[:1].isupper() for word in substantive)
+            ):
+                full_name_segments += 1
+        return full_name_segments >= 4 and full_name_segments / len(segments) >= 0.75
 
     def _normalized_language_text(self, text: str) -> str:
         return " ".join(self._language_words(self._text_for_language_detection(text)))
@@ -2286,6 +2437,15 @@ class MlxTranslator:
             ),
             "translation_table_cell_missing": (
                 "Translation output omitted content from one or more source table cells after retry."
+            ),
+            "translation_identifier_missing": (
+                "Translation output omitted a required source URL or email address after retry."
+            ),
+            "translation_source_acronym_missing": (
+                "Translation output omitted or reinterpreted a required source acronym after retry."
+            ),
+            "translation_target_acronym_invented": (
+                "Translation output introduced an acronym that was absent from the source after retry."
             ),
         }
         chunk.status = self.TRANSLATION_FAILED_STATUS
@@ -2338,6 +2498,34 @@ class MlxTranslator:
         *,
         source_language_authoritative: bool = False,
     ) -> str:
+        structural_translation = self._structural_label_translation(
+            text,
+            source_language,
+            block_type,
+        )
+        if structural_translation is not None:
+            return structural_translation
+
+        structural_caption = self._structural_caption_parts(
+            text,
+            source_language,
+            block_type,
+        )
+        if structural_caption is not None:
+            translated_prefix, caption_body = structural_caption
+            translated_body = self._translate_chunk_with_validation(
+                caption_body,
+                (
+                    f"{context}\n"
+                    "TEXT is the natural-language body of a document caption. Translate it completely "
+                    "without adding a table/figure label; that structural label is supplied separately."
+                ).strip(),
+                source_language,
+                BlockType.CAPTION,
+                source_language_authoritative=source_language_authoritative,
+            )
+            return f"{translated_prefix} {translated_body}".strip()
+
         translated = self._translate_chunk(text, context, source_language)
         if self._is_acceptable_chunk_translation(
             text,
@@ -2348,6 +2536,26 @@ class MlxTranslator:
         ):
             return translated
 
+        missing_acronyms = self._missing_source_acronyms(text, translated, block_type)
+        invented_acronyms = self._invented_target_acronyms(text, translated, block_type)
+        missing_identifiers = self._missing_verbatim_identifiers(text, translated)
+        verbatim_requirements = ""
+        if missing_acronyms:
+            verbatim_requirements += (
+                " Required source acronyms that must appear unchanged in the English output: "
+                f"{', '.join(missing_acronyms)}."
+            )
+        if missing_identifiers:
+            verbatim_requirements += (
+                " Required identifiers that must appear character-for-character unchanged: "
+                f"{', '.join(missing_identifiers)}."
+            )
+        if invented_acronyms:
+            verbatim_requirements += (
+                " Remove these invented target acronyms because they are absent from TEXT: "
+                f"{', '.join(invented_acronyms)}. Translate the source wording directly instead "
+                "of importing terminology or abbreviations from nearby context."
+            )
         retry_context = (
             f"{context}\n"
             "The previous output was not an acceptable English translation. Return English only and "
@@ -2355,7 +2563,7 @@ class MlxTranslator:
             "Preserve the source structure exactly: keep paragraph boundaries, list boundaries, headings, "
             "Markdown markers, citations, numeric values, and line breaks that "
             "separate logical blocks. Preserve every numeric value exactly. "
-            "Do not summarize, omit, or collapse content."
+            f"Do not summarize, omit, or collapse content.{verbatim_requirements}"
         ).strip()
         retried = self._translate_chunk(text, retry_context, source_language)
         if self._is_acceptable_chunk_translation(
@@ -2422,6 +2630,99 @@ class MlxTranslator:
                     "Used structural affiliation heading fallback after repeated homograph output."
                 )
                 return structural_fallback
+        contact_retry_used = self._should_retry_contact_block(text, block_type, issue)
+        if contact_retry_used:
+            contact_context = (
+                f"{retry_context}\n"
+                "TEXT is a professional postal/contact block, not an identifier-only block. Preserve "
+                "personal names, institution proper names, street/place names, postal codes, and email "
+                "addresses exactly. Translate every translatable honorific, department or service name, "
+                "organizational descriptor, country name, and contact label into natural English. Do not "
+                "return TEXT unchanged, and return only the translated contact block."
+            )
+            contact_translation = self._translate_chunk(
+                text,
+                contact_context,
+                source_language,
+            )
+            if self._is_acceptable_chunk_translation(
+                text,
+                contact_translation,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            ):
+                return contact_translation
+            retried = contact_translation
+            issue = self._chunk_translation_issue(
+                text,
+                retried,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            )
+            contact_fallback = self._spanish_contact_fallback(
+                text,
+                source_language,
+            )
+            if contact_fallback is not None:
+                logger.info(
+                    "Used deterministic Spanish contact-metadata fallback after repeated model rejection."
+                )
+                return contact_fallback
+        if (
+            block_type != BlockType.HEADING
+            and not contact_retry_used
+            and issue
+            in {
+                "translation_identifier_missing",
+                "translation_output_high_source_overlap",
+                "translation_output_matches_source",
+                "translation_output_not_english",
+                "translation_source_acronym_missing",
+                "translation_target_acronym_invented",
+            }
+        ):
+            invented_acronyms = self._invented_target_acronyms(
+                text,
+                retried,
+                block_type,
+            )
+            invented_acronym_guidance = (
+                " Remove these invented target acronyms because they do not occur in TEXT: "
+                f"{', '.join(invented_acronyms)}."
+                if invented_acronyms
+                else ""
+            )
+            final_context = (
+                f"{retry_context}\n"
+                "A second attempt was also rejected. Produce a direct, clause-by-clause English "
+                "translation now. Every source-language word or phrase with translatable meaning must "
+                "be rendered in English. Retain only proper names and the exact required identifiers or "
+                "acronyms from the preservation instructions."
+                f"{invented_acronym_guidance} Return only the translation."
+            )
+            final_translation = self._translate_chunk(
+                text,
+                final_context,
+                source_language,
+            )
+            if self._is_acceptable_chunk_translation(
+                text,
+                final_translation,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            ):
+                return final_translation
+            retried = final_translation
+            issue = self._chunk_translation_issue(
+                text,
+                retried,
+                source_language,
+                block_type,
+                source_language_authoritative=source_language_authoritative,
+            )
         logger.warning(
             "Chunk translation failed validation after English-only retry (%s); returning source text.",
             issue or "unknown_validation_failure",
@@ -2450,9 +2751,7 @@ class MlxTranslator:
 
     def _structural_heading_fallback(self, context: str) -> str | None:
         numbered_lines = [
-            line.strip()
-            for line in context.splitlines()
-            if re.match(r"^\s*\d+[.)]?\s+\S", line)
+            line.strip() for line in context.splitlines() if re.match(r"^\s*\d+[.)]?\s+\S", line)
         ]
         if len(numbered_lines) < 2:
             return None
@@ -2462,6 +2761,114 @@ class MlxTranslator:
         ):
             return None
         return "Affiliations"
+
+    def _structural_label_translation(
+        self,
+        source: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+    ) -> str | None:
+        """Translate unambiguous short document labels without model variance."""
+
+        if block_type not in {
+            BlockType.CAPTION,
+            BlockType.HEADING,
+            BlockType.PARAGRAPH,
+        }:
+            return None
+        compact = " ".join(html.unescape(source).strip().split())
+        table_or_figure = re.fullmatch(
+            r"(?i)(tabla|figura)\s+([ivxlcdm]+|\d+)([.:]?)",
+            compact,
+        )
+        if table_or_figure is not None:
+            label = "TABLE" if table_or_figure.group(1).casefold() == "tabla" else "FIGURE"
+            return f"{label} {table_or_figure.group(2)}{table_or_figure.group(3)}"
+
+        normalized = "".join(
+            character
+            for character in self._normalized_language_text(compact)
+            if character.isalnum() or character.isspace()
+        )
+        return self._SPANISH_STRUCTURAL_HEADINGS.get(" ".join(normalized.split()))
+
+    def _structural_caption_parts(
+        self,
+        source: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+    ) -> tuple[str, str] | None:
+        if block_type != BlockType.CAPTION:
+            return None
+        compact = " ".join(html.unescape(source).strip().split())
+        match = re.fullmatch(
+            r"(?is)(tabla|figura)\s+([ivxlcdm]+|\d+)([.:])\s*(.+)",
+            compact,
+        )
+        if match is None:
+            return None
+        label = "TABLE" if match.group(1).casefold() == "tabla" else "FIGURE"
+        return f"{label} {match.group(2)}{match.group(3)}", match.group(4).strip()
+
+    def _should_retry_contact_block(
+        self,
+        source: str,
+        block_type: BlockType | None,
+        issue: str | None,
+    ) -> bool:
+        return bool(
+            block_type in {BlockType.CAPTION, BlockType.FOOTNOTE, BlockType.PARAGRAPH}
+            and issue
+            in {
+                "translation_identifier_missing",
+                "translation_output_high_source_overlap",
+                "translation_output_matches_source",
+                "translation_output_not_english",
+            }
+            and re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", source)
+        )
+
+    def _spanish_contact_fallback(
+        self,
+        source: str,
+        source_language: str | None,
+    ) -> str | None:
+        """Translate generic Spanish contact terms while preserving address names.
+
+        Professional contact blocks are dominated by names and addresses, so a
+        generic language detector can reject a correct English result—or the
+        model can repeatedly copy the source. This conservative fallback only
+        changes unambiguous titles, organizational descriptors, country names,
+        and contact labels. It never rewrites the personal/institution/place
+        names or verbatim identifiers that make the address usable.
+        """
+
+        if (
+            self._base_language(source_language) != "es"
+            or re.search(r"[^\s@]+@[^\s@]+\.[^\s@]+", source) is None
+        ):
+            return None
+        translated = source
+        replacements = (
+            (r"(?i)\bDra\.", "Dr."),
+            (r"(?i)\bDirecci[oó]n del autor\b", "Author Contact"),
+            (r"(?i)\bServicio de\b", "Department of"),
+            (r"(?i)\bDepartamento de\b", "Department of"),
+            (r"(?i)\bUnidad de\b", "Unit of"),
+            (r"(?i)\bEndocrinolog[ií]a\b", "Endocrinology"),
+            (r"(?i)\bNutrici[oó]n\b", "Nutrition"),
+            (r"(?i)\bEndocrinology\s+y\s+Nutrition\b", "Endocrinology and Nutrition"),
+            (r"(?i)\bPab\.", "Pavilion"),
+            (r"(?i)\bComplejo Hospitalario\b", "Hospital Complex"),
+            (r"(?i)\bEspa[nñ]a\b", "Spain"),
+            (r"(?i)\bCorreo electr[oó]nico\b", "Email"),
+            (r"(?i)\bTel[eé]fono\b", "Telephone"),
+        )
+        for pattern, replacement in replacements:
+            translated = re.sub(pattern, replacement, translated)
+        if translated == source or self._missing_verbatim_identifiers(source, translated):
+            return None
+        return translated
 
     def _is_acceptable_chunk_translation(
         self,
@@ -2494,6 +2901,12 @@ class MlxTranslator:
     ) -> str | None:
         if not self._is_valid_chunk_translation_structure(source, translated, block_type):
             return "translation_structure_invalid"
+        if self._missing_verbatim_identifiers(source, translated):
+            return "translation_identifier_missing"
+        if self._missing_source_acronyms(source, translated, block_type):
+            return "translation_source_acronym_missing"
+        if self._invented_target_acronyms(source, translated, block_type):
+            return "translation_target_acronym_invented"
         if self.TABLE_DELIMITER in source:
             for source_cell, translated_cell in zip(
                 source.split(self.TABLE_DELIMITER),
@@ -2522,6 +2935,85 @@ class MlxTranslator:
             source_language,
             block_type,
             source_language_authoritative=source_language_authoritative,
+        )
+
+    def _missing_verbatim_identifiers(self, source: str, translated: str) -> list[str]:
+        identifiers = re.findall(
+            r"(?i)(?:https?://|ftp://|www\.)[^\s<>()]+|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+",
+            html.unescape(source),
+        )
+        return [identifier for identifier in identifiers if identifier not in translated]
+
+    def _source_acronyms_to_preserve(
+        self,
+        source: str,
+        block_type: BlockType | None,
+    ) -> list[str]:
+        if block_type == BlockType.TABLE:
+            # Compact medical/statistical table abbreviations may have a
+            # standard English form (for example ACV -> CVA). Acronyms
+            # explicitly introduced in parentheses remain document-defined
+            # labels and must stay exact.
+            return list(dict.fromkeys(self._ordered_acronyms(source)))
+
+        visible = self._TAG_RE.sub(" ", html.unescape(source))
+        acronyms = list(self._ordered_acronyms(visible))
+        if re.search(r"[a-zà-öø-ÿ]", visible):
+            for match in re.finditer(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", visible):
+                token = match.group(1)
+                suffix = visible[match.end() : match.end() + 1]
+                if (
+                    suffix == "="
+                    or re.fullmatch(r"[IVXLCDM]+", token)
+                    or token not in self._document_defined_acronyms
+                ):
+                    continue
+                acronyms.append(token)
+        return list(dict.fromkeys(acronyms))
+
+    def _missing_source_acronyms(
+        self,
+        source: str,
+        translated: str,
+        block_type: BlockType | None,
+    ) -> list[str]:
+        source_counts = Counter(self._source_acronyms_to_preserve(source, block_type))
+        if not source_counts:
+            return []
+        translated_counts = Counter(
+            re.findall(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", html.unescape(translated))
+        )
+        return [
+            acronym
+            for acronym, required_count in source_counts.items()
+            if translated_counts[acronym] < required_count
+        ]
+
+    def _invented_target_acronyms(
+        self,
+        source: str,
+        translated: str,
+        block_type: BlockType | None,
+    ) -> list[str]:
+        """Return stable-looking target acronyms that have no source evidence.
+
+        Only parenthesized or slash-delimited target acronyms are considered.
+        This avoids treating uppercase headings as acronyms while preventing
+        the model from importing context-only expansions such as ``(TFM)`` into
+        a narrow continuation block. Tables remain exempt because compact
+        source abbreviations may legitimately have different English forms.
+        """
+
+        if block_type == BlockType.TABLE:
+            return []
+        source_visible = self._TAG_RE.sub(" ", html.unescape(source))
+        source_acronyms = set(re.findall(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", source_visible))
+        return list(
+            dict.fromkeys(
+                acronym
+                for acronym in self._ordered_acronyms(translated)
+                if not re.fullmatch(r"[IVXLCDM]+", acronym) and acronym not in source_acronyms
+            )
         )
 
     def _ordered_acronyms(self, text: str) -> list[str]:
@@ -2575,19 +3067,13 @@ class MlxTranslator:
         source_words = self._language_words(self._text_for_language_detection(source))
         source_alpha_count = sum(len(word) for word in source_words)
         if len(source_words) >= 3 and source_alpha_count >= 12:
-            translated_words = self._language_words(
-                self._text_for_language_detection(translated)
-            )
+            translated_words = self._language_words(self._text_for_language_detection(translated))
             translated_alpha_count = sum(len(word) for word in translated_words)
             minimum_target_words = (
-                max(2, math.ceil(len(source_words) * 0.20))
-                if len(source_words) >= 6
-                else 1
+                max(2, math.ceil(len(source_words) * 0.20)) if len(source_words) >= 6 else 1
             )
             minimum_target_alpha = (
-                max(4, math.ceil(source_alpha_count * 0.12))
-                if len(source_words) >= 6
-                else 2
+                max(4, math.ceil(source_alpha_count * 0.12)) if len(source_words) >= 6 else 2
             )
             if (
                 len(translated_words) < minimum_target_words
@@ -2603,14 +3089,18 @@ class MlxTranslator:
 
         source_paragraphs = self._paragraph_count(source)
         translated_paragraphs = self._paragraph_count(translated)
-        if block_type in {
-            BlockType.CAPTION,
-            BlockType.FOOTNOTE,
-            BlockType.HEADER,
-            BlockType.HEADING,
-            BlockType.PARAGRAPH,
-            BlockType.REFERENCE,
-        } and translated_paragraphs != source_paragraphs:
+        if (
+            block_type
+            in {
+                BlockType.CAPTION,
+                BlockType.FOOTNOTE,
+                BlockType.HEADER,
+                BlockType.HEADING,
+                BlockType.PARAGRAPH,
+                BlockType.REFERENCE,
+            }
+            and translated_paragraphs != source_paragraphs
+        ):
             return False
         if source_paragraphs >= 3 and translated_paragraphs < max(2, source_paragraphs // 2):
             return False
@@ -2668,6 +3158,7 @@ class MlxTranslator:
             source_language,
             force_max_tokens=max_tokens,
         )
+        translated = self._repair_common_spanish_table_labels(text, translated)
         if self._is_acceptable_table_translation(text, translated, source_language):
             return translated
 
@@ -2677,21 +3168,83 @@ class MlxTranslator:
             "translate every substantive non-English table label or sentence, and do not repeat "
             "source-language prose. Do not truncate output. Keep the same number of rows and cells."
         )
+        missing_acronyms = self._missing_source_acronyms(
+            text,
+            translated,
+            BlockType.TABLE,
+        )
+        if missing_acronyms:
+            retry_context += (
+                " Preserve these document-defined acronyms character-for-character: "
+                f"{', '.join(missing_acronyms)}."
+            )
         retried = self._translate_chunk(
             text,
             retry_context,
             source_language,
             force_max_tokens=max_tokens,
         )
+        retried = self._repair_common_spanish_table_labels(text, retried)
         if self._is_acceptable_table_translation(text, retried, source_language):
             return retried
 
         fallback = self._translate_table_by_row_groups(text, context, source_language)
+        fallback = self._repair_common_spanish_table_labels(text, fallback or "")
         if fallback and self._is_acceptable_table_translation(text, fallback, source_language):
             return fallback
 
         logger.warning("Table translation remained invalid after retries; using source table text.")
         return text
+
+    def _repair_common_spanish_table_labels(
+        self,
+        source_table: str,
+        translated_table: str,
+    ) -> str:
+        """Apply deterministic English to a few unambiguous aligned cells.
+
+        The translation model occasionally shortens the fully spelled
+        ``Seguimiento`` to the invented token ``Fol`` to satisfy compact-table
+        guidance. Cell topology is already required to remain identical, so an
+        exact source-label mapping can safely replace the corresponding target
+        cell without guessing about another cell or changing table markup.
+        """
+
+        source_matches = list(self._TABLE_CELL_RE.finditer(source_table or ""))
+        target_matches = list(self._TABLE_CELL_RE.finditer(translated_table or ""))
+        if not source_matches or len(source_matches) != len(target_matches):
+            return translated_table
+
+        deterministic_targets: dict[int, str] = {}
+        for index, source_match in enumerate(source_matches):
+            source_text = self._TAG_RE.sub(" ", source_match.group("body"))
+            normalized = " ".join(html.unescape(source_text).casefold().split())
+            follow_up = re.fullmatch(
+                r"seguimiento(?:\s*/\s*(\d+)\s+mes(?:es)?)?",
+                normalized,
+            )
+            if follow_up is None:
+                continue
+            months = follow_up.group(1)
+            deterministic_targets[index] = (
+                f"Follow-up / {months} {'month' if months == '1' else 'months'}"
+                if months is not None
+                else "Follow-up"
+            )
+        if not deterministic_targets:
+            return translated_table
+
+        pieces: list[str] = []
+        cursor = 0
+        for index, target_match in enumerate(target_matches):
+            replacement = deterministic_targets.get(index)
+            if replacement is None:
+                continue
+            pieces.append(translated_table[cursor : target_match.start("body")])
+            pieces.append(html.escape(replacement))
+            cursor = target_match.end("body")
+        pieces.append(translated_table[cursor:])
+        return "".join(pieces)
 
     def _normalize_table_markup_for_translation(self, text: str) -> str:
         if not text or not self._may_contain_table_markup(text):
@@ -2843,13 +3396,7 @@ class MlxTranslator:
             if not section_open:
                 return None
             section_close = f"</{section[0]}>"
-        group_table = (
-            table_open
-            + section_open
-            + "".join(group_rows)
-            + section_close
-            + "</table>"
-        )
+        group_table = table_open + section_open + "".join(group_rows) + section_close + "</table>"
         group_context = (
             f"{context}\n"
             "Translate this HTML table to English and keep tags intact. "
@@ -2869,9 +3416,7 @@ class MlxTranslator:
         ):
             translated_table = self._extract_primary_table(translated_group)
             parsed_group = (
-                self._parse_table_rows(translated_table)
-                if translated_table is not None
-                else None
+                self._parse_table_rows(translated_table) if translated_table is not None else None
             )
             if parsed_group is not None:
                 _, translated_rows, _ = parsed_group
@@ -2947,6 +3492,12 @@ class MlxTranslator:
             return "translation_table_structure_invalid"
         if not self._table_nonempty_cells_preserved(source_table, translated_table):
             return "translation_table_cell_missing"
+        if self._missing_source_acronyms(
+            source_table,
+            translated_table,
+            BlockType.TABLE,
+        ):
+            return "translation_source_acronym_missing"
         if (
             self._base_language(source_language) not in {None, "en"}
             and self._normalized_table_cell(source_table)
@@ -2978,19 +3529,14 @@ class MlxTranslator:
     def _looks_like_table_abbreviation(self, word: str) -> bool:
         letters = [character for character in word if character.isalpha()]
         cased_letters = [
-            character
-            for character in letters
-            if character.islower() or character.isupper()
+            character for character in letters if character.islower() or character.isupper()
         ]
         uppercase_count = sum(character.isupper() for character in cased_letters)
         return bool(
             letters
             and len(letters) <= 6
             and cased_letters
-            and (
-                all(character.isupper() for character in cased_letters)
-                or uppercase_count >= 2
-            )
+            and (all(character.isupper() for character in cased_letters) or uppercase_count >= 2)
         )
 
     def _parse_table_rows(self, html: str) -> tuple[str, list[str], str] | None:
@@ -3119,7 +3665,9 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "units, numeric values, and figure references. "
+            "units, numeric values, and figure references. Preserve source acronyms and unexplained "
+            "abbreviations exactly; never expand or reinterpret them. Do not invent abbreviations from "
+            "ordinary source words. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
             "Translate short section headings and titles as well."
         )
@@ -3205,9 +3753,7 @@ class MlxTranslator:
             and sum(len(word) for word in words) <= 60
         )
         if is_short_heading and nearby_context:
-            contextual_text = self._text_for_language_detection(
-                f"{text}\n{nearby_context}"
-            )
+            contextual_text = self._text_for_language_detection(f"{text}\n{nearby_context}")
             contextual_words = self._language_words(contextual_text)
             if len(contextual_words) >= 4 and sum(len(word) for word in contextual_words) >= 24:
                 language, confidence = self._detect_language_with_confidence(contextual_text)

@@ -1767,13 +1767,17 @@ class OriginalLayoutReconstructor:
         text uniquely aligns to every PDF word in monotonic row order.
         """
 
-        if (
-            not source_rows
-            or not source_rows[0]
-            or any(len(row) != len(source_rows[0]) for row in source_rows)
+        if not source_rows or not source_rows[0]:
+            return []
+        logical_columns = max(
+            sum(max(1, int(cell.colspan or 1)) for cell in row) for row in source_rows
+        )
+        if logical_columns <= 0 or any(
+            sum(max(1, int(cell.colspan or 1)) for cell in row) != logical_columns
+            or any(int(cell.rowspan or 1) != 1 for cell in row)
+            for row in source_rows
         ):
             return []
-        logical_columns = len(source_rows[0])
         boundary_candidates = self._horizontal_rule_column_candidates(
             page,
             table_rect,
@@ -1916,7 +1920,7 @@ class OriginalLayoutReconstructor:
         physical_lines = self._physical_table_lines(page, table_rect, column_edges)
         if not physical_lines or len(physical_lines) < len(source_rows):
             return None
-        logical_columns = len(source_rows[0])
+        logical_columns = len(column_edges) - 1
 
         @lru_cache(maxsize=None)
         def combined_cells(start: int, end: int) -> tuple[str, ...]:
@@ -1943,7 +1947,12 @@ class OriginalLayoutReconstructor:
             candidates: list[tuple[float, tuple[tuple[int, int], ...]]] = []
             for take in range(1, max_take + 1):
                 end = physical_index + take
-                actual_cells = combined_cells(physical_index, end)
+                actual_cells = self._collapse_physical_cells_for_colspans(
+                    source_rows[logical_index],
+                    combined_cells(physical_index, end),
+                )
+                if actual_cells is None:
+                    continue
                 score = self._semantic_table_row_similarity(
                     source_rows[logical_index],
                     actual_cells,
@@ -2026,18 +2035,19 @@ class OriginalLayoutReconstructor:
             return None
         row_edges.append(float(bottom))
 
-        rows = tuple(
-            tuple(
-                fitz.Rect(
-                    column_edges[column],
-                    row_edges[row],
-                    column_edges[column + 1],
-                    row_edges[row + 1],
-                )
-                for column in range(logical_columns)
+        rows: tuple[tuple[fitz.Rect, ...], ...] = tuple(
+            self._semantic_row_rectangles(
+                source_row,
+                column_edges=column_edges,
+                y0=row_edges[row_index],
+                y1=row_edges[row_index + 1],
             )
-            for row in range(len(source_rows))
+            for row_index, source_row in enumerate(source_rows)
         )
+        if any(
+            len(row) != len(source_row) for row, source_row in zip(rows, source_rows, strict=True)
+        ):
+            return None
         signature = tuple(
             round(value, 2)
             for value in (
@@ -2047,8 +2057,14 @@ class OriginalLayoutReconstructor:
         )
         assignment_signature = tuple(
             self._comparison_text(cell)
-            for start, end in row_ranges
-            for cell in combined_cells(start, end)
+            for source_row, (start, end) in zip(source_rows, row_ranges, strict=True)
+            for cell in (
+                self._collapse_physical_cells_for_colspans(
+                    source_row,
+                    combined_cells(start, end),
+                )
+                or ()
+            )
         )
         return _SemanticTableGrid(
             rows=rows,
@@ -2056,6 +2072,54 @@ class OriginalLayoutReconstructor:
             signature=signature,
             assignment_signature=assignment_signature,
         )
+
+    def _collapse_physical_cells_for_colspans(
+        self,
+        source_row: list[ParsedTableCell],
+        physical_cells: tuple[str, ...],
+    ) -> tuple[str, ...] | None:
+        collapsed: list[str] = []
+        column_index = 0
+        for source_cell in source_row:
+            colspan = max(1, int(source_cell.colspan or 1))
+            end = column_index + colspan
+            if end > len(physical_cells):
+                return None
+            collapsed.append(
+                " ".join(cell for cell in physical_cells[column_index:end] if cell).strip()
+            )
+            column_index = end
+        if column_index != len(physical_cells):
+            return None
+        return tuple(collapsed)
+
+    def _semantic_row_rectangles(
+        self,
+        source_row: list[ParsedTableCell],
+        *,
+        column_edges: tuple[float, ...],
+        y0: float,
+        y1: float,
+    ) -> tuple[fitz.Rect, ...]:
+        rectangles: list[fitz.Rect] = []
+        column_index = 0
+        for source_cell in source_row:
+            colspan = max(1, int(source_cell.colspan or 1))
+            end = column_index + colspan
+            if end >= len(column_edges):
+                return ()
+            rectangles.append(
+                fitz.Rect(
+                    column_edges[column_index],
+                    y0,
+                    column_edges[end],
+                    y1,
+                )
+            )
+            column_index = end
+        if column_index != len(column_edges) - 1:
+            return ()
+        return tuple(rectangles)
 
     def _semantic_scores_are_ambiguous(self, best: float, second: float) -> bool:
         difference = best - second
@@ -2128,15 +2192,6 @@ class OriginalLayoutReconstructor:
         words = [word for word in words if len(word) >= 5 and self._comparison_text(str(word[4]))]
         if not words:
             return ()
-
-        for word in words:
-            word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
-            tolerance = min(1.5, max(0.6, word_rect.height * 0.1))
-            if any(
-                word_rect.x0 + tolerance < boundary < word_rect.x1 - tolerance
-                for boundary in column_edges[1:-1]
-            ):
-                return ()
 
         heights = sorted(float(word[3]) - float(word[1]) for word in words)
         median_height = heights[len(heights) // 2]
@@ -2242,7 +2297,7 @@ class OriginalLayoutReconstructor:
         without jumping across columns or through an intervening figure.
         """
 
-        expected = self._comparison_text(expected_text)
+        expected = self._hidden_ocr_alignment_text(expected_text)
         if len(expected) < 5:
             return None, {
                 "reason": "hidden_ocr_source_text_too_short_for_unique_alignment",
@@ -2277,7 +2332,7 @@ class OriginalLayoutReconstructor:
                         break
                     selected.append(line)
                     actual_text = " ".join(item.text for item in selected)
-                    actual = self._comparison_text(actual_text)
+                    actual = self._hidden_ocr_alignment_text(actual_text)
                     if len(actual) > maximum_characters:
                         break
                     if len(actual) < minimum_characters:
@@ -2371,6 +2426,19 @@ class OriginalLayoutReconstructor:
                 "competing_score": round(competing_score, 6),
             },
         )
+
+    def _hidden_ocr_alignment_text(self, text: str) -> str:
+        """Normalize a narrow OCR confusion in structural Roman-numeral labels."""
+
+        compared = self._comparison_text(text)
+        structural_label = re.fullmatch(
+            r"(tabla|table|figura|figure)([ivxlcdm1]+)",
+            compared,
+        )
+        if structural_label is None:
+            return compared
+        numeral = structural_label.group(2).replace("1", "i")
+        return f"{structural_label.group(1)}{numeral}"
 
     def _hidden_ocr_text_blocks(
         self,
@@ -3113,6 +3181,13 @@ class OriginalLayoutReconstructor:
         for word in words:
             if len(word) < 8 or not self._comparison_text(str(word[4])):
                 continue
+            center_x = (float(word[0]) + float(word[2])) / 2
+            center_y = (float(word[1]) + float(word[3])) / 2
+            if not (
+                search_rectangle.x0 <= center_x <= search_rectangle.x1
+                and search_rectangle.y0 <= center_y <= search_rectangle.y1
+            ):
+                continue
             groups.setdefault((int(word[5]), int(word[6])), []).append(
                 fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
             )
@@ -3274,7 +3349,7 @@ class OriginalLayoutReconstructor:
             ]
             for source_cell, rectangle in zip(source_row, rectangles, strict=True):
                 expected = self._comparison_text(source_cell.text)
-                actual_text = page.get_text("text", clip=rectangle)
+                actual_text = self._table_cell_text(page, rectangle)
                 actual = self._comparison_text(actual_text)
                 if expected == actual:
                     continue
@@ -3318,6 +3393,8 @@ class OriginalLayoutReconstructor:
             return True
         if not expected or not actual:
             return False
+        if self._short_ocr_tokens_are_confusable(expected, actual):
+            return True
         longest = max(len(expected), len(actual))
         shortest = min(len(expected), len(actual))
         if shortest <= 3:
@@ -3354,7 +3431,7 @@ class OriginalLayoutReconstructor:
         nonempty_cell_scores: list[float] = []
         for cell, rectangle in zip(source_row, rectangles, strict=True):
             expected = self._comparison_text(cell.text)
-            actual_text = page.get_text("text", clip=rectangle)
+            actual_text = self._table_cell_text(page, rectangle)
             actual = self._comparison_text(actual_text)
             if not expected:
                 # Empty logical cells are never redacted. PDF glyph boxes from a
@@ -3377,6 +3454,32 @@ class OriginalLayoutReconstructor:
         if not nonempty_cell_scores:
             return 1.0
         return weighted_score / max(1.0, total_weight)
+
+    def _table_cell_text(self, page: fitz.Page, rectangle: fitz.Rect) -> str:
+        """Read only words whose centres belong to this semantic table cell."""
+
+        try:
+            words = page.get_text("words", clip=rectangle, sort=True)
+        except Exception:
+            return ""
+        groups: dict[tuple[int, int], list[tuple[float, str]]] = {}
+        for word in words:
+            if len(word) < 8:
+                continue
+            center_x = (float(word[0]) + float(word[2])) / 2
+            center_y = (float(word[1]) + float(word[3])) / 2
+            if not (
+                rectangle.x0 <= center_x <= rectangle.x1
+                and rectangle.y0 <= center_y <= rectangle.y1
+            ):
+                continue
+            text = str(word[4]).strip()
+            if not text:
+                continue
+            groups.setdefault((int(word[5]), int(word[6])), []).append((float(word[0]), text))
+        return "\n".join(
+            " ".join(text for _x, text in sorted(line)) for _key, line in groups.items()
+        )
 
     def _table_cell_text_similarity(self, expected: str, actual_text: str) -> float:
         """Compare a logical cell with clipped PDF text without trusting substrings.
@@ -3404,7 +3507,13 @@ class OriginalLayoutReconstructor:
                 self._comparison_text(token)
                 for token in re.findall(r"\w+", actual_text, flags=re.UNICODE)
             }
-            return 1.0 if expected in tokens else 0.0
+            if expected in tokens:
+                return 1.0
+            return (
+                0.9
+                if any(self._short_ocr_tokens_are_confusable(expected, token) for token in tokens)
+                else 0.0
+            )
 
         best = 0.0
         for actual in candidates:
@@ -3418,6 +3527,25 @@ class OriginalLayoutReconstructor:
                     score = max(score, len(expected) / len(actual))
             best = max(best, score)
         return best
+
+    def _short_ocr_tokens_are_confusable(self, expected: str, actual: str) -> bool:
+        if len(expected) != len(actual) or not 2 <= len(expected) <= 4:
+            return False
+        confusable_groups = (
+            frozenset({"0", "o"}),
+            frozenset({"1", "i", "l"}),
+            frozenset({"5", "s"}),
+        )
+        differences = 0
+        for expected_character, actual_character in zip(expected, actual, strict=True):
+            if expected_character == actual_character:
+                continue
+            if not any(
+                {expected_character, actual_character} <= group for group in confusable_groups
+            ):
+                return False
+            differences += 1
+        return differences == 1
 
     def _comparison_text(self, text: str) -> str:
         normalized = unicodedata.normalize("NFKC", text).casefold()

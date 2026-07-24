@@ -315,7 +315,7 @@ def test_failed_non_english_translation_is_detectable_on_chunk() -> None:
 
     translated_doc, _ = translator.translate_document(document, "")
 
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert translated_doc.blocks[0].text == source
     chunk = translated_doc.translation_chunks[0]
     assert chunk.status == "translation_failed"
@@ -335,6 +335,38 @@ def test_failed_non_english_translation_is_detectable_on_chunk() -> None:
         "policy": "retry_english_then_preserve_source",
     }
     assert "failed English-output validation" in translated_doc.warnings[-1]
+
+
+def test_final_clause_by_clause_retry_recovers_unchanged_prose() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = "Los pacientes reciben tratamiento hormonal con seguimiento clínico continuo."
+    contexts: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (source_language, force_max_tokens)
+        contexts.append(context)
+        if "clause-by-clause" in context:
+            return "Patients receive hormonal treatment with continuous clinical follow-up."
+        return text
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated = translator._translate_chunk_with_validation(
+        source,
+        "",
+        "es",
+        BlockType.PARAGRAPH,
+        source_language_authoritative=True,
+    )
+
+    assert translated.startswith("Patients receive")
+    assert len(contexts) == 3
+    assert "clause-by-clause" in contexts[-1]
 
 
 def test_short_heading_is_validated_while_names_and_formulas_remain_exempt() -> None:
@@ -419,6 +451,60 @@ def test_repeated_initial_multi_author_line_is_exempt_from_translation_failure()
             source,
             "es",
             BlockType.PARAGRAPH,
+        )
+        is None
+    )
+
+
+def test_full_name_multi_author_line_is_exempt_from_translation_failure() -> None:
+    source = (
+        "Birgit Möller*, Timo Ole Nieder*, Wilhelm F. Preuss, Inga Becker, "
+        "Saskia Fahrenkrug, Achim Wüsthof, Peer Briken, Georg Romer und "
+        "Hertha Richter-Appelt"
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._detect_language_with_confidence = lambda _text: (  # type: ignore[method-assign]
+        "de",
+        0.99,
+    )
+
+    assert translator._looks_like_multi_author_list(source) is True
+    assert (
+        translator._translation_acceptance_issue(
+            source,
+            source,
+            "de",
+            BlockType.PARAGRAPH,
+        )
+        is None
+    )
+
+
+def test_comma_separated_prose_is_not_mistaken_for_full_name_author_list() -> None:
+    translator = MlxTranslator(TranslationSettings())
+
+    assert (
+        translator._looks_like_multi_author_list(
+            "Berlin, Patienten erhalten Behandlung, Ergebnisse bleiben stabil, "
+            "weitere Kontrollen folgen"
+        )
+        is False
+    )
+
+
+def test_single_author_caption_is_exempt_from_translation_failure() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    translator._detect_language_with_confidence = lambda _text: (  # type: ignore[method-assign]
+        "es",
+        0.99,
+    )
+
+    assert (
+        translator._translation_acceptance_issue(
+            "Esteva de Antonio I.",
+            "Esteva de Antonio I.",
+            "es",
+            BlockType.CAPTION,
         )
         is None
     )
@@ -763,6 +849,37 @@ def test_table_abbreviations_may_use_equally_compact_target_language_forms() -> 
     )
 
 
+def test_parenthesized_document_acronym_is_preserved_in_table() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = (
+        "<table><tr><th>Tratamiento para Hombre-a-Mujer (TMF)</th></tr>"
+        "<tr><td>ACV</td></tr></table>"
+    )
+
+    assert (
+        translator._table_translation_issue(
+            source,
+            (
+                "<table><tr><th>Treatment for Male-to-Female (MTF)</th></tr>"
+                "<tr><td>CVA</td></tr></table>"
+            ),
+            "es",
+        )
+        == "translation_source_acronym_missing"
+    )
+    assert (
+        translator._table_translation_issue(
+            source,
+            (
+                "<table><tr><th>Treatment for Male-to-Female (TMF)</th></tr>"
+                "<tr><td>CVA</td></tr></table>"
+            ),
+            "es",
+        )
+        is None
+    )
+
+
 def test_known_short_english_target_is_not_rejected_by_language_detector() -> None:
     translator = MlxTranslator(TranslationSettings())
     translator._detect_language_with_confidence = lambda _text: (  # type: ignore[method-assign]
@@ -850,8 +967,302 @@ def test_parenthesized_document_acronym_is_preserved() -> None:
             "es",
             BlockType.PARAGRAPH,
         )
+        == "translation_source_acronym_missing"
+    )
+    assert (
+        translator._chunk_translation_issue(
+            "Terapia hormonal (TMF) continuada.",
+            "Continued hormonal therapy (TMF).",
+            "es",
+            BlockType.PARAGRAPH,
+        )
         is None
     )
+
+
+def test_sentence_acronym_loss_triggers_exact_preservation_retry() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    translator._document_defined_acronyms = {"TMF"}
+    contexts: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (text, source_language, force_max_tokens)
+        contexts.append(context)
+        if "Required source acronyms" in context:
+            return (
+                "Two cases of TMF after surgery continued cyproterone acetate to reduce body hair."
+            )
+        return "Two cases of postoperative hirsutism continued cyproterone acetate."
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated = translator._translate_chunk_with_validation(
+        "Dos casos de TMF post-cirugía continuaron con acetato de ciproterona.",
+        "",
+        "es",
+        BlockType.PARAGRAPH,
+        source_language_authoritative=True,
+    )
+
+    assert "TMF" in translated
+    assert len(contexts) == 2
+    assert "Required source acronyms that must appear unchanged" in contexts[-1]
+
+
+def test_invented_target_acronym_triggers_direct_translation_retry() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = (
+        "No se ha excluido a ningún paciente salvo uno que permanece en actitud "
+        "expectante por dependencia del alcohol."
+    )
+    contexts: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (text, source_language, force_max_tokens)
+        contexts.append(context)
+        if "Remove these invented target acronyms" in context:
+            return (
+                "No patient was excluded except one who remains under observation "
+                "because of alcohol dependence."
+            )
+        return (
+            "No patient with Female-to-Male Transsexualism (TFM) was excluded except "
+            "one under observation because of alcohol dependence."
+        )
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    assert (
+        translator._chunk_translation_issue(
+            source,
+            fake_translate(source),
+            "es",
+            BlockType.PARAGRAPH,
+            source_language_authoritative=True,
+        )
+        == "translation_target_acronym_invented"
+    )
+    contexts.clear()
+
+    translated = translator._translate_chunk_with_validation(
+        source,
+        "",
+        "es",
+        BlockType.PARAGRAPH,
+        source_language_authoritative=True,
+    )
+
+    assert translated == (
+        "No patient was excluded except one who remains under observation "
+        "because of alcohol dependence."
+    )
+    assert len(contexts) == 2
+    assert "Remove these invented target acronyms" in contexts[-1]
+    assert "TFM" in contexts[-1]
+
+
+def test_spanish_structural_caption_translates_body_separately() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        return "Basic care sequence in the Gender Identity Disorders Unit (UTIG)."
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated = translator._translate_chunk_with_validation(
+        "TABLA I. Secuencia básica de atención en la Unidad de Trastornos "
+        "de Identidad de Género (UTIG).",
+        "",
+        "es",
+        BlockType.CAPTION,
+        source_language_authoritative=True,
+    )
+
+    assert translated == (
+        "TABLE I. Basic care sequence in the Gender Identity Disorders Unit (UTIG)."
+    )
+    assert calls == [
+        "Secuencia básica de atención en la Unidad de Trastornos de Identidad de Género (UTIG)."
+    ]
+
+
+def test_short_spanish_structural_labels_use_deterministic_translation() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    translator._translate_chunk = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("unambiguous structural labels should not invoke the model")
+    )
+
+    assert (
+        translator._translate_chunk_with_validation(
+            "Conclusiones",
+            "",
+            "es",
+            BlockType.HEADING,
+            source_language_authoritative=True,
+        )
+        == "Conclusions"
+    )
+    assert (
+        translator._chunk_translation_issue(
+            "Conclusiones",
+            "Conclusions",
+            "es",
+            BlockType.HEADING,
+            source_language_authoritative=True,
+        )
+        is None
+    )
+    assert (
+        translator._translate_chunk_with_validation(
+            "TABLA III",
+            "",
+            "es",
+            BlockType.CAPTION,
+        )
+        == "TABLE III"
+    )
+    assert (
+        translator._translate_chunk_with_validation(
+            "Bibliografía",
+            "",
+            "en",
+            BlockType.HEADING,
+        )
+        == "References"
+    )
+
+
+def test_spanish_structural_heading_overrides_inferred_english_chunk_language() -> None:
+    heading = _block("references-heading", "Bibliografía", 100, 120).model_copy(
+        update={"block_type": BlockType.HEADING}
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(filename="paper.pdf", page_count=1),
+        pages=[],
+        blocks=[heading],
+    )
+    chunk = TranslationChunk(
+        id="p0001-c001",
+        block_ids=[heading.id],
+        source_text=heading.text,
+        source_language="en",
+        source_language_origin="nearby_context",
+        source_language_confidence=0.999,
+        chunk_type="heading",
+        page_start=1,
+        page_end=1,
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator.build_chunks = lambda _document: [chunk]  # type: ignore[method-assign]
+    translator._translate_chunk = lambda *args, **kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("deterministic structural translation should not invoke the model")
+    )
+
+    translated_document, _ = translator.translate_document(document, "")
+
+    assert translated_document.blocks[0].text == "References"
+    assert translated_document.translation_chunks[0].translated_text == "References"
+
+
+def test_unchanged_contact_block_gets_targeted_translation_retry() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = (
+        "Dra. Isabel Esteva de Antonio\n"
+        "Servicio de Endocrinología y Nutrición\n"
+        "Hospital Civil, 29009 Málaga (España)\n"
+        "E-mail: soriguer@arrakis.es"
+    )
+    contexts: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (source_language, force_max_tokens)
+        contexts.append(context)
+        if "professional postal/contact block" in context:
+            return (
+                "Dr. Isabel Esteva de Antonio\n"
+                "Department of Endocrinology and Nutrition\n"
+                "Civil Hospital, 29009 Málaga (Spain)\n"
+                "Email: soriguer@arrakis.es"
+            )
+        return text
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated = translator._translate_chunk_with_validation(
+        source,
+        "Author contact",
+        "es",
+        BlockType.PARAGRAPH,
+        source_language_authoritative=True,
+    )
+
+    assert "Department of Endocrinology and Nutrition" in translated
+    assert "soriguer@arrakis.es" in translated
+    assert len(contexts) == 3
+    assert "professional postal/contact block" in contexts[-1]
+
+
+def test_repeatedly_unchanged_spanish_contact_block_uses_deterministic_fallback() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = (
+        "Dra. Isabel Esteva de Antonio Servicio de Endocrinología y Nutrición "
+        "Hospital Civil (Pab. C – Complejo Hospitalario Carlos Haya) Plaza del "
+        "Hospital Civil S/N 29009 Málaga (España) E-mail: soriguer@arrakis.es"
+    )
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        return text
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated = translator._translate_chunk_with_validation(
+        source,
+        "Dirección del autor",
+        "es",
+        BlockType.PARAGRAPH,
+        source_language_authoritative=True,
+    )
+
+    assert "Dr. Isabel Esteva de Antonio" in translated
+    assert "Department of Endocrinology and Nutrition" in translated
+    assert "Pavilion C" in translated
+    assert "Hospital Complex Carlos Haya" in translated
+    assert "Málaga (Spain)" in translated
+    assert "Plaza del Hospital Civil S/N" in translated
+    assert "soriguer@arrakis.es" in translated
+    assert len(calls) == 3
 
 
 def test_translation_validation_rejects_invented_paragraph_heading() -> None:
@@ -912,13 +1323,9 @@ def test_table_markup_validation_detects_truncation() -> None:
 
 def test_table_markup_validation_preserves_each_row_width() -> None:
     translator = MlxTranslator(TranslationSettings())
-    source = (
-        "<table><tr><th>A</th><th>B</th></tr>"
-        "<tr><td>C</td><td>D</td></tr></table>"
-    )
+    source = "<table><tr><th>A</th><th>B</th></tr><tr><td>C</td><td>D</td></tr></table>"
     redistributed = (
-        "<table><tr><th>Alpha</th><th>Beta</th><td>Extra</td></tr>"
-        "<tr><td>Delta</td></tr></table>"
+        "<table><tr><th>Alpha</th><th>Beta</th><td>Extra</td></tr><tr><td>Delta</td></tr></table>"
     )
 
     assert translator._is_valid_table_markup_translation(source, redistributed) is False
@@ -985,9 +1392,7 @@ def test_table_markup_validation_preserves_all_layout_attributes() -> None:
     dropped_cell_class = reordered_attributes.replace(' class="key measure"', "")
     changed_cell_style = reordered_attributes.replace("text-align:left", "text-align:center")
 
-    assert (
-        translator._is_valid_table_markup_translation(source, reordered_attributes) is True
-    )
+    assert translator._is_valid_table_markup_translation(source, reordered_attributes) is True
     assert translator._is_valid_table_markup_translation(source, dropped_table_class) is False
     assert translator._is_valid_table_markup_translation(source, changed_section_style) is False
     assert translator._is_valid_table_markup_translation(source, changed_row_alignment) is False
@@ -1073,7 +1478,7 @@ def test_table_row_group_fallback_preserves_sections_and_translates_every_row() 
     source = (
         '<table class="clinical"><thead data-kind="labels">'
         "<tr><th>Tratamiento hormonal continuo</th><th>Edad media pacientes</th></tr>"
-        "</thead><tbody class=\"records\">"
+        '</thead><tbody class="records">'
         "<tr><td>Grupo de control</td><td>Seguimiento clínico continuado</td></tr>"
         "<tr><td>Grupo de tratamiento</td><td>Respuesta clínica favorable</td></tr>"
         "</tbody><tfoot>"
@@ -1278,8 +1683,7 @@ def test_short_non_english_table_labels_trigger_retry() -> None:
         "<tr><td>12</td><td>18</td></tr></table>"
     )
     target = (
-        "<table><tr><th>Treatment</th><th>Mean age</th></tr>"
-        "<tr><td>12</td><td>18</td></tr></table>"
+        "<table><tr><th>Treatment</th><th>Mean age</th></tr><tr><td>12</td><td>18</td></tr></table>"
     )
     translator = MlxTranslator(TranslationSettings())
     calls: list[str] = []
@@ -1303,10 +1707,7 @@ def test_short_non_english_table_labels_trigger_retry() -> None:
 
 
 def test_numeric_and_abbreviation_only_table_may_remain_unchanged() -> None:
-    source = (
-        "<table><tr><th>TMF</th><th>TFM</th></tr>"
-        "<tr><td>12</td><td>18</td></tr></table>"
-    )
+    source = "<table><tr><th>TMF</th><th>TFM</th></tr><tr><td>12</td><td>18</td></tr></table>"
 
     assert (
         MlxTranslator(TranslationSettings())._is_acceptable_table_translation(
@@ -2030,9 +2431,7 @@ def test_grouped_translation_cannot_collapse_a_substantive_region_to_punctuation
         "Andere machten in ihren Schilderungen wiederum deutlich, vorherige "
         "Zielvorstellungen im Rah-"
     )
-    second_text = (
-        "men der Therapie nicht oder nur in unbefriedigendem Ausmaß erreicht zu haben."
-    )
+    second_text = "men der Therapie nicht oder nur in unbefriedigendem Ausmaß erreicht zu haben."
     first = Block(
         id="/page/2/Text/12",
         page_number=3,
@@ -2107,7 +2506,7 @@ def test_grouped_translation_cannot_collapse_a_substantive_region_to_punctuation
 
     translated_doc, _ = translator.translate_document(document, "")
 
-    assert len(calls) == 3
+    assert calls == [logical_source]
     first_target = translated_doc.blocks[0].text
     second_target = translated_doc.blocks[1].text
     assert len(first_target.split()) >= 8
@@ -2119,6 +2518,74 @@ def test_grouped_translation_cannot_collapse_a_substantive_region_to_punctuation
     assert translated_doc.blocks[1].metadata["translation_placement_index"] == 1
     readable_markdown = MarkdownBuilder().build(translated_doc)
     assert logical_target in readable_markdown
+
+
+def test_cross_column_sentence_continuation_is_translated_once_without_duplication() -> None:
+    first_text = (
+        "No ha sido excluido ningún paciente del tratamiento triádico salvo un caso "
+        "que está en actitud expectante"
+    )
+    second_text = "por dependencia del alcohol."
+    first = _block("left-bottom", first_text, 700, 745, x0=40).model_copy(
+        update={"reading_order_index": 0}
+    )
+    second = _block("right-top", second_text, 50, 75, x0=330).model_copy(
+        update={"reading_order_index": 1}
+    )
+    logical_source = f"{first_text} {second_text}"
+    logical_target = (
+        "No patient was excluded from the triadic treatment except for one case "
+        "awaiting treatment because of alcohol dependence."
+    )
+    document = DocumentModel(
+        metadata=DocumentMetadata(
+            filename="scan.pdf",
+            page_count=1,
+            detected_language="es",
+            translation={"ocr_logical_chunks_prepared": True},
+        ),
+        pages=[],
+        blocks=[first, second],
+        translation_chunks=[
+            TranslationChunk(
+                id="p0001-c001",
+                block_ids=[first.id, second.id],
+                source_text=logical_source,
+                source_language="es",
+                page_start=1,
+                page_end=1,
+            )
+        ],
+    )
+    translator = MlxTranslator(TranslationSettings())
+    translator._ensure_loaded = lambda: True  # type: ignore[method-assign]
+    translator._is_already_english = lambda _chunk: False  # type: ignore[method-assign]
+    calls: list[str] = []
+
+    def fake_translate(
+        text: str,
+        context: str = "",
+        source_language: str | None = None,
+        force_max_tokens: int | None = None,
+    ) -> str:
+        _ = (context, source_language, force_max_tokens)
+        calls.append(text)
+        assert text == logical_source
+        return logical_target
+
+    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+
+    translated_doc, _ = translator.translate_document(document, "")
+
+    targets = [block.text for block in translated_doc.blocks]
+    assert calls == [logical_source]
+    assert " ".join(" ".join(targets).split()) == logical_target
+    assert " ".join(targets).count("alcohol dependence") == 1
+    assert len(targets[1].split()) == 1
+    assert targets[1] == "dependence."
+    assert all(
+        block.metadata["translation_placement_count"] == 2 for block in translated_doc.blocks
+    )
 
 
 def test_collapsed_adjacent_paragraphs_fall_back_without_redistribution() -> None:
@@ -2181,12 +2648,8 @@ def test_collapsed_adjacent_paragraphs_fall_back_without_redistribution() -> Non
     assert f"{first_text} {second_text}" not in calls
     assert "not proven to be one paragraph" in contexts[0]
     assert "Do not shift wording or meaning" in contexts[1]
-    assert translated_doc.blocks[0].text == (
-        "The therapeutic goal was not reached satisfactorily."
-    )
-    assert translated_doc.blocks[1].text == (
-        "This finding requires further clinical assessment."
-    )
+    assert translated_doc.blocks[0].text == ("The therapeutic goal was not reached satisfactorily.")
+    assert translated_doc.blocks[1].text == ("This finding requires further clinical assessment.")
 
 
 def test_continuous_redistribution_aligns_asymmetric_sentence_expansion() -> None:
@@ -2213,6 +2676,7 @@ def test_continuous_redistribution_aligns_asymmetric_sentence_expansion() -> Non
         logical_target,
         segments,
         "de",
+        {},
         continuity_proven=True,
     )
 
@@ -2241,6 +2705,7 @@ def test_continuous_redistribution_does_not_gate_on_number_order_or_count() -> N
             target,
             segments,
             "de",
+            {},
             continuity_proven=True,
         )
         assert redistributed is not None
@@ -2259,6 +2724,7 @@ def test_continuous_redistribution_allows_natural_numeric_reordering() -> None:
         target,
         numeric_segments,
         "de",
+        {},
         continuity_proven=True,
     )
     assert redistributed is not None
@@ -2278,6 +2744,7 @@ def test_continuous_redistribution_requires_explicit_continuity_proof() -> None:
             "First independent paragraph. Second independent paragraph.",
             segments,
             "es",
+            {},
             continuity_proven=False,
         )
         is None
@@ -2317,7 +2784,7 @@ def test_tagged_segments_validate_the_complete_passage_language() -> None:
 
     translated_doc, _ = translator.translate_document(document, "")
 
-    assert len(calls) == 6
+    assert len(calls) == 8
     assert translated_doc.blocks[0].text == first_text
     assert translated_doc.blocks[1].text == second_text
     assert [chunk.status for chunk in translated_doc.translation_chunks] == [
@@ -2340,6 +2807,44 @@ def test_translation_prompt_includes_context_and_source_language() -> None:
     assert "SOURCE LANGUAGE: es" in prompt
     assert "Use the prior section's terminology." in prompt
     assert "TEXT:\nTexto que traducir." in prompt
+
+
+def test_translation_prompt_preserves_source_acronyms_without_expanding_them() -> None:
+    prompt = MlxTranslator(TranslationSettings())._build_prompt(
+        "Dos casos de TMF continuaron el tratamiento.",
+        "",
+        "es",
+    )
+
+    assert "Preserve source acronyms" in prompt
+    assert "never expand or reinterpret them" in prompt
+
+
+def test_compact_table_prompt_does_not_abbreviate_spelled_out_source_terms() -> None:
+    guidance = MlxTranslator._COMPACT_TABLE_TRANSLATION_GUIDANCE
+
+    assert "Never abbreviate or truncate an ordinary source word" in guidance
+    assert "spell out its English translation" in guidance
+
+
+def test_common_spanish_follow_up_table_label_is_repaired_by_cell_position() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    source = '<table><tr><td class="phase">Seguimiento / 3 meses</td><td>12</td></tr></table>'
+    model_output = '<table><tr><td class="phase">Fol / 3 months</td><td>12</td></tr></table>'
+    translator._translate_chunk = (  # type: ignore[method-assign]
+        lambda text, context="", source_language=None, force_max_tokens=None: model_output
+    )
+
+    translated = translator._translate_table_markup_chunk(
+        source,
+        "",
+        "es",
+    )
+
+    assert "Follow-up / 3 months" in translated
+    assert "Fol / 3 months" not in translated
+    assert 'class="phase"' in translated
+    assert translator._is_acceptable_table_translation(source, translated, "es") is True
 
 
 def test_qwen_markdown_parser_preserves_header_and_footer_text() -> None:
