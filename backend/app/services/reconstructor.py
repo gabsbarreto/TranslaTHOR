@@ -3,11 +3,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-import markdown
+import markdown  # type: ignore[import-untyped]
 
 
 class Reconstructor:
-    def markdown_to_html(self, markdown_text: str, title: str | None = None, output_mode: str = "readable") -> str:
+    def markdown_to_html(
+        self, markdown_text: str, title: str | None = None, output_mode: str = "readable"
+    ) -> str:
         body_html = markdown.markdown(
             markdown_text,
             extensions=["tables", "fenced_code", "md_in_html"],
@@ -68,10 +70,13 @@ class Reconstructor:
 
     def html_to_pdf(self, html_text: str, pdf_path: Path) -> None:
         self._configure_macos_homebrew_libs()
-        from weasyprint import CSS, HTML
+        from weasyprint import CSS, HTML  # type: ignore[import-untyped]
 
         pdf_path.parent.mkdir(parents=True, exist_ok=True)
-        HTML(string=html_text).write_pdf(str(pdf_path), stylesheets=[CSS(string="")])
+        HTML(string=html_text, base_url=pdf_path.parent.resolve().as_uri()).write_pdf(
+            str(pdf_path),
+            stylesheets=[CSS(string="")],
+        )
 
     def _configure_macos_homebrew_libs(self) -> None:
         homebrew_lib = Path("/opt/homebrew/lib")

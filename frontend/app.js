@@ -90,6 +90,7 @@ function appendTranslationFormFields(form) {
   form.append("repetition_penalty", String(DEFAULT_LLM_REPETITION_PENALTY));
   form.append("output_mode", "readable");
   form.append("extraction_mode", getInputValue("extractionMode", "auto"));
+  form.append("ocr_engine", getInputValue("ocrEngine", "surya2_llamacpp"));
   form.append("use_local_vlm_repair", checkboxValue("useLocalVlmRepair"));
   form.append("keep_debug_artifacts", checkboxValue("keepDebugArtifacts"));
 }

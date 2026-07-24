@@ -34,14 +34,25 @@ class PageRenderer:
             return out_path
 
         pdf = pdfium.PdfDocument(str(pdf_path))
-        page = pdf[page_number - 1]
-        scale = dpi / 72
-        if profiler is not None:
-            with profiler.step(f"{stage_prefix}_pdf_to_bitmap", page=page_number):
-                bitmap = page.render(scale=scale)
-        else:
-            bitmap = page.render(scale=scale)
-        pil_image: Image.Image = bitmap.to_pil()
+        try:
+            page = pdf[page_number - 1]
+            try:
+                scale = dpi / 72
+                if profiler is not None:
+                    with profiler.step(f"{stage_prefix}_pdf_to_bitmap", page=page_number):
+                        bitmap = page.render(scale=scale)
+                else:
+                    bitmap = page.render(scale=scale)
+                try:
+                    # Detach the PIL image before releasing pdfium resources so
+                    # repeated OCR jobs do not retain PDF page handles.
+                    pil_image: Image.Image = bitmap.to_pil().copy()
+                finally:
+                    bitmap.close()
+            finally:
+                page.close()
+        finally:
+            pdf.close()
 
         if grayscale:
             pil_image = ImageOps.grayscale(pil_image)

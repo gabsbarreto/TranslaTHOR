@@ -1,8 +1,10 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.venv-surya2/
 .env.local
 workspace/jobs/
 workspace/ocr_region_debug/
+workspace/benchmarks/
 *.pyc
 .DS_Store

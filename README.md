@@ -7,7 +7,8 @@ This browser-based app translates PDFs locally.
 1. The user uploads one or more PDFs.
 2. The backend classifies each document as `digital_good_text`, `scanned_no_text`, `bad_hidden_ocr`, `mixed`, or `unknown`.
 3. Marker extracts documents with usable embedded text.
-4. Surya detects layout boxes for bad scans and Qwen OCR reads the full annotated page images.
+4. The selected OCR engine handles poor scans: experimental Surya 2 through
+   `llama.cpp`, legacy Surya + Qwen through `mlx-vlm`, or legacy Surya + Marker.
 5. Qwen full-page OCR reads rendered page images directly when Marker needs an uncertain-document OCR fallback.
 6. Surya OCR regions are cleaned and merged into traceable logical translation chunks.
 7. Extracted text is normalized into a shared structured document model.
@@ -75,6 +76,21 @@ python -m venv .venv-marker
 .venv-marker/bin/python -m pip install "marker-pdf==1.10.2" "transformers<5" "regex<2025"
 ```
 
+Install the isolated Surya 2 runtime and its officially supported Apple
+Silicon backend:
+
+```bash
+bash scripts/setup_surya2_runtime.sh
+```
+
+The script installs the fully resolved `requirements-surya2.lock.txt`. The
+shorter `requirements-surya2.txt` records the intentionally selected top-level
+compatibility set.
+
+This pins `surya-ocr==0.22.1` and sets
+`SURYA_INFERENCE_BACKEND=llamacpp`. The app reuses one Surya inference
+manager/server across pages and queued jobs.
+
 Inspect Surya layout boxes for rendered OCR pages:
 
 ```bash
@@ -102,6 +118,18 @@ Open `http://127.0.0.1:8000`.
 - `QWEN_OCR_MODEL`: Qwen OCR model identifier.
 - `QWEN_OCR_PROMPT`: OCR transcription prompt.
 - `SURYA_LAYOUT_PYTHON`: Python executable containing Surya; defaults to `.venv-marker/bin/python`.
+- `OCR_ENGINE`: `surya2_llamacpp` (branch default), `surya_qwen_mlx`, or `marker_surya`.
+- `SURYA2_PYTHON`: isolated Surya 2 Python; defaults to `.venv-surya2/bin/python`.
+- `SURYA2_DPI`: render DPI; defaults to `192`.
+- `SURYA2_STRATEGY`: `full_page` (default) or `layout_then_block`.
+- `SURYA_INFERENCE_BACKEND`: must be `llamacpp` for the experimental engine.
+- The worker forces `SURYA_GUIDED_LAYOUT=false` for compatibility with the
+  tested llama.cpp 10090 grammar parser.
 - `MARKER_BIN`: Marker executable path.
 - `ENABLE_QWEN_OCR_FALLBACK`: Enable full-page Qwen OCR fallback.
 - `ENABLE_LOCAL_VLM_REPAIR`: Enable Marker block repair through the optional local VLM endpoint.
+
+See [OCR architecture](docs/architecture.md) and
+[benchmarking](docs/benchmarking.md) for schema, coordinate, lifecycle, and
+reproduction details. The measured experiment and recommendation are in the
+[Surya 2 benchmark report](docs/surya2-benchmark-report.md).

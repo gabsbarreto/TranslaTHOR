@@ -10,6 +10,8 @@ fi
 
 export PYTHONPATH=backend
 export PATH="$(pwd)/.venv/bin:/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
+export SURYA_INFERENCE_BACKEND=llamacpp
+export SURYA2_PYTHON="${SURYA2_PYTHON:-$(pwd)/.venv-surya2/bin/python}"
 if [[ -d /opt/homebrew/lib ]]; then
   export DYLD_FALLBACK_LIBRARY_PATH="/opt/homebrew/lib:${DYLD_FALLBACK_LIBRARY_PATH:-}"
 fi

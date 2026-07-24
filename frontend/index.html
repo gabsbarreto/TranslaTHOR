@@ -10,7 +10,7 @@
     <main class="app-shell">
       <section class="panel upload-panel">
         <h1>PDF Translation Workbench</h1>
-        <p class="sub">Upload a PDF to automatically extract with Marker and translate with the local Qwen model.</p>
+        <p class="sub">Upload a PDF, select an OCR engine, and translate with the local Qwen model.</p>
 
         <div id="dropzone" class="dropzone">
           <input id="fileInput" type="file" accept="application/pdf" multiple hidden />
@@ -19,6 +19,13 @@
         </div>
 
         <div class="settings-grid">
+          <label>OCR Engine
+            <select id="ocrEngine">
+              <option value="surya2_llamacpp" selected>Surya 2 + llama.cpp (experimental)</option>
+              <option value="surya_qwen_mlx">Surya + Qwen (mlx-vlm)</option>
+              <option value="marker_surya">Surya + Marker</option>
+            </select>
+          </label>
           <label>Extraction Mode
             <select id="extractionMode">
               <option value="auto" selected>Auto</option>
@@ -51,7 +58,7 @@
         <ol id="workflowSteps" class="workflow-steps">
           <li data-step="upload">Upload</li>
           <li data-step="select">Detect PDF type</li>
-          <li data-step="ocr">Marker extraction</li>
+          <li data-step="ocr">OCR / document structure</li>
           <li data-step="translate">Translate</li>
           <li data-step="export">Export</li>
         </ol>
@@ -71,6 +78,6 @@
       </section>
     </main>
 
-    <script src="/app.js?v=20260602-lean" defer></script>
+    <script src="/app.js?v=20260724-surya2" defer></script>
   </body>
 </html>

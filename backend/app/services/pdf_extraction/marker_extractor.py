@@ -57,6 +57,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
         on_process_finished: Callable[[subprocess.Popen], None] | None = None,
         on_detection_complete: Callable[[PDFTypeDetectionResult, MarkerMode], None] | None = None,
+        marker_config: dict | None = None,
     ) -> PDFExtractionResult:
         started = time.perf_counter()
         mode = self._normalize_mode(mode)
@@ -83,11 +84,7 @@ class PDFExtractor:
             if job_dir is None or not keep_debug_artifacts
             else None
         )
-        output_root = (
-            Path(temp_context.name)
-            if temp_context is not None
-            else (job_dir / "marker")
-        )
+        output_root = Path(temp_context.name) if temp_context is not None else (job_dir / "marker")
         output_root.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -104,12 +101,14 @@ class PDFExtractor:
                 on_process_started=on_process_started,
                 on_process_finished=on_process_finished,
                 warnings=warnings,
+                marker_config=marker_config,
             )
             used_force_ocr = marker_mode in {"force_ocr", "strip_existing_ocr_force_ocr"}
             stripped_existing_ocr = marker_mode == "strip_existing_ocr_force_ocr"
             used_ocr = used_force_ocr or (
                 marker_mode == "normal"
-                and detection.classification in {"scanned_no_text", "bad_hidden_ocr", "mixed", "unknown"}
+                and detection.classification
+                in {"scanned_no_text", "bad_hidden_ocr", "mixed", "unknown"}
             )
             parser_metadata = {
                 "pdf_classification": detection.classification,
@@ -144,14 +143,20 @@ class PDFExtractor:
             repaired_count = 0
             if use_local_vlm_repair:
                 logger.info("Local VLM repair enabled: true")
-                debug_dir = (job_dir / "artifacts" / "debug") if keep_debug_artifacts and job_dir is not None else None
+                debug_dir = (
+                    (job_dir / "artifacts" / "debug")
+                    if keep_debug_artifacts and job_dir is not None
+                    else None
+                )
                 repair_context = {
                     "pdf_classification": detection.classification,
                     "marker_mode": marker_mode,
                     "marker_requested_mode": requested_marker_mode,
                     "detected_language": document.metadata.detected_language,
                     "suspicious_hidden_ocr": bool(detection.metadata.get("suspicious_hidden_ocr")),
-                    "marker_fallback_to_normal": bool(marker_retry_metadata.get("marker_fallback_to_normal")),
+                    "marker_fallback_to_normal": bool(
+                        marker_retry_metadata.get("marker_fallback_to_normal")
+                    ),
                 }
                 repaired_count, repair_warnings = self.local_vlm_service.repair_blocks(
                     document.blocks,
@@ -232,6 +237,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None,
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         env_overrides: dict[str, str] | None = None,
+        marker_config: dict | None = None,
     ):
         marker_bin = os.getenv("MARKER_BIN") or self._default_marker_bin()
         cmd = [
@@ -250,6 +256,14 @@ class PDFExtractor:
             cmd.append("--disable_ocr")
         if keep_debug_artifacts:
             cmd.append("--debug")
+        if marker_config:
+            config_path = output_dir / "translathor_marker_config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps(marker_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            cmd.extend(["--config_json", str(config_path)])
 
         env = os.environ.copy()
         if env_overrides:
@@ -277,7 +291,9 @@ class PDFExtractor:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         stdout, stderr = process.communicate()
-                    raise RuntimeError(f"Marker timed out after {timeout} seconds: {stderr[-2000:] or stdout[-2000:]}")
+                    raise RuntimeError(
+                        f"Marker timed out after {timeout} seconds: {stderr[-2000:] or stdout[-2000:]}"
+                    )
                 time.sleep(0.2)
             stdout, stderr = process.communicate(timeout=1)
         except subprocess.TimeoutExpired:
@@ -296,7 +312,9 @@ class PDFExtractor:
         payload_path = self._find_marker_payload(output_dir, output_format)
         if payload_path is None:
             self._write_marker_failure(output_dir, cmd, process.returncode or 0, stdout, stderr)
-            raise RuntimeError(f"Marker completed but no {output_format} output was found in {output_dir}")
+            raise RuntimeError(
+                f"Marker completed but no {output_format} output was found in {output_dir}"
+            )
         return json.loads(payload_path.read_text(encoding="utf-8"))
 
     def _run_marker_with_recovery(
@@ -314,6 +332,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None,
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         warnings: list[str],
+        marker_config: dict | None,
     ):
         retry_metadata = {
             "marker_retried_on_cpu": False,
@@ -331,6 +350,7 @@ class PDFExtractor:
                     cancel_requested=cancel_requested,
                     on_process_started=on_process_started,
                     on_process_finished=on_process_finished,
+                    marker_config=marker_config,
                 ),
                 marker_mode,
                 retry_metadata,
@@ -355,14 +375,21 @@ class PDFExtractor:
                         on_process_started=on_process_started,
                         on_process_finished=on_process_finished,
                         env_overrides={"TORCH_DEVICE": "cpu", "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+                        marker_config=marker_config,
                     )
                     retry_metadata["marker_retried_on_cpu"] = True
                     return payload, marker_mode, retry_metadata
                 except MarkerExecutionError as cpu_exc:
-                    warnings.append(f"Marker CPU OCR retry also failed: {self._short_error(cpu_exc)}")
+                    warnings.append(
+                        f"Marker CPU OCR retry also failed: {self._short_error(cpu_exc)}"
+                    )
                     exc = cpu_exc
 
-            if classification == "bad_hidden_ocr" and mode in {"auto", "auto_repair", "strip_and_force_ocr"}:
+            if classification == "bad_hidden_ocr" and mode in {
+                "auto",
+                "auto_repair",
+                "strip_and_force_ocr",
+            }:
                 warnings.append(
                     "Falling back to Marker normal mode using the existing hidden OCR layer because forced OCR failed. "
                     "Extraction can continue, but OCR quality may need local LLM repair."
@@ -378,6 +405,7 @@ class PDFExtractor:
                     cancel_requested=cancel_requested,
                     on_process_started=on_process_started,
                     on_process_finished=on_process_finished,
+                    marker_config=marker_config,
                 )
                 retry_metadata["marker_fallback_to_normal"] = True
                 return payload, "normal", retry_metadata
@@ -393,12 +421,29 @@ class PDFExtractor:
 
     def _find_marker_payload(self, output_dir: Path, output_format: str) -> Path | None:
         suffix = ".json" if output_format in {"json", "chunks"} else ".md"
-        candidates = sorted(output_dir.rglob(f"*{suffix}"), key=lambda path: (len(path.parts), path.name))
+        candidates = sorted(
+            output_dir.rglob(f"*{suffix}"), key=lambda path: (len(path.parts), path.name)
+        )
         if output_format in {"json", "chunks"}:
             candidates = [
-                path for path in candidates
-                if path.name not in {"metadata.json", "debug_data.json"} and "debug" not in path.parts
+                path
+                for path in candidates
+                if path.name not in {"metadata.json", "debug_data.json"}
+                and "debug" not in path.parts
             ] or candidates
+            # Marker debug mode writes blocks.json beside the canonical
+            # Document JSON. Prefer the public document tree instead of
+            # accidentally parsing the internal serialized block objects.
+            for path in candidates:
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                if (
+                    isinstance(payload, dict)
+                    and str(payload.get("block_type", "")).lower() == "document"
+                ):
+                    return path
         return candidates[0] if candidates else None
 
     def _default_marker_bin(self) -> str:
@@ -407,7 +452,9 @@ class PDFExtractor:
             return str(isolated_marker)
         return "marker_single"
 
-    def _write_marker_failure(self, output_dir: Path, cmd: list[str], return_code: int, stdout: str, stderr: str) -> None:
+    def _write_marker_failure(
+        self, output_dir: Path, cmd: list[str], return_code: int, stdout: str, stderr: str
+    ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "cmd": cmd,
@@ -415,4 +462,6 @@ class PDFExtractor:
             "stdout_tail": stdout[-4000:],
             "stderr_tail": stderr[-4000:],
         }
-        (output_dir / "marker_failure.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (output_dir / "marker_failure.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )
