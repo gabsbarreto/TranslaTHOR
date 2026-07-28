@@ -50,3 +50,20 @@ def test_pipeline_does_not_bypass_marker_when_qwen_disabled_or_mode_forced() -> 
         _detection("scanned_no_text"),
         {"extraction_mode": "digital", "qwen_ocr_fallback": True},
     ) is False
+
+
+def test_translation_chunk_progress_is_monotonic() -> None:
+    pipeline = TranslationPipeline(JobStore())
+
+    events = [
+        pipeline._translation_chunk_progress(1, 10, completed=False),
+        pipeline._translation_chunk_progress(1, 10, completed=True),
+        pipeline._translation_chunk_progress(2, 10, completed=False),
+        pipeline._translation_chunk_progress(9, 10, completed=True),
+        pipeline._translation_chunk_progress(10, 10, completed=False),
+        pipeline._translation_chunk_progress(10, 10, completed=True),
+    ]
+
+    assert events == sorted(events)
+    assert events[0] == 0.7
+    assert events[-1] == 0.88

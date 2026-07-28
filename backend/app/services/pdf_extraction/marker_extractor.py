@@ -22,6 +22,7 @@ from app.services.pdf_extraction.models import (
     PDFTypeDetectionResult,
 )
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
+from app.services.pdf_extraction.table_repair import MarkerTableRepairService
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +41,12 @@ class PDFExtractor:
         detector: PDFTypeDetector | None = None,
         document_builder: MarkerDocumentBuilder | None = None,
         local_vlm_service: LocalVLMRepairService | None = None,
+        table_repair_service: MarkerTableRepairService | None = None,
     ) -> None:
         self.detector = detector or PDFTypeDetector()
         self.document_builder = document_builder or MarkerDocumentBuilder()
         self.local_vlm_service = local_vlm_service or LocalVLMRepairService()
+        self.table_repair_service = table_repair_service or MarkerTableRepairService()
 
     def extract(
         self,
@@ -57,6 +60,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None = None,
         on_process_finished: Callable[[subprocess.Popen], None] | None = None,
         on_detection_complete: Callable[[PDFTypeDetectionResult, MarkerMode], None] | None = None,
+        marker_config: dict | None = None,
     ) -> PDFExtractionResult:
         started = time.perf_counter()
         mode = self._normalize_mode(mode)
@@ -83,11 +87,7 @@ class PDFExtractor:
             if job_dir is None or not keep_debug_artifacts
             else None
         )
-        output_root = (
-            Path(temp_context.name)
-            if temp_context is not None
-            else (job_dir / "marker")
-        )
+        output_root = Path(temp_context.name) if temp_context is not None else (job_dir / "marker")
         output_root.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -104,12 +104,14 @@ class PDFExtractor:
                 on_process_started=on_process_started,
                 on_process_finished=on_process_finished,
                 warnings=warnings,
+                marker_config=marker_config,
             )
             used_force_ocr = marker_mode in {"force_ocr", "strip_existing_ocr_force_ocr"}
             stripped_existing_ocr = marker_mode == "strip_existing_ocr_force_ocr"
             used_ocr = used_force_ocr or (
                 marker_mode == "normal"
-                and detection.classification in {"scanned_no_text", "bad_hidden_ocr", "mixed", "unknown"}
+                and detection.classification
+                in {"scanned_no_text", "bad_hidden_ocr", "mixed", "unknown"}
             )
             parser_metadata = {
                 "pdf_classification": detection.classification,
@@ -141,17 +143,32 @@ class PDFExtractor:
                 warnings=warnings,
             )
 
+            table_repair = self.table_repair_service.repair(pdf_path, document)
+            warnings.extend(table_repair.warnings)
+            parser_metadata["table_repair"] = table_repair.as_metadata()
+            document.metadata.translation["table_repair"] = table_repair.as_metadata()
+            document.warnings = list(warnings)
+            if table_repair.repaired_count:
+                markdown = AppMarkdownBuilder().build(document)
+                chunks = self.document_builder.chunks_from_blocks(document.blocks)
+
             repaired_count = 0
             if use_local_vlm_repair:
                 logger.info("Local VLM repair enabled: true")
-                debug_dir = (job_dir / "artifacts" / "debug") if keep_debug_artifacts and job_dir is not None else None
+                debug_dir = (
+                    (job_dir / "artifacts" / "debug")
+                    if keep_debug_artifacts and job_dir is not None
+                    else None
+                )
                 repair_context = {
                     "pdf_classification": detection.classification,
                     "marker_mode": marker_mode,
                     "marker_requested_mode": requested_marker_mode,
                     "detected_language": document.metadata.detected_language,
                     "suspicious_hidden_ocr": bool(detection.metadata.get("suspicious_hidden_ocr")),
-                    "marker_fallback_to_normal": bool(marker_retry_metadata.get("marker_fallback_to_normal")),
+                    "marker_fallback_to_normal": bool(
+                        marker_retry_metadata.get("marker_fallback_to_normal")
+                    ),
                 }
                 repaired_count, repair_warnings = self.local_vlm_service.repair_blocks(
                     document.blocks,
@@ -232,6 +249,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None,
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         env_overrides: dict[str, str] | None = None,
+        marker_config: dict | None = None,
     ):
         marker_bin = os.getenv("MARKER_BIN") or self._default_marker_bin()
         cmd = [
@@ -250,6 +268,14 @@ class PDFExtractor:
             cmd.append("--disable_ocr")
         if keep_debug_artifacts:
             cmd.append("--debug")
+        if marker_config:
+            config_path = output_dir / "translathor_marker_config.json"
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(
+                json.dumps(marker_config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            cmd.extend(["--config_json", str(config_path)])
 
         env = os.environ.copy()
         if env_overrides:
@@ -277,7 +303,9 @@ class PDFExtractor:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         stdout, stderr = process.communicate()
-                    raise RuntimeError(f"Marker timed out after {timeout} seconds: {stderr[-2000:] or stdout[-2000:]}")
+                    raise RuntimeError(
+                        f"Marker timed out after {timeout} seconds: {stderr[-2000:] or stdout[-2000:]}"
+                    )
                 time.sleep(0.2)
             stdout, stderr = process.communicate(timeout=1)
         except subprocess.TimeoutExpired:
@@ -293,10 +321,16 @@ class PDFExtractor:
             message = f"Marker failed with exit code {process.returncode}: {stderr[-4000:] or stdout[-4000:]}"
             raise MarkerExecutionError(message, process.returncode, stdout, stderr)
 
-        payload_path = self._find_marker_payload(output_dir, output_format)
+        payload_path = self._find_marker_payload(
+            output_dir,
+            output_format,
+            source_stem=pdf_path.stem,
+        )
         if payload_path is None:
             self._write_marker_failure(output_dir, cmd, process.returncode or 0, stdout, stderr)
-            raise RuntimeError(f"Marker completed but no {output_format} output was found in {output_dir}")
+            raise RuntimeError(
+                f"Marker completed but no {output_format} output was found in {output_dir}"
+            )
         return json.loads(payload_path.read_text(encoding="utf-8"))
 
     def _run_marker_with_recovery(
@@ -314,6 +348,7 @@ class PDFExtractor:
         on_process_started: Callable[[subprocess.Popen], None] | None,
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         warnings: list[str],
+        marker_config: dict | None,
     ):
         retry_metadata = {
             "marker_retried_on_cpu": False,
@@ -331,6 +366,7 @@ class PDFExtractor:
                     cancel_requested=cancel_requested,
                     on_process_started=on_process_started,
                     on_process_finished=on_process_finished,
+                    marker_config=marker_config,
                 ),
                 marker_mode,
                 retry_metadata,
@@ -355,14 +391,21 @@ class PDFExtractor:
                         on_process_started=on_process_started,
                         on_process_finished=on_process_finished,
                         env_overrides={"TORCH_DEVICE": "cpu", "PYTORCH_ENABLE_MPS_FALLBACK": "1"},
+                        marker_config=marker_config,
                     )
                     retry_metadata["marker_retried_on_cpu"] = True
                     return payload, marker_mode, retry_metadata
                 except MarkerExecutionError as cpu_exc:
-                    warnings.append(f"Marker CPU OCR retry also failed: {self._short_error(cpu_exc)}")
+                    warnings.append(
+                        f"Marker CPU OCR retry also failed: {self._short_error(cpu_exc)}"
+                    )
                     exc = cpu_exc
 
-            if classification == "bad_hidden_ocr" and mode in {"auto", "auto_repair", "strip_and_force_ocr"}:
+            if classification == "bad_hidden_ocr" and mode in {
+                "auto",
+                "auto_repair",
+                "strip_and_force_ocr",
+            }:
                 warnings.append(
                     "Falling back to Marker normal mode using the existing hidden OCR layer because forced OCR failed. "
                     "Extraction can continue, but OCR quality may need local LLM repair."
@@ -378,6 +421,7 @@ class PDFExtractor:
                     cancel_requested=cancel_requested,
                     on_process_started=on_process_started,
                     on_process_finished=on_process_finished,
+                    marker_config=marker_config,
                 )
                 retry_metadata["marker_fallback_to_normal"] = True
                 return payload, "normal", retry_metadata
@@ -391,15 +435,76 @@ class PDFExtractor:
         detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()
         return detail[-1][-500:] if detail else str(exc)[-500:]
 
-    def _find_marker_payload(self, output_dir: Path, output_format: str) -> Path | None:
+    def _find_marker_payload(
+        self,
+        output_dir: Path,
+        output_format: str,
+        *,
+        source_stem: str | None = None,
+    ) -> Path | None:
         suffix = ".json" if output_format in {"json", "chunks"} else ".md"
-        candidates = sorted(output_dir.rglob(f"*{suffix}"), key=lambda path: (len(path.parts), path.name))
-        if output_format in {"json", "chunks"}:
+        candidates = sorted(
+            output_dir.rglob(f"*{suffix}"),
+            key=lambda path: (len(path.parts), path.name),
+        )
+        if output_format == "json":
             candidates = [
-                path for path in candidates
-                if path.name not in {"metadata.json", "debug_data.json"} and "debug" not in path.parts
-            ] or candidates
+                path
+                for path in candidates
+                if path.name
+                not in {
+                    "blocks.json",
+                    "metadata.json",
+                    "debug_data.json",
+                }
+                and not path.name.endswith("_meta.json")
+                and "debug" not in path.parts
+                and self._is_canonical_marker_json(path)
+            ]
+        elif output_format == "chunks":
+            candidates = [
+                path
+                for path in candidates
+                if path.name not in {"blocks.json", "metadata.json", "debug_data.json"}
+                and not path.name.endswith("_meta.json")
+                and "debug" not in path.parts
+            ]
+        if source_stem:
+            exact = [path for path in candidates if path.stem == source_stem]
+            if exact:
+                return exact[0]
         return candidates[0] if candidates else None
+
+    def _is_canonical_marker_json(self, path: Path) -> bool:
+        """Reject Marker's numeric debug graph before it reaches the semantic builder."""
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, TypeError):
+            return False
+
+        def is_page(value: object) -> bool:
+            return bool(
+                isinstance(value, dict)
+                and str(value.get("block_type", "")).casefold() == "page"
+                and isinstance(value.get("children"), list)
+            )
+
+        if isinstance(payload, list):
+            return bool(payload) and all(is_page(item) for item in payload)
+        if not isinstance(payload, dict):
+            return False
+        block_type = str(payload.get("block_type", "")).casefold()
+        if block_type == "page":
+            return is_page(payload)
+        if block_type == "document":
+            children = payload.get("children")
+            return bool(
+                isinstance(children, list)
+                and all(is_page(item) for item in children)
+            )
+        pages = payload.get("pages")
+        return bool(isinstance(pages, list) and pages and all(is_page(item) for item in pages))
 
     def _default_marker_bin(self) -> str:
         isolated_marker = BASE_DIR / ".venv-marker" / "bin" / "marker_single"
@@ -407,7 +512,9 @@ class PDFExtractor:
             return str(isolated_marker)
         return "marker_single"
 
-    def _write_marker_failure(self, output_dir: Path, cmd: list[str], return_code: int, stdout: str, stderr: str) -> None:
+    def _write_marker_failure(
+        self, output_dir: Path, cmd: list[str], return_code: int, stdout: str, stderr: str
+    ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         payload = {
             "cmd": cmd,
@@ -415,4 +522,6 @@ class PDFExtractor:
             "stdout_tail": stdout[-4000:],
             "stderr_tail": stderr[-4000:],
         }
-        (output_dir / "marker_failure.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        (output_dir / "marker_failure.json").write_text(
+            json.dumps(payload, indent=2), encoding="utf-8"
+        )

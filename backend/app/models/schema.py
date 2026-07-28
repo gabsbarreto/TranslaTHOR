@@ -29,6 +29,13 @@ class BlockType(str, Enum):
     UNKNOWN = "unknown"
 
 
+class FigureAssetType(str, Enum):
+    RASTER = "raster"
+    VECTOR = "vector"
+    MIXED = "mixed"
+    UNKNOWN = "unknown"
+
+
 class BoundingBox(BaseModel):
     x0: float
     y0: float
@@ -47,6 +54,11 @@ class Block(BaseModel):
     style_hints: dict[str, Any] = Field(default_factory=dict)
     source_type: SourceType
     language: str | None = None
+    raw_label: str | None = None
+    html: str | None = None
+    polygon: list[list[float]] | None = None
+    skipped: bool = False
+    error: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -65,6 +77,16 @@ class FigureAsset(BaseModel):
     bbox: BoundingBox | None = None
     caption_block_id: str | None = None
     image_path: str | None = None
+    original_width: float | None = None
+    original_height: float | None = None
+    aspect_ratio: float | None = None
+    asset_type: FigureAssetType = FigureAssetType.UNKNOWN
+    vector_path: str | None = None
+    detection_confidence: float | None = None
+    has_internal_text: bool = False
+    source_block_ids: list[str] = Field(default_factory=list)
+    source_region_ids: list[str] = Field(default_factory=list)
+    extraction_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class TableModel(BaseModel):
@@ -74,6 +96,11 @@ class TableModel(BaseModel):
         colspan: int = 1
         bbox: BoundingBox | None = None
         confidence: float | None = None
+        row_index: int | None = None
+        column_index: int | None = None
+        source_id: str | None = None
+        polygon: list[list[float]] = Field(default_factory=list)
+        extraction_metadata: dict[str, Any] = Field(default_factory=dict)
 
     id: str
     page_numbers: list[int]
@@ -83,6 +110,7 @@ class TableModel(BaseModel):
     caption: str | None = None
     notes: str | None = None
     headers: list[str] = Field(default_factory=list)
+    header_cells: list[TableCell] = Field(default_factory=list)
     rows: list[list[str]] = Field(default_factory=list)
     cells: list[list[TableCell]] = Field(default_factory=list)
     continued_from_previous_page: bool = False
@@ -98,6 +126,11 @@ class TranslationChunk(BaseModel):
     translated_text: str = ""
     context: str = ""
     source_language: str | None = None
+    source_language_origin: str | None = None
+    source_language_confidence: float | None = None
+    placement_group_id: str | None = None
+    placement_index: int | None = None
+    placement_count: int | None = None
     source_token_count: int | None = None
     chunk_type: str = "paragraph"
     document_id: str | None = None
@@ -146,15 +179,29 @@ class JobStage(str, Enum):
     FAILED = "failed"
 
 
+class JobQueueState(str, Enum):
+    NONE = "none"
+    QUEUED = "queued"
+    RUNNING = "running"
+
+
 class JobStatus(BaseModel):
     job_id: str
     filename: str
     source_filename: str | None = None
     attempt: int = 0
     created_at: str | None = None
+    queued_at: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    archived_at: str | None = None
     stage: JobStage
     progress: float = 0.0
     message: str = ""
     error: str | None = None
+    queue_state: JobQueueState = JobQueueState.NONE
+    queue_position: int | None = None
+    jobs_ahead: int | None = None
+    settings: dict[str, Any] = Field(default_factory=dict)
     artifacts: dict[str, str] = Field(default_factory=dict)
     translation: dict[str, Any] = Field(default_factory=dict)

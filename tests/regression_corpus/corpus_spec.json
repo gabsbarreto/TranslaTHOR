@@ -1,0 +1,126 @@
+{
+  "schema_version": 2,
+  "description": "Five non-English digital cases and five non-English scan cases.",
+  "render_dpi": 180,
+  "jpeg_quality": 88,
+  "digital_cases": [
+    {
+      "id": "de-digital-qualitative-study",
+      "language": "de",
+      "language_profile": "non_english_body_with_english_abstract",
+      "source_filename": "de-de image.pdf",
+      "source_sha256": "27f733ad4c285f0b6df739489e588ec7b1cbe1e0f80e8d275668fec8f23dac74",
+      "source_pages": [2, 3, 6, 8],
+      "expected_page_count": 4,
+      "expected_classification": "digital_good_text",
+      "minimum_embedded_characters": 19000,
+      "features": ["multi_column", "vector_table", "footnotes"]
+    },
+    {
+      "id": "de-digital-youth-clinic",
+      "language": "de",
+      "language_profile": "non_english_body_with_english_abstract",
+      "source_filename": "de-de image2.pdf",
+      "source_sha256": "8945ba2a6ca49ef3f0fd8b75d721fbd71d037a485bc0fabbd2f12c171e2d1edb",
+      "source_pages": [2, 5, 10, 11, 12, 13],
+      "expected_page_count": 6,
+      "expected_classification": "digital_good_text",
+      "minimum_embedded_characters": 10000,
+      "features": ["long_form", "table", "charts", "digital_text_noise"]
+    },
+    {
+      "id": "es-digital-epidemiology",
+      "language": "es",
+      "language_profile": "non_english_body_with_english_abstract",
+      "source_filename": "es-es image.pdf",
+      "source_sha256": "224fe6a70559a7c0dda000147d0470df7cff54166903ee4924cacd1b277a3824",
+      "source_pages": [2, 5, 6, 7, 8],
+      "expected_page_count": 5,
+      "expected_classification": "digital_good_text",
+      "minimum_embedded_characters": 13000,
+      "features": ["multi_column", "raster_charts", "table", "captions"]
+    },
+    {
+      "id": "fr-digital-gender-psychiatry",
+      "language": "fr",
+      "language_profile": "non_english_body",
+      "source_filename": "fr-fr image.pdf",
+      "source_sha256": "7dab53d7fabaa4c10f5495c6fcd5d553aded42bc0da6b117a03ec0caf226e7c5",
+      "source_pages": [1, 6, 8, 9, 10, 11],
+      "expected_page_count": 6,
+      "expected_classification": "digital_good_text",
+      "minimum_embedded_characters": 8000,
+      "features": ["mixed_page_sizes", "flowchart", "tables", "charts"]
+    },
+    {
+      "id": "pt-digital-anxiety-study",
+      "language": "pt",
+      "language_profile": "non_english_body_with_english_abstract",
+      "source_filename": "pt-br image.pdf",
+      "source_sha256": "b390fac36b80074b1ca7370b106b9d53f69cafec0af750851a08e48230cc9de5",
+      "source_pages": [1, 8, 11, 13, 15, 16],
+      "expected_page_count": 6,
+      "expected_classification": "digital_good_text",
+      "minimum_embedded_characters": 12000,
+      "features": ["single_column", "dense_tables", "repeated_page_furniture"]
+    }
+  ],
+  "scanned_cases": [
+    {
+      "id": "es-hidden-ocr-endocrinology",
+      "language": "es",
+      "language_profile": "non_english_body_with_english_abstract",
+      "build_mode": "copy_hidden_ocr",
+      "source_filename": "es-es scanned.pdf",
+      "source_sha256": "56dac50f1db5cbfc28c6d2f338cc0cc7b23a5e0c14178d29e3ee93e45c912c18",
+      "source_pages": [1, 2, 3, 4, 8],
+      "expected_page_count": 5,
+      "expected_classification": "bad_hidden_ocr",
+      "minimum_embedded_characters": 19000,
+      "features": ["genuine_scan", "multi_column", "boxed_tables", "portrait"]
+    },
+    {
+      "id": "pt-hidden-ocr-clinic",
+      "language": "pt",
+      "language_profile": "non_english_body_with_english_abstract",
+      "build_mode": "copy_hidden_ocr",
+      "source_filename": "pt-bt scanned.pdf",
+      "source_sha256": "3b43b203a74eda7abeb202971e8d2c850ffcd2f1d1837be7c1e9b5b25946615c",
+      "source_pages": [1, 2, 3, 4, 5, 8],
+      "expected_page_count": 6,
+      "expected_classification": "bad_hidden_ocr",
+      "minimum_embedded_characters": 22000,
+      "features": ["genuine_scan", "multi_column", "accent_ocr_noise", "page_decoration"]
+    },
+    {
+      "id": "de-raster-scan-youth-clinic",
+      "language": "de",
+      "language_profile": "non_english_body_with_english_abstract",
+      "build_mode": "rasterize_digital",
+      "derived_from": "de-digital-youth-clinic",
+      "expected_page_count": 6,
+      "expected_classification": "scanned_no_text",
+      "features": ["derived_scan", "table", "charts"]
+    },
+    {
+      "id": "es-raster-scan-epidemiology",
+      "language": "es",
+      "language_profile": "non_english_body_with_english_abstract",
+      "build_mode": "rasterize_digital",
+      "derived_from": "es-digital-epidemiology",
+      "expected_page_count": 5,
+      "expected_classification": "scanned_no_text",
+      "features": ["derived_scan", "multi_column", "raster_charts", "table"]
+    },
+    {
+      "id": "fr-raster-scan-gender-psychiatry",
+      "language": "fr",
+      "language_profile": "non_english_body",
+      "build_mode": "rasterize_digital",
+      "derived_from": "fr-digital-gender-psychiatry",
+      "expected_page_count": 6,
+      "expected_classification": "scanned_no_text",
+      "features": ["derived_scan", "mixed_page_sizes", "flowchart", "tables", "charts"]
+    }
+  ]
+}

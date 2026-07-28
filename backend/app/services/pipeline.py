@@ -25,10 +25,13 @@ from app.config import (
 )
 from app.models.schema import DocumentModel
 from app.models.schema import JobStage
+from app.services.figure_extractor import FigureExtractionService
 from app.services.job_store import JobStore
+from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction import PDFExtractor
-from app.services.pdf_extraction.models import PDFTypeDetectionResult
+from app.services.pdf_extraction.models import MarkerMode, PDFTypeDetectionResult
 from app.services.pdf_extraction.qwen_ocr_fallback import QwenFullPageOCRFallback
+from app.services.pdf_extraction.surya2_extractor import Surya2LlamaCppExtractor
 from app.services.profiler import PipelineProfiler
 from app.services.translation_debug import write_translation_comparison_report
 from app.services.translation_subprocess import run_translation_subprocess
@@ -41,6 +44,8 @@ class TranslationPipeline:
         self.job_store = job_store
         self.pdf_extractor = PDFExtractor()
         self.qwen_ocr_fallback = QwenFullPageOCRFallback()
+        self.figure_extractor = FigureExtractionService()
+        self.surya2_extractor = Surya2LlamaCppExtractor()
         self._lock = threading.RLock()
         self._cancelled_jobs: set[str] = set()
         self._active_processes: dict[str, list[subprocess.Popen]] = {}
@@ -79,9 +84,12 @@ class TranslationPipeline:
         pdf_readable = artifacts_dir / "translated_readable.pdf"
         pdf_faithful = artifacts_dir / "translated_faithful.pdf"
         extraction_mode = str(settings.get("extraction_mode", "auto"))
-        keep_debug_artifacts = bool(settings.get("keep_debug_artifacts", KEEP_EXTRACTION_DEBUG_ARTIFACTS))
+        keep_debug_artifacts = bool(
+            settings.get("keep_debug_artifacts", KEEP_EXTRACTION_DEBUG_ARTIFACTS)
+        )
         translation_metadata = {
             "model": str(settings.get("model", "")),
+            "ocr_engine": str(settings.get("ocr_engine", "surya_qwen_mlx")),
             "temperature": float(settings.get("temperature", DEFAULT_LLM_TEMPERATURE)),
             "top_p": float(settings.get("top_p", DEFAULT_LLM_TOP_P)),
             "top_k": int(settings.get("top_k", DEFAULT_LLM_TOP_K)),
@@ -109,7 +117,58 @@ class TranslationPipeline:
             with profiler.step("pdf_text_quality_detection"):
                 detection = self.pdf_extractor.detector.detect(pdf_path)
 
-            if self._should_bypass_marker_for_qwen(detection, settings):
+            if self._should_use_surya2(detection, settings):
+                if not self._update_status(
+                    job_id,
+                    stage=JobStage.OCR_LAYOUT,
+                    progress=0.18,
+                    message=(
+                        f"PDF classified as {detection.classification}; "
+                        "running direct Surya 2 OCR through llama.cpp"
+                    ),
+                    translation={
+                        **translation_metadata,
+                        "pdf_classification": detection.classification,
+                        "marker_mode": "skipped_for_surya2_llamacpp",
+                        "fallback_engine": "surya2_llamacpp",
+                        "ocr_engine": "surya2_llamacpp",
+                        "ocr_used": True,
+                        "force_ocr": True,
+                        "strip_existing_ocr": False,
+                        "warnings": detection.warnings,
+                    },
+                ):
+                    return
+
+                def on_surya2_progress(event: dict) -> None:
+                    update = self._surya2_progress_from_event(event)
+                    if update is None:
+                        return
+                    progress, message = update
+                    self._update_status(
+                        job_id,
+                        stage=JobStage.OCR_LAYOUT,
+                        progress=progress,
+                        message=message,
+                    )
+
+                with profiler.step("surya2_llamacpp_ocr"):
+                    result = self.surya2_extractor.extract(
+                        pdf_path=pdf_path,
+                        job_dir=job_dir,
+                        pdf_classification=detection.classification,
+                        detection_metadata=self._detection_metadata(detection),
+                        warnings=detection.warnings,
+                        settings=settings,
+                        profiler=profiler,
+                        cancel_requested=lambda: self._is_cancelled(job_id),
+                        on_process_started=lambda process: self._register_process(job_id, process),
+                        on_process_finished=lambda process: self._unregister_process(
+                            job_id, process
+                        ),
+                        on_progress=on_surya2_progress,
+                    )
+            elif self._should_bypass_marker_for_qwen(detection, settings):
                 if not self._update_status(
                     job_id,
                     stage=JobStage.OCR_LAYOUT,
@@ -162,39 +221,59 @@ class TranslationPipeline:
                         profiler=profiler,
                         cancel_requested=lambda: self._is_cancelled(job_id),
                         on_process_started=lambda process: self._register_process(job_id, process),
-                        on_process_finished=lambda process: self._unregister_process(job_id, process),
+                        on_process_finished=lambda process: self._unregister_process(
+                            job_id, process
+                        ),
                         on_ocr_progress=on_qwen_progress,
                     )
             else:
+
+                def on_marker_detection_complete(
+                    detected: PDFTypeDetectionResult,
+                    marker_mode: MarkerMode,
+                ) -> None:
+                    self._update_status(
+                        job_id,
+                        stage=JobStage.EXTRACTION,
+                        progress=0.14,
+                        message=(
+                            f"PDF classified as {detected.classification}; "
+                            f"running Marker mode {marker_mode}"
+                        ),
+                        translation={
+                            **translation_metadata,
+                            "pdf_classification": detected.classification,
+                            "marker_mode": marker_mode,
+                            "ocr_used": marker_mode
+                            in {"force_ocr", "strip_existing_ocr_force_ocr"},
+                            "force_ocr": marker_mode
+                            in {"force_ocr", "strip_existing_ocr_force_ocr"},
+                            "strip_existing_ocr": (marker_mode == "strip_existing_ocr_force_ocr"),
+                            "warnings": detected.warnings,
+                        },
+                    )
+
                 with profiler.step("marker_extraction"):
+                    marker_extraction_mode = self._marker_extraction_mode(
+                        extraction_mode,
+                        detection,
+                        settings,
+                    )
                     result = self.pdf_extractor.extract(
                         pdf_path=pdf_path,
-                        mode=extraction_mode,
-                        use_local_vlm_repair=bool(settings.get("use_local_vlm_repair", ENABLE_LOCAL_VLM_REPAIR)),
+                        mode=marker_extraction_mode,
+                        use_local_vlm_repair=bool(
+                            settings.get("use_local_vlm_repair", ENABLE_LOCAL_VLM_REPAIR)
+                        ),
                         keep_debug_artifacts=keep_debug_artifacts,
                         job_dir=job_dir,
                         timeout=int(settings.get("marker_timeout_seconds", MARKER_TIMEOUT_SECONDS)),
                         cancel_requested=lambda: self._is_cancelled(job_id),
                         on_process_started=lambda process: self._register_process(job_id, process),
-                        on_process_finished=lambda process: self._unregister_process(job_id, process),
-                        on_detection_complete=lambda detection, marker_mode: self._update_status(
-                            job_id,
-                            stage=JobStage.EXTRACTION,
-                            progress=0.14,
-                            message=(
-                                f"PDF classified as {detection.classification}; "
-                                f"running Marker mode {marker_mode}"
-                            ),
-                            translation={
-                                **translation_metadata,
-                                "pdf_classification": detection.classification,
-                                "marker_mode": marker_mode,
-                                "ocr_used": marker_mode in {"force_ocr", "strip_existing_ocr_force_ocr"},
-                                "force_ocr": marker_mode in {"force_ocr", "strip_existing_ocr_force_ocr"},
-                                "strip_existing_ocr": marker_mode == "strip_existing_ocr_force_ocr",
-                                "warnings": detection.warnings,
-                            },
+                        on_process_finished=lambda process: self._unregister_process(
+                            job_id, process
                         ),
+                        on_detection_complete=on_marker_detection_complete,
                     )
                 if self._is_cancelled(job_id):
                     self._mark_cancelled(job_id)
@@ -241,8 +320,12 @@ class TranslationPipeline:
                             settings=settings,
                             profiler=profiler,
                             cancel_requested=lambda: self._is_cancelled(job_id),
-                            on_process_started=lambda process: self._register_process(job_id, process),
-                            on_process_finished=lambda process: self._unregister_process(job_id, process),
+                            on_process_started=lambda process: self._register_process(
+                                job_id, process
+                            ),
+                            on_process_finished=lambda process: self._unregister_process(
+                                job_id, process
+                            ),
                             on_ocr_progress=on_qwen_progress,
                         )
 
@@ -263,11 +346,25 @@ class TranslationPipeline:
             ):
                 return
 
+            with profiler.step("figure_extraction"):
+                result.document = self.figure_extractor.extract(
+                    pdf_path=pdf_path,
+                    document=result.document,
+                    artifact_dir=artifacts_dir / "figures",
+                    extraction_metadata=result.metadata,
+                )
+                result.markdown = MarkdownBuilder().build(result.document)
+                result.pages = [page.model_dump() for page in result.document.pages]
+                result.blocks = [block.model_dump() for block in result.document.blocks]
+                result.warnings = list(result.document.warnings)
+
             with profiler.step("marker_artifact_write"):
                 json_path.write_text(result.document.model_dump_json(indent=2), encoding="utf-8")
                 source_md_path.write_text(result.markdown.strip() + "\n", encoding="utf-8")
                 marker_detection = result.metadata.get("detection", {})
-                marker_detection_path.write_text(json.dumps(marker_detection, indent=2), encoding="utf-8")
+                marker_detection_path.write_text(
+                    json.dumps(marker_detection, indent=2), encoding="utf-8"
+                )
                 extraction_payload = {
                     "markdown": result.markdown,
                     "chunks": [asdict(chunk) for chunk in result.chunks],
@@ -282,7 +379,9 @@ class TranslationPipeline:
                     "used_local_vlm_repair": result.used_local_vlm_repair,
                     "warnings": result.warnings,
                 }
-                extraction_json_path.write_text(json.dumps(extraction_payload, indent=2), encoding="utf-8")
+                extraction_json_path.write_text(
+                    json.dumps(extraction_payload, indent=2), encoding="utf-8"
+                )
 
             artifacts = {
                 "json": str(json_path),
@@ -293,7 +392,9 @@ class TranslationPipeline:
                 "pdf_faithful": str(pdf_faithful),
                 "extraction_result": str(extraction_json_path),
                 "marker_detection": str(marker_detection_path),
-                "logical_translation_chunks": str(result.metadata.get("ocr_logical_chunks_path", "")),
+                "logical_translation_chunks": str(
+                    result.metadata.get("ocr_logical_chunks_path", "")
+                ),
             }
             self._update_status(
                 job_id,
@@ -321,31 +422,40 @@ class TranslationPipeline:
             logger.info("Translation started")
             logger.info("Translation chunks: %s", len(result.chunks))
             translation_started = time.perf_counter()
+            translation_progress = 0.7
 
             def on_chunk_translated(index: int, total: int, preview: str) -> None:
-                partial_progress = 0.7 + (0.18 * (index / max(total, 1)))
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=True),
+                )
                 safe_preview = preview if preview else "(empty output)"
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.88), 3),
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: {safe_preview}",
                 )
 
             def on_chunk_started(index: int, total: int) -> None:
+                nonlocal translation_progress
+                translation_progress = max(
+                    translation_progress,
+                    self._translation_chunk_progress(index, total, completed=False),
+                )
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=0.7,
+                    progress=translation_progress,
                     message=f"Chunk {index}/{total}: translating...",
                 )
 
             def on_table_progress(index: int, total: int, label: str) -> None:
-                partial_progress = 0.88 + (0.08 * (index / max(total, 1)))
                 self._update_status(
                     job_id,
                     stage=JobStage.TRANSLATION,
-                    progress=round(min(partial_progress, 0.96), 3),
+                    progress=translation_progress,
                     message=f"Tables {index}/{total}: {label}",
                 )
 
@@ -362,13 +472,22 @@ class TranslationPipeline:
                 on_process_finished=lambda process: self._unregister_process(job_id, process),
                 profiler=profiler,
             )
-            logger.info("Translation completed in %.2f seconds", time.perf_counter() - translation_started)
+            logger.info(
+                "Translation completed in %.2f seconds", time.perf_counter() - translation_started
+            )
 
             if self._is_cancelled(job_id):
                 self._mark_cancelled(job_id)
                 return
 
-            translated_document = DocumentModel.model_validate_json(json_path.read_text(encoding="utf-8"))
+            translated_document = DocumentModel.model_validate_json(
+                json_path.read_text(encoding="utf-8")
+            )
+            # Translation can add safe-retention warnings (for example when an
+            # English-only retry still returns source-language prose). Surface
+            # those through the normal job-details warning channel as well as
+            # the structured artifact.
+            result.warnings = list(translated_document.warnings)
             comparison_json, comparison_md = write_translation_comparison_report(
                 source_path=source_md_path,
                 translated_path=md_path,
@@ -384,7 +503,11 @@ class TranslationPipeline:
                 profile_json = json_path_prof
                 profile_csv = csv_path_prof
                 profile_summary = summary_path_prof
-                logger.info("Pipeline timing summary for %s\n%s", job_id, "\n".join(profiler.summary_lines()))
+                logger.info(
+                    "Pipeline timing summary for %s\n%s",
+                    job_id,
+                    "\n".join(profiler.summary_lines()),
+                )
 
             artifacts.update(
                 {
@@ -432,20 +555,64 @@ class TranslationPipeline:
                 self._cancelled_jobs.discard(job_id)
 
     def _should_run_qwen_ocr_fallback(self, result, settings: dict) -> bool:
-        enabled = bool(settings.get("enable_qwen_ocr_fallback", settings.get("qwen_ocr_fallback", ENABLE_QWEN_OCR_FALLBACK)))
+        if str(settings.get("ocr_engine", "surya_qwen_mlx")) != "surya_qwen_mlx":
+            return False
+        enabled = bool(
+            settings.get(
+                "enable_qwen_ocr_fallback",
+                settings.get("qwen_ocr_fallback", ENABLE_QWEN_OCR_FALLBACK),
+            )
+        )
         if not enabled:
             return False
         if str(settings.get("extraction_mode", "auto")) not in {"auto", "auto_repair"}:
             return False
-        return result.pdf_classification != "digital_good_text"
+        return bool(result.pdf_classification != "digital_good_text")
 
-    def _should_bypass_marker_for_qwen(self, detection: PDFTypeDetectionResult, settings: dict) -> bool:
-        enabled = bool(settings.get("enable_qwen_ocr_fallback", settings.get("qwen_ocr_fallback", ENABLE_QWEN_OCR_FALLBACK)))
+    def _should_bypass_marker_for_qwen(
+        self, detection: PDFTypeDetectionResult, settings: dict
+    ) -> bool:
+        if str(settings.get("ocr_engine", "surya_qwen_mlx")) != "surya_qwen_mlx":
+            return False
+        enabled = bool(
+            settings.get(
+                "enable_qwen_ocr_fallback",
+                settings.get("qwen_ocr_fallback", ENABLE_QWEN_OCR_FALLBACK),
+            )
+        )
         if not enabled:
             return False
         if str(settings.get("extraction_mode", "auto")) not in {"auto", "auto_repair"}:
             return False
         return detection.classification in {"scanned_no_text", "bad_hidden_ocr"}
+
+    def _should_use_surya2(
+        self,
+        detection: PDFTypeDetectionResult,
+        settings: dict,
+    ) -> bool:
+        if str(settings.get("ocr_engine", "")) != "surya2_llamacpp":
+            return False
+        extraction_mode = str(settings.get("extraction_mode", "auto"))
+        if extraction_mode in {"scanned", "strip_and_force_ocr"}:
+            return True
+        return detection.classification != "digital_good_text"
+
+    def _marker_extraction_mode(
+        self,
+        requested_mode: str,
+        detection: PDFTypeDetectionResult,
+        settings: dict,
+    ) -> str:
+        if str(settings.get("ocr_engine", "")) != "marker_surya":
+            return requested_mode
+        if requested_mode not in {"auto", "auto_repair"}:
+            return requested_mode
+        if detection.classification == "bad_hidden_ocr":
+            return "strip_and_force_ocr"
+        if detection.classification != "digital_good_text":
+            return "scanned"
+        return requested_mode
 
     def _detection_metadata(self, detection: PDFTypeDetectionResult) -> dict:
         return {
@@ -486,6 +653,46 @@ class TranslationPipeline:
         if kind == "complete":
             pages = int(event.get("pages") or 0)
             return 0.5, f"Qwen OCR completed for {pages} page(s)"
+        return None
+
+    def _translation_chunk_progress(
+        self,
+        index: int,
+        total: int,
+        *,
+        completed: bool,
+    ) -> float:
+        completed_chunks = index if completed else index - 1
+        fraction = max(0, completed_chunks) / max(total, 1)
+        return round(min(0.7 + (0.18 * fraction), 0.88), 3)
+
+    def _surya2_progress_from_event(self, event: dict) -> tuple[float, str] | None:
+        kind = str(event.get("event", ""))
+        if kind == "render_page_done":
+            index = int(event.get("page_number") or 0)
+            total = int(event.get("total") or 1)
+            progress = 0.18 + (0.06 * (index / max(total, 1)))
+            return round(progress, 3), f"Rendered page {index}/{total} for Surya 2"
+        if kind == "request_started":
+            pages = int(event.get("pages") or 0)
+            strategy = str(event.get("strategy") or "")
+            return 0.25, f"Surya 2 {strategy} OCR started for {pages} page(s)"
+        if kind == "layout_started":
+            return 0.28, "Surya 2 layout analysis and reading-order detection started"
+        if kind == "layout_complete":
+            blocks = int(event.get("blocks") or 0)
+            return 0.34, f"Surya 2 layout detected {blocks} block(s)"
+        if kind == "page_done":
+            index = int(event.get("page_number") or 0)
+            total = int(event.get("total") or 1)
+            progress = 0.34 + (0.16 * (index / max(total, 1)))
+            blocks = int(event.get("blocks") or 0)
+            return round(min(progress, 0.5), 3), (
+                f"Surya 2 page {index}/{total}: {blocks} block(s)"
+            )
+        if kind == "request_complete":
+            pages = int(event.get("pages") or 0)
+            return 0.5, f"Surya 2 OCR completed for {pages} page(s)"
         return None
 
     def _update_status(self, job_id: str, **updates: object) -> bool:
@@ -544,3 +751,6 @@ class TranslationPipeline:
                         process.kill()
             except Exception:
                 logger.debug("Unable to terminate process %s", getattr(process, "pid", "unknown"))
+
+    def shutdown(self) -> None:
+        self.surya2_extractor.close()
