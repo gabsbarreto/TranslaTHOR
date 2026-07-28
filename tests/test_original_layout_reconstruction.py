@@ -1411,6 +1411,60 @@ def test_marker_cell_polygons_allow_small_shared_boundary_overlap(tmp_path: Path
     assert strategy == "marker_table_cell_polygons"
 
 
+def test_marker_cell_polygons_allow_proportionally_small_detector_overlap(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "stored-table-proportional-overlap.pdf"
+    source_markup, _translated_markup, block, x_edges, y_edges = (
+        _horizontal_rule_table_source(source)
+    )
+    source_rows = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
+    table = _stored_horizontal_table(
+        block=block,
+        source_markup=source_markup,
+        x_edges=x_edges,
+        y_edges=y_edges,
+    )
+    first = table.header_cells[0]
+    assert first.bbox is not None
+    first.bbox.x1 += 8.0
+    assert block.bbox is not None
+
+    with fitz.open(source) as pdf:
+        rows, strategy = OriginalLayoutReconstructor()._stored_table_grid_rows(
+            page=pdf[0],
+            block=block,
+            table=table,
+            source_rows=source_rows,
+            table_bbox=block.bbox,
+        )
+
+    assert rows
+    assert strategy == "marker_table_cell_polygons"
+
+
+def test_table_cell_geometry_snaps_to_nearby_exact_pdf_word_run(tmp_path: Path) -> None:
+    source = tmp_path / "table-cell-word-snap.pdf"
+    doc = fitz.open()
+    page = doc.new_page(width=240, height=100)
+    page.insert_text((80, 45), "n = 14 (12%)", fontsize=10)
+    doc.save(source)
+    doc.close()
+
+    predicted = fitz.Rect(105, 30, 155, 50)
+    with fitz.open(source) as pdf:
+        expanded = OriginalLayoutReconstructor()._expand_table_cell_to_pdf_words(
+            pdf[0],
+            predicted,
+            fitz.Rect(20, 20, 200, 60),
+            "n = 14 (12%)",
+        )
+        extracted = OriginalLayoutReconstructor()._table_cell_text(pdf[0], expanded)
+
+    assert expanded.x0 < predicted.x0
+    assert OriginalLayoutReconstructor()._comparison_text(extracted) == "n1412"
+
+
 def test_table_row_similarity_tolerates_boundary_bleed_into_empty_cells(
     tmp_path: Path,
 ) -> None:

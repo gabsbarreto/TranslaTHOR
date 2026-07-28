@@ -93,6 +93,7 @@ class OriginalLayoutReconstructor:
     """Conservatively replace translated text while retaining the source PDF page art."""
 
     minimum_scale = 0.6
+    maximum_incidental_table_cell_overlap = 0.25
     locked_redaction_guard = 1.0
     locked_block_types = {BlockType.FIGURE, BlockType.EQUATION}
     conservative_skip_types = {BlockType.TABLE}
@@ -1250,8 +1251,20 @@ class OriginalLayoutReconstructor:
 
         replacements: list[_ReplacementRegion] = []
         for row_index, (source_row, translated_row, rectangles) in enumerate(aligned):
-            for column_index, (source_cell, translated_cell, rectangle) in enumerate(
-                zip(source_row, translated_row, rectangles, strict=True)
+            insertion_rectangles = self._nonoverlapping_table_row_rectangles(rectangles)
+            for column_index, (
+                source_cell,
+                translated_cell,
+                rectangle,
+                insertion_rectangle,
+            ) in enumerate(
+                zip(
+                    source_row,
+                    translated_row,
+                    rectangles,
+                    insertion_rectangles,
+                    strict=True,
+                )
             ):
                 source_text = source_cell.text.strip()
                 translated_text = translated_cell.text.strip()
@@ -1300,11 +1313,22 @@ class OriginalLayoutReconstructor:
                     4.0 if grid_strategy == "pymupdf_text_lattice_semantic_alignment" else 2.0
                 )
                 bbox = self._inset_bbox(
-                    cell_bbox,
+                    BoundingBox(
+                        x0=float(insertion_rectangle.x0),
+                        y0=float(insertion_rectangle.y0),
+                        x1=float(insertion_rectangle.x1),
+                        y1=float(insertion_rectangle.y1),
+                    ),
                     horizontal=horizontal_inset,
                     vertical=1.0,
                 )
-                redaction_bboxes = None
+                redaction_bboxes = [
+                    self._inset_bbox(
+                        cell_bbox,
+                        horizontal=horizontal_inset,
+                        vertical=1.0,
+                    )
+                ]
                 redaction_fill: tuple[float, float, float] | None = None
                 background_metadata: dict[str, Any] = {}
                 if scan_overlay:
@@ -1336,13 +1360,16 @@ class OriginalLayoutReconstructor:
                     cell_bbox,
                     infer_alignment=True,
                 )
+                inferred_alignment = style_hints.get(
+                    "text_align",
+                    "left" if column_index == 0 else "center",
+                )
+                if column_index > 0 and len(self._comparison_text(source_text)) <= 24:
+                    inferred_alignment = "center"
                 style_hints.update(
                     {
                         "line_height": 0.9,
-                        "text_align": style_hints.get(
-                            "text_align",
-                            "left" if column_index == 0 else "center",
-                        ),
+                        "text_align": inferred_alignment,
                     }
                 )
                 replacements.append(
@@ -1403,6 +1430,22 @@ class OriginalLayoutReconstructor:
                     )
                     return []
         return replacements
+
+    def _nonoverlapping_table_row_rectangles(
+        self,
+        rectangles: list[fitz.Rect],
+    ) -> list[fitz.Rect]:
+        """Create disjoint insertion boxes while retaining source redaction boxes."""
+
+        normalized = [fitz.Rect(rectangle) for rectangle in rectangles]
+        for left, right in zip(normalized, normalized[1:]):
+            if left.x1 <= right.x0:
+                continue
+            boundary = (left.x1 + right.x0) / 2
+            if boundary - left.x0 >= 1.0 and right.x1 - boundary >= 1.0:
+                left.x1 = boundary
+                right.x0 = boundary
+        return normalized
 
     def _parse_table_rows(
         self,
@@ -1510,11 +1553,17 @@ class OriginalLayoutReconstructor:
 
         table_rect = self._fitz_rect(table_bbox)
         converted_rows: list[list[fitz.Rect]] = []
-        placements: list[tuple[int, int, int, int, fitz.Rect]] = []
-        for model_row, expected_row in zip(model_rows, expected_rows, strict=True):
+        placements: list[tuple[int, int, int, int, fitz.Rect, bool]] = []
+        for model_row, source_row, expected_row in zip(
+            model_rows,
+            source_rows,
+            expected_rows,
+            strict=True,
+        ):
             converted_row: list[fitz.Rect] = []
-            for cell, (row_index, column_index, rowspan, colspan) in zip(
+            for cell, source_cell, (row_index, column_index, rowspan, colspan) in zip(
                 model_row,
+                source_row,
                 expected_row,
                 strict=True,
             ):
@@ -1539,18 +1588,43 @@ class OriginalLayoutReconstructor:
                 ):
                     return [], "unavailable"
                 converted_row.append(rectangle)
-                placements.append((row_index, column_index, rowspan, colspan, rectangle))
+                placements.append(
+                    (
+                        row_index,
+                        column_index,
+                        rowspan,
+                        colspan,
+                        rectangle,
+                        bool(self._comparison_text(source_cell.text)),
+                    )
+                )
             converted_rows.append(converted_row)
 
         for index, placement in enumerate(placements):
-            row_index, column_index, rowspan, colspan, rectangle = placement
+            row_index, column_index, rowspan, colspan, rectangle, has_text = placement
             for other_placement in placements[index + 1 :]:
-                other_row, other_column, other_rowspan, other_colspan, other = other_placement
+                (
+                    other_row,
+                    other_column,
+                    other_rowspan,
+                    other_colspan,
+                    other,
+                    other_has_text,
+                ) = other_placement
                 intersection = fitz.Rect(rectangle & other)
+                smaller_cell_area = min(rectangle.get_area(), other.get_area())
+                overlap_ratio = (
+                    intersection.get_area() / smaller_cell_area
+                    if smaller_cell_area > 0
+                    else 1.0
+                )
                 if (
                     intersection.get_area() > 0.75
                     and intersection.width > 1.5
                     and intersection.height > 1.5
+                    and has_text
+                    and other_has_text
+                    and overlap_ratio > self.maximum_incidental_table_cell_overlap
                 ):
                     return [], "unavailable"
                 rectangle_mid_x = (rectangle.x0 + rectangle.x1) / 2
@@ -1566,7 +1640,138 @@ class OriginalLayoutReconstructor:
                 ):
                     return [], "unavailable"
 
-        return converted_rows, "marker_table_cell_polygons"
+        try:
+            page_words = page.get_text("words", sort=False)
+        except Exception:
+            page_words = []
+        expanded_rows = [
+            [
+                self._expand_table_cell_to_pdf_words(
+                    page,
+                    rectangle,
+                    table_rect,
+                    source_cell.text,
+                    words=page_words,
+                )
+                if self._comparison_text(source_cell.text)
+                else rectangle
+                for source_cell, rectangle in zip(source_row, converted_row, strict=True)
+            ]
+            for source_row, converted_row in zip(source_rows, converted_rows, strict=True)
+        ]
+        return expanded_rows, "marker_table_cell_polygons"
+
+    def _expand_table_cell_to_pdf_words(
+        self,
+        page: fitz.Page,
+        rectangle: fitz.Rect,
+        table_rect: fitz.Rect,
+        source_text: str = "",
+        *,
+        words: list[tuple[Any, ...]] | None = None,
+    ) -> fitz.Rect:
+        """Include complete PDF words whose centres fall inside a predicted cell.
+
+        Marker polygons may end part-way through a glyph or word. Expanding to
+        the source PDF's complete word boxes prevents both clipped validation
+        text and untranslated glyph fragments after redaction.
+        """
+
+        expanded = fitz.Rect(rectangle)
+        if words is None:
+            try:
+                words = page.get_text("words", sort=False)
+            except Exception:
+                return expanded
+        for word in words:
+            if len(word) < 5:
+                continue
+            word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+            center_x = (word_rect.x0 + word_rect.x1) / 2
+            center_y = (word_rect.y0 + word_rect.y1) / 2
+            if (
+                rectangle.x0 <= center_x <= rectangle.x1
+                and rectangle.y0 <= center_y <= rectangle.y1
+            ):
+                expanded.include_rect(word_rect)
+        matching_rect = self._nearby_exact_table_cell_text_rect(
+            words,
+            rectangle=rectangle,
+            table_rect=table_rect,
+            source_text=source_text,
+        )
+        if matching_rect is not None:
+            expanded.include_rect(matching_rect)
+        return fitz.Rect(expanded & table_rect)
+
+    def _nearby_exact_table_cell_text_rect(
+        self,
+        words: list[tuple[Any, ...]],
+        *,
+        rectangle: fitz.Rect,
+        table_rect: fitz.Rect,
+        source_text: str,
+    ) -> fitz.Rect | None:
+        """Find an exact source-text word run close to a predicted cell.
+
+        Empty placeholder columns in a table model can shift the following
+        polygon slightly. Only an exact normalized match on one PDF line is
+        accepted, bounded to a local horizontal search area and the predicted
+        vertical cell band.
+        """
+
+        expected = self._comparison_text(source_text)
+        if not expected:
+            return None
+        horizontal_margin = max(12.0, min(36.0, rectangle.width * 0.65))
+        search_rect = fitz.Rect(
+            max(table_rect.x0, rectangle.x0 - horizontal_margin),
+            rectangle.y0 - 1.0,
+            min(table_rect.x1, rectangle.x1 + horizontal_margin),
+            rectangle.y1 + 1.0,
+        )
+        lines: dict[tuple[int, int], list[tuple[int, fitz.Rect, str]]] = {}
+        for word in words:
+            if len(word) < 8:
+                continue
+            word_rect = fitz.Rect(float(word[0]), float(word[1]), float(word[2]), float(word[3]))
+            center_x = (word_rect.x0 + word_rect.x1) / 2
+            center_y = (word_rect.y0 + word_rect.y1) / 2
+            if not (
+                search_rect.x0 <= center_x <= search_rect.x1
+                and search_rect.y0 <= center_y <= search_rect.y1
+            ):
+                continue
+            lines.setdefault((int(word[5]), int(word[6])), []).append(
+                (int(word[7]), word_rect, str(word[4]))
+            )
+
+        matches: list[fitz.Rect] = []
+        for line in lines.values():
+            ordered = sorted(line)
+            for start in range(len(ordered)):
+                candidate = ""
+                candidate_rect: fitz.Rect | None = None
+                for _word_index, word_rect, text in ordered[start:]:
+                    candidate += text
+                    candidate_rect = (
+                        fitz.Rect(word_rect)
+                        if candidate_rect is None
+                        else fitz.Rect(candidate_rect | word_rect)
+                    )
+                    normalized = self._comparison_text(candidate)
+                    if normalized == expected and candidate_rect is not None:
+                        matches.append(candidate_rect)
+                        break
+                    if len(normalized) > len(expected):
+                        break
+        if not matches:
+            return None
+        rectangle_center = (rectangle.x0 + rectangle.x1) / 2
+        return min(
+            matches,
+            key=lambda match: abs(((match.x0 + match.x1) / 2) - rectangle_center),
+        )
 
     def _rect_outside_with_tolerance(
         self,
@@ -3353,6 +3558,11 @@ class OriginalLayoutReconstructor:
                 actual = self._comparison_text(actual_text)
                 if expected == actual:
                     continue
+                if not expected:
+                    # Empty logical placeholders are never redacted. Marker
+                    # commonly overlaps them with a spanning neighbour, so
+                    # visible text inside one cannot make replacement unsafe.
+                    continue
 
                 expected_lines = [
                     normalized
@@ -3459,7 +3669,16 @@ class OriginalLayoutReconstructor:
         """Read only words whose centres belong to this semantic table cell."""
 
         try:
-            words = page.get_text("words", clip=rectangle, sort=True)
+            # Padding prevents PyMuPDF from returning a truncated word when a
+            # detector polygon ends inside its glyph box. Centres are still
+            # filtered against the unpadded semantic cell below.
+            word_clip = fitz.Rect(
+                rectangle.x0 - 36.0,
+                rectangle.y0 - 4.0,
+                rectangle.x1 + 36.0,
+                rectangle.y1 + 4.0,
+            ) & page.rect
+            words = page.get_text("words", clip=word_clip, sort=True)
         except Exception:
             return ""
         groups: dict[tuple[int, int], list[tuple[float, str]]] = {}
