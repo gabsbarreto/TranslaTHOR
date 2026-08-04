@@ -1933,7 +1933,7 @@ def _surya2_image_scan_document(
     )
 
 
-def test_surya2_image_only_scan_uses_raster_text_masks_and_preserves_visuals(
+def test_surya2_image_only_scan_uses_authoritative_bbox_and_preserves_other_visuals(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "surya2-image-only.pdf"
@@ -1956,14 +1956,16 @@ def test_surya2_image_only_scan_uses_raster_text_masks_and_preserves_visuals(
     assert report["surya2_image_overlay_pages"] == 1
     assert report["surya2_image_text_masks"] >= 1
     replaced = next(region for region in report["regions"] if region["status"] == "replaced")
-    assert replaced["reconstruction_strategy"] == "surya2_image_text_overlay"
+    assert replaced["reconstruction_strategy"] == "surya2_authoritative_bbox_overlay"
     assert replaced["bbox"] == text_bbox.model_dump()
     assert replaced["source_text_masks"]
     assert replaced["coordinate_metadata"][0]["scale_x"] == 1
     assert replaced["coordinate_metadata"][0]["scale_y"] == 1
     raster_metadata = replaced["coordinate_metadata"][-1]
     assert raster_metadata["geometry_source"] == "surya2_pdf_bbox"
-    assert raster_metadata["mask_source"] == "surya2_raster_foreground_rows"
+    assert raster_metadata["mask_source"] == "surya2_full_region_bbox"
+    assert raster_metadata["region_policy"] == "authoritative_surya_bbox_with_full_text_fit"
+    assert replaced["source_text_masks"] == [text_bbox.model_dump()]
 
     with fitz.open(output) as translated:
         assert "Translated source content" in translated[0].get_text("text")
@@ -1985,7 +1987,82 @@ def test_surya2_image_only_scan_uses_raster_text_masks_and_preserves_visuals(
     )
 
 
-def test_surya2_image_only_scan_rejects_nonuniform_visual_text_region(
+def test_surya2_hidden_ocr_region_bypasses_alignment_and_translation_guards(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surya2-hidden-ocr.pdf"
+    output = tmp_path / "surya2-hidden-ocr-output.pdf"
+    text_bbox, figure_bbox = _create_surya2_image_only_scan(source)
+    with fitz.open(source) as pdf:
+        page = pdf[0]
+        page.insert_textbox(
+            fitz.Rect(text_bbox.x0, text_bbox.y0, text_bbox.x1, text_bbox.y1),
+            "Completely unrelated hidden OCR words in this rectangle",
+            fontsize=8,
+            render_mode=3,
+        )
+        pdf.saveIncr()
+
+    document = _surya2_image_scan_document(
+        source.name,
+        text_bbox=text_bbox,
+        figure_bbox=figure_bbox,
+    )
+    document.pages[0].has_embedded_text = True
+    document.pages[0].embedded_text_quality = 0.1
+    document.blocks[0].metadata["translation_validation"] = {
+        "status": "translation_failed",
+        "reason": "synthetic_guard_that_must_not_veto_surya_geometry",
+    }
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "surya2-hidden-ocr-report.json",
+    )
+
+    assert report["status"] == "complete"
+    assert report["pages"][0]["reconstruction_strategy"] == "surya2_image_overlay"
+    assert report["scan_text_regions_aligned"] == 0
+    assert report["scan_text_regions_alignment_failed"] == 0
+    assert report["regions_replaced"] == 1
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] == text_bbox.model_dump()
+    assert replaced["source_text_masks"] == [text_bbox.model_dump()]
+    with fitz.open(output) as translated:
+        assert "Translated source content" in translated[0].get_text("text")
+
+
+def test_surya2_region_is_retained_when_translated_text_does_not_fit(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "surya2-overflow.pdf"
+    output = tmp_path / "surya2-overflow-output.pdf"
+    text_bbox, figure_bbox = _create_surya2_image_only_scan(source)
+    document = _surya2_image_scan_document(
+        source.name,
+        text_bbox=text_bbox,
+        figure_bbox=figure_bbox,
+    )
+    document.blocks[0].text = "This target text must all fit inside the Surya box. " * 200
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=source,
+        output_pdf_path=output,
+        document=document,
+        report_path=tmp_path / "surya2-overflow-report.json",
+    )
+
+    assert report["status"] == "partial"
+    assert report["regions_replaced"] == 0
+    assert report["text_boxes_did_not_fit"] == 1
+    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
+    assert skipped["reason"] == "translated_text_did_not_fit_minimum_scale"
+    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+
+
+def test_surya2_image_only_scan_trusts_region_over_background_and_visual_guards(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "surya2-unsafe-image-only.pdf"
@@ -1994,7 +2071,7 @@ def test_surya2_image_only_scan_rejects_nonuniform_visual_text_region(
     document = _surya2_image_scan_document(
         source.name,
         text_bbox=figure_bbox,
-        figure_bbox=BoundingBox(x0=335, y0=120, x1=355, y1=175),
+        figure_bbox=figure_bbox,
     )
 
     report = OriginalLayoutReconstructor().reconstruct(
@@ -2004,14 +2081,17 @@ def test_surya2_image_only_scan_rejects_nonuniform_visual_text_region(
         report_path=tmp_path / "surya2-unsafe-image-only-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["regions_replaced"] == 0
-    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
-    assert skipped["reason"] == "surya2_image_scan_background_not_uniform_or_light"
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 1
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] == figure_bbox.model_dump()
+    assert replaced["source_text_masks"] == [figure_bbox.model_dump()]
+    background = replaced["coordinate_metadata"][-1]["scan_background"]
+    assert background["accepted_without_background_gate"] is True
+    assert _render_rgb(source).tobytes() != _render_rgb(output).tobytes()
 
 
-def test_surya2_image_only_scan_retains_table_without_cell_geometry(
+def test_surya2_image_only_scan_trusts_table_region_without_cell_geometry(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "surya2-image-only-table.pdf"
@@ -2058,12 +2138,15 @@ def test_surya2_image_only_scan_retains_table_without_cell_geometry(
         report_path=tmp_path / "surya2-image-only-table-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["regions_replaced"] == 1
-    skipped_table = next(
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 2
+    replaced_table = next(
         region for region in report["regions"] if region["block_ids"] == ["surya2-table"]
     )
-    assert skipped_table["reason"] == "surya2_image_scan_table_requires_cell_geometry"
+    assert replaced_table["status"] == "replaced"
+    assert replaced_table["reconstruction_strategy"] == "surya2_authoritative_bbox_overlay"
+    with fitz.open(output) as translated:
+        assert "Translated" in translated[0].get_text("text")
 
 
 def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(

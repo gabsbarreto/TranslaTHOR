@@ -289,42 +289,40 @@ ten-case specification is always tested.
 
 ## Reconstruction Limitations
 
-- Surya 2 image-only scans can replace text blocks only when the Surya PDF-space box contains
-  raster foreground rows on a light, sufficiently uniform background. The mask is derived from
-  source pixels and recorded in the reconstruction report. Dense, dark, nonuniform, missing, or
-  overflowing regions are retained unchanged. This is conservative masking, not general
-  background inpainting.
-- Hidden-OCR pages can replace body text when the complete source passage has one unambiguous match
-  to a spatially contiguous hidden-OCR line lane. The stored Surya box is an auditable position hint
-  rather than the final authority, because a missed or merged region can shift later reading-order
-  associations. Line lanes may bridge a malformed native PDF text-block boundary, but they cannot
-  jump between columns. Multi-column classification requires a stable gutter across several lines;
-  isolated OCR glyph fragments are ignored.
+- Surya 2 llama.cpp text regions are authoritative in original-layout output, including on scans
+  with a selectable hidden-OCR layer. Reconstruction covers the complete Surya PDF-space box and
+  places the target text there without hidden-OCR alignment, background, raster-mask, script, table-
+  cell, or overlapping-visual confidence vetoes. Background sampling only chooses a cosmetic fill
+  colour and cannot reject the box. Missing or invalid geometry and target text that cannot fit at
+  the minimum scale are still retained and reported. Surya figure and equation regions remain
+  preserved.
+- Non-Surya hidden-OCR pages can replace body text when the complete source passage has one
+  unambiguous match to a spatially contiguous hidden-OCR line lane. Line lanes may bridge a malformed
+  native PDF text-block boundary, but they cannot jump between columns. Multi-column classification
+  requires a stable gutter across several lines; isolated OCR glyph fragments are ignored.
   The original scan remains the background; only verified line masks on light, sufficiently uniform
   paper are covered before translated text is inserted. Partial matches, multi-column regions that
   require table geometry, already-English passages, and suspicious translation-script changes are
   retained and reported. A page with any retained translatable region is reported as partial, and
   the readable PDF remains the safe full-translation fallback.
 - Image-only OCR from Qwen or legacy Marker still requires hidden text geometry for original-layout
-  replacement. The pixel-mask strategy is intentionally restricted to Surya 2 blocks because its
-  adapter preserves the tested polygon, PDF-space box, raw label, and reading order contract.
-  Image-only Surya tables also remain unchanged unless trustworthy cell geometry is available;
-  their translated structured content remains available in the readable PDF.
+  replacement.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
-- Missing, invalid, or low-confidence bounding boxes are skipped and reported rather than guessed.
-  New translations preserve one independently placeable target per source block, even when several
-  blocks share one model request for linguistic context; long groups are batched without translating
-  a physical block twice.
+- Missing or invalid bounding boxes are skipped and reported rather than guessed. New translations
+  preserve one independently placeable target per source block, even when several blocks share one
+  model request for linguistic context; long groups are batched without translating a physical block
+  twice.
   Legacy cross-page translation batches are recovered only when their preserved source and
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.
-- Tables are translated cell-by-cell in original-layout output only when the translated HTML or
-  Markdown shape can be matched to validated cell geometry and the source cell text validates that
-  mapping. New extractions retain Marker cell polygons as the preferred geometry. Older clean
-  digital PDFs with partial horizontal rules or whitespace-separated columns can use a semantic
-  fallback: physical PDF text lines and candidate column edges are coalesced into the logical table
-  only when all source cells align in a unique monotonic solution.
+- Non-Surya tables are translated cell-by-cell in original-layout output only when the translated
+  HTML or Markdown shape can be matched to validated cell geometry and the source cell text validates
+  that mapping. Authoritative Surya tables instead replace and re-typeset their complete region from
+  the translated table markup. New extractions retain Marker cell polygons as the preferred geometry.
+  Older clean digital PDFs with partial horizontal rules or whitespace-separated columns can use a
+  semantic fallback: physical PDF text lines and candidate column edges are coalesced into the logical
+  table only when all source cells align in a unique monotonic solution.
   For scanned tables, the hidden OCR line boxes and a light, sufficiently uniform background must
   also pass validation; only cells whose text actually changes are masked. When Marker
   collapses a ruled digital table into one oversized cell, the extraction stage attempts a clipped

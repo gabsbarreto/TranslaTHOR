@@ -46,6 +46,7 @@ class _ReplacementRegion:
     redaction_bboxes: list[BoundingBox] | None = None
     redaction_fill: tuple[float, float, float] | None = None
     reconstruction_strategy: str = "embedded_text_replacement"
+    authoritative_surya_bbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -90,7 +91,7 @@ class _HiddenOCRMatch:
 
 
 class OriginalLayoutReconstructor:
-    """Conservatively replace translated text while retaining the source PDF page art."""
+    """Replace translated text while retaining the source PDF page art."""
 
     minimum_scale = 0.6
     maximum_incidental_table_cell_overlap = 0.25
@@ -195,6 +196,13 @@ class OriginalLayoutReconstructor:
                 )
                 guarded_replacements: list[_ReplacementRegion] = []
                 for region in replacements:
+                    if region.authoritative_surya_bbox:
+                        # Surya regions are authoritative. Do not trim or reject
+                        # their redaction boxes against independently detected
+                        # visual regions: doing so would reintroduce a second
+                        # geometry opinion after Surya has labelled the region.
+                        guarded_replacements.append(region)
+                        continue
                     region.redaction_bboxes = self._redaction_bboxes_avoiding_locked_regions(
                         self._redaction_bboxes(region),
                         locked_by_page.get(page_number, []),
@@ -379,7 +387,7 @@ class OriginalLayoutReconstructor:
                     report["regions_replaced"] += 1
                     page_report["regions_replaced"] += 1
                     report["scan_text_masks"] += len(region.redaction_bboxes or [])
-                    if region.reconstruction_strategy == "surya2_image_text_overlay":
+                    if region.reconstruction_strategy == "surya2_authoritative_bbox_overlay":
                         report["surya2_image_text_masks"] += len(region.redaction_bboxes or [])
                     report["regions"].append({**entry, "status": "replaced"})
                 raster_table_ids = {
@@ -475,6 +483,7 @@ class OriginalLayoutReconstructor:
             "scan_text_regions_alignment_failed": 0,
             "surya2_image_overlay_pages": 0,
             "surya2_image_text_masks": 0,
+            "surya2_region_policy": "authoritative_bbox_with_full_text_fit",
             "raster_tables_reconstructed": 0,
             "safe_fallback": "readable_pdf",
             "minimum_text_scale": self.minimum_scale,
@@ -517,6 +526,15 @@ class OriginalLayoutReconstructor:
                 "Structured page metadata is missing; the source page was retained unchanged.",
             )
         if metadata.extraction_mode == SourceType.OCR:
+            surya2_blocks = [block for block in blocks if self._is_surya2_region(block)]
+            if any(
+                block.bbox is not None and block.block_type not in self.locked_block_types
+                for block in surya2_blocks
+            ):
+                # Surya's region geometry is authoritative even when the scan
+                # also contains a selectable hidden-OCR layer. Hidden OCR is a
+                # competing transcription and must not veto a Surya box.
+                return "surya2_image_overlay", ""
             if metadata.has_embedded_text and len(page.get_text("words")) >= 5:
                 translated_tables = {
                     block.id
@@ -533,17 +551,6 @@ class OriginalLayoutReconstructor:
                 if translated_tables and not translated_body:
                     return "ocr_table_overlay", ""
                 return "ocr_text_overlay", ""
-            surya2_blocks = [
-                block
-                for block in blocks
-                if str(block.metadata.get("ocr_engine", "")).casefold() == "surya2_llamacpp"
-                or str(block.metadata.get("parser", "")).casefold() == "surya2_llamacpp"
-            ]
-            if any(
-                block.bbox is not None and block.block_type not in self.locked_block_types
-                for block in surya2_blocks
-            ):
-                return "surya2_image_overlay", ""
             return (
                 "unsupported",
                 "The OCR page has neither usable hidden text geometry nor Surya 2 image-region "
@@ -560,6 +567,12 @@ class OriginalLayoutReconstructor:
                 "The page has no reliable removable PDF text and was retained unchanged.",
             )
         return "embedded_text_replacement", ""
+
+    def _is_surya2_region(self, block: Block) -> bool:
+        return (
+            str(block.metadata.get("ocr_engine", "")).casefold() == "surya2_llamacpp"
+            or str(block.metadata.get("parser", "")).casefold() == "surya2_llamacpp"
+        )
 
     def _locked_regions(
         self,
@@ -707,16 +720,8 @@ class OriginalLayoutReconstructor:
                     bbox=self._block_pdf_bbox(page, block),
                 )
                 continue
-            if block.block_type == BlockType.TABLE:
-                if surya2_image_overlay:
-                    self._skip_block(
-                        report,
-                        page_report,
-                        block,
-                        reason="surya2_image_scan_table_requires_cell_geometry",
-                        bbox=self._block_pdf_bbox(page, block),
-                    )
-                    continue
+            authoritative_surya_block = surya2_image_overlay and self._is_surya2_region(block)
+            if block.block_type == BlockType.TABLE and not authoritative_surya_block:
                 validation = block.metadata.get("translation_validation")
                 if (
                     isinstance(validation, dict)
@@ -750,7 +755,7 @@ class OriginalLayoutReconstructor:
                 elif scan_overlay and page_report["regions_skipped"] > skipped_before:
                     failed_scan_table_ids.add(block.id)
                 continue
-            if block.block_type in self.conservative_skip_types:
+            if block.block_type in self.conservative_skip_types and not authoritative_surya_block:
                 self._skip_block(
                     report,
                     page_report,
@@ -796,6 +801,10 @@ class OriginalLayoutReconstructor:
                     continue
                 translated_text = block.text.strip()
 
+            authoritative_surya_region = authoritative_surya_block and all(
+                self._is_surya2_region(source_block) for source_block in source_blocks
+            )
+
             converted: list[BoundingBox] = []
             conversions: list[dict[str, Any]] = []
             for source_block in source_blocks:
@@ -810,7 +819,9 @@ class OriginalLayoutReconstructor:
                     converted.append(conversion.bbox)
             consumed.update(item.id for item in source_blocks)
             source_bbox_missing = len(converted) != len(source_blocks)
-            recover_bbox_from_hidden_ocr = scan_overlay and source_bbox_missing
+            recover_bbox_from_hidden_ocr = (
+                scan_overlay and not authoritative_surya_region and source_bbox_missing
+            )
             if source_bbox_missing and not recover_bbox_from_hidden_ocr:
                 report["regions_missing_or_invalid_bboxes"] += 1
                 self._skip_block(
@@ -837,7 +848,11 @@ class OriginalLayoutReconstructor:
                 if str(item.metadata.get("source_text", "")).strip()
             )
             validation = block.metadata.get("translation_validation")
-            if isinstance(validation, dict) and validation.get("status") == "translation_failed":
+            if (
+                not authoritative_surya_region
+                and isinstance(validation, dict)
+                and validation.get("status") == "translation_failed"
+            ):
                 self._skip_block(
                     report,
                     page_report,
@@ -848,12 +863,14 @@ class OriginalLayoutReconstructor:
                     bbox=None if recover_bbox_from_hidden_ocr else bbox,
                 )
                 continue
-            if source_text and self._normalized_text(source_text) == self._normalized_text(
-                translated_text
+            if (
+                not authoritative_surya_region
+                and source_text
+                and self._normalized_text(source_text) == self._normalized_text(translated_text)
             ):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
-            if not scan_overlay and not surya2_image_overlay:
+            if not scan_overlay and not authoritative_surya_region:
                 source_validation = self._embedded_source_text_validation(
                     page,
                     bbox,
@@ -878,7 +895,7 @@ class OriginalLayoutReconstructor:
                         "source_text_validation": source_validation,
                     }
                 )
-            if (scan_overlay or surya2_image_overlay) and not source_text:
+            if scan_overlay and not authoritative_surya_region and not source_text:
                 self._skip_block(
                     report,
                     page_report,
@@ -888,7 +905,7 @@ class OriginalLayoutReconstructor:
                 )
                 continue
             scan_match: _HiddenOCRMatch | None = None
-            if scan_overlay or surya2_image_overlay:
+            if scan_overlay and not authoritative_surya_region:
                 if self._source_text_is_probably_english(source_text):
                     # The application targets English. Re-typesetting an
                     # already-English passage only introduces scan artefacts
@@ -903,7 +920,7 @@ class OriginalLayoutReconstructor:
                         bbox=None if recover_bbox_from_hidden_ocr else bbox,
                     )
                     continue
-            if scan_overlay:
+            if scan_overlay and not authoritative_surya_region:
                 scan_match, match_metadata = self._match_hidden_ocr_lines(
                     page,
                     source_text,
@@ -949,7 +966,9 @@ class OriginalLayoutReconstructor:
                     continue
                 bbox = self._scan_match_envelope(page, scan_match.bbox)
 
-            if any(self._overlaps_locked_region(bbox, locked) for locked in locked_regions):
+            if not authoritative_surya_region and any(
+                self._overlaps_locked_region(bbox, locked) for locked in locked_regions
+            ):
                 self._skip_block(
                     report,
                     page_report,
@@ -967,8 +986,9 @@ class OriginalLayoutReconstructor:
                 source_text=source_text,
                 style_hints=dict(block.style_hints or {}),
                 coordinate_metadata=conversions,
+                authoritative_surya_bbox=authoritative_surya_region,
             )
-            if scan_overlay and scan_match is not None:
+            if scan_overlay and not authoritative_surya_region and scan_match is not None:
                 masks = self._scan_match_masks(page, scan_match.lines)
                 fill, background_metadata = self._scan_background_fill(page, bbox)
                 if fill is None or not masks:
@@ -1013,49 +1033,19 @@ class OriginalLayoutReconstructor:
                 replacement.coordinate_metadata.append(alignment_metadata)
                 claimed_scan_lines.update(scan_match.keys)
                 report["scan_text_regions_aligned"] += 1
-            elif surya2_image_overlay:
-                fill, background_metadata = self._scan_background_fill(page, bbox)
-                if fill is None:
-                    self._skip_block(
-                        report,
-                        page_report,
-                        block,
-                        reason="surya2_image_scan_background_not_uniform_or_light",
-                        bbox=bbox,
-                        alignment_diagnostics={
-                            "scan_background": background_metadata,
-                        },
-                    )
-                    continue
-                masks, mask_metadata = self._surya2_image_text_masks(
-                    page,
-                    bbox,
-                    background_fill=fill,
-                )
-                if not masks:
-                    self._skip_block(
-                        report,
-                        page_report,
-                        block,
-                        reason="surya2_image_scan_text_mask_not_reliable",
-                        bbox=bbox,
-                        alignment_diagnostics={
-                            "scan_background": background_metadata,
-                            "raster_text_mask": mask_metadata,
-                        },
-                    )
-                    continue
-                replacement.redaction_bboxes = masks
+            elif authoritative_surya_region:
+                fill, background_metadata = self._authoritative_surya_background_fill(page, bbox)
+                replacement.redaction_bboxes = [bbox]
                 replacement.redaction_fill = fill
-                replacement.reconstruction_strategy = "surya2_image_text_overlay"
+                replacement.reconstruction_strategy = "surya2_authoritative_bbox_overlay"
                 replacement.coordinate_metadata.append(
                     {
                         "geometry_source": "surya2_pdf_bbox",
                         "coordinate_space": "pdf_points_top_left",
                         "surya2_region_bbox_pdf": bbox.model_dump(),
-                        "mask_source": "surya2_raster_foreground_rows",
+                        "mask_source": "surya2_full_region_bbox",
+                        "region_policy": "authoritative_surya_bbox_with_full_text_fit",
                         "scan_background": background_metadata,
-                        "raster_text_mask": mask_metadata,
                     }
                 )
             replacements.append(replacement)
@@ -3071,153 +3061,43 @@ class OriginalLayoutReconstructor:
             return None, metadata
         return tuple(channel / 255.0 for channel in mode), metadata
 
-    def _surya2_image_text_masks(
+    def _authoritative_surya_background_fill(
         self,
         page: fitz.Page,
         bbox: BoundingBox,
-        *,
-        background_fill: tuple[float, float, float],
-    ) -> tuple[list[BoundingBox], dict[str, Any]]:
-        """Locate dark source-glyph rows inside a Surya 2 image-region box.
+    ) -> tuple[tuple[float, float, float], dict[str, Any]]:
+        """Choose a fill colour without using background analysis as a veto.
 
-        Image-only scans have no PDF word geometry to redact. Surya supplies the
-        containing text region, while this raster pass limits the fill to rows
-        that actually contain foreground pixels. Dense or ambiguous regions are
-        rejected instead of painting over diagrams or photographic content.
+        A Surya text-region box is painted in full. Background sampling is used
+        only to make that paint blend into ordinary paper; an inconclusive or
+        failed sample falls back to white and never rejects the region.
         """
 
-        rectangle = self._fitz_rect(bbox)
-        render_scale = 2.0
-        try:
-            pixmap = page.get_pixmap(
-                matrix=fitz.Matrix(render_scale, render_scale),
-                clip=rectangle,
-                colorspace=fitz.csRGB,
-                alpha=False,
-            )
-        except Exception as exc:
-            return [], {"reason": f"render_failed:{type(exc).__name__}"}
-        if (
-            pixmap.width < 2
-            or pixmap.height < 2
-            or not pixmap.samples
-            or len(pixmap.samples) != pixmap.width * pixmap.height * 3
-        ):
-            return [], {"reason": "empty_or_invalid_render"}
-
-        background = tuple(min(255, max(0, round(channel * 255.0))) for channel in background_fill)
-        background_luminance = (
-            0.2126 * background[0] + 0.7152 * background[1] + 0.0722 * background[2]
-        )
-        luminance_limit = min(210.0, background_luminance - 28.0)
-        foreground_by_row: list[list[int]] = [[] for _ in range(pixmap.height)]
-        samples = pixmap.samples
-        foreground_count = 0
-        for pixel_index in range(pixmap.width * pixmap.height):
-            offset = pixel_index * 3
-            red, green, blue = samples[offset : offset + 3]
-            luminance = 0.2126 * red + 0.7152 * green + 0.0722 * blue
-            colour_distance = max(
-                abs(red - background[0]),
-                abs(green - background[1]),
-                abs(blue - background[2]),
-            )
-            if luminance <= luminance_limit and colour_distance >= 24:
-                row = pixel_index // pixmap.width
-                column = pixel_index % pixmap.width
-                foreground_by_row[row].append(column)
-                foreground_count += 1
-
-        pixel_count = pixmap.width * pixmap.height
-        foreground_ratio = foreground_count / pixel_count
-        metadata: dict[str, Any] = {
-            "render_scale": render_scale,
-            "render_width": pixmap.width,
-            "render_height": pixmap.height,
-            "background_rgb": list(background),
-            "background_luminance": round(background_luminance, 3),
-            "foreground_pixel_ratio": round(foreground_ratio, 6),
-            "threshold": {
-                "minimum_foreground_pixel_ratio": 0.0005,
-                "maximum_foreground_pixel_ratio": 0.22,
-                "minimum_colour_distance": 24,
-                "maximum_foreground_luminance": round(luminance_limit, 3),
-            },
-        }
-        if foreground_ratio < 0.0005:
-            metadata["reason"] = "foreground_too_sparse"
-            return [], metadata
-        if foreground_ratio > 0.22:
-            metadata["reason"] = "foreground_too_dense_for_text"
-            return [], metadata
-
-        minimum_row_pixels = max(2, math.ceil(pixmap.width * 0.0025))
-        active_rows = [
-            index
-            for index, columns in enumerate(foreground_by_row)
-            if len(columns) >= minimum_row_pixels
-        ]
-        if not active_rows:
-            metadata["reason"] = "no_text_rows"
-            return [], metadata
-
-        groups: list[list[int]] = [[active_rows[0]]]
-        for row in active_rows[1:]:
-            if row - groups[-1][-1] <= 3:
-                groups[-1].append(row)
-            else:
-                groups.append([row])
-
-        scale_x = pixmap.width / max(rectangle.width, 1.0)
-        scale_y = pixmap.height / max(rectangle.height, 1.0)
-        masks: list[BoundingBox] = []
-        rejected_tall_groups = 0
-        maximum_group_height = max(36, round(pixmap.height * 0.5))
-        for rows in groups:
-            first_row = rows[0]
-            last_row = rows[-1]
-            group_height = last_row - first_row + 1
-            if group_height > maximum_group_height:
-                rejected_tall_groups += 1
-                continue
-            columns = [
-                column
-                for row in range(first_row, last_row + 1)
-                for column in foreground_by_row[row]
-            ]
-            if not columns:
-                continue
-            left = max(0.0, min(columns) / scale_x - 1.5)
-            right = min(rectangle.width, (max(columns) + 1) / scale_x + 1.5)
-            top = max(0.0, first_row / scale_y - 1.2)
-            bottom = min(rectangle.height, (last_row + 1) / scale_y + 1.2)
-            if right - left < 1.0 or bottom - top < 1.0:
-                continue
-            masks.append(
-                BoundingBox(
-                    x0=float(rectangle.x0 + left),
-                    y0=float(rectangle.y0 + top),
-                    x1=float(rectangle.x0 + right),
-                    y1=float(rectangle.y0 + bottom),
+        fill, metadata = self._scan_background_fill(page, bbox)
+        fill_source = "validated_background_sample"
+        if fill is None:
+            sampled = metadata.get("sampled_background_rgb")
+            if (
+                isinstance(sampled, list)
+                and len(sampled) == 3
+                and all(isinstance(channel, (int, float)) for channel in sampled)
+            ):
+                fill = (
+                    min(255.0, max(0.0, float(sampled[0]))) / 255.0,
+                    min(255.0, max(0.0, float(sampled[1]))) / 255.0,
+                    min(255.0, max(0.0, float(sampled[2]))) / 255.0,
                 )
-            )
-
-        metadata.update(
-            {
-                "active_row_count": len(active_rows),
-                "row_group_count": len(groups),
-                "accepted_mask_count": len(masks),
-                "rejected_tall_group_count": rejected_tall_groups,
-                "minimum_active_row_pixels": minimum_row_pixels,
-            }
-        )
-        if not masks:
-            metadata["reason"] = "no_reliable_text_line_masks"
-            return [], metadata
-        if rejected_tall_groups:
-            metadata["reason"] = "dense_foreground_group_rejected"
-            return [], metadata
-        return self._clamp_scan_masks(masks, bbox, guard=0.25), metadata
+                fill_source = "unvalidated_background_sample"
+            else:
+                fill = (1.0, 1.0, 1.0)
+                fill_source = "white_fallback"
+        assert fill is not None
+        return fill, {
+            **metadata,
+            "accepted_without_background_gate": True,
+            "fill_source": fill_source,
+            "applied_fill_rgb": [round(channel * 255.0) for channel in fill],
+        }
 
     def _scan_cell_text_masks(
         self,
@@ -3775,11 +3655,38 @@ class OriginalLayoutReconstructor:
         region: _ReplacementRegion,
         page: fitz.Page,
     ) -> tuple[str, str]:
-        escaped = html.escape(region.translated_text)
-        paragraphs = [part.strip() for part in re.split(r"\n\s*\n", escaped) if part.strip()]
-        rendered = "".join(f"<p>{part.replace(chr(10), '<br>')}</p>" for part in paragraphs)
-        if not rendered:
-            rendered = f"<p>{escaped}</p>"
+        table_css = ""
+        table_rows = (
+            self._parse_table_rows(region.translated_text)
+            if region.block_type == BlockType.TABLE
+            else []
+        )
+        if table_rows:
+            rendered_rows = []
+            for row in table_rows:
+                rendered_cells = []
+                for cell in row:
+                    cell_text = html.escape(cell.text).replace("\n", "<br>")
+                    spans = ""
+                    if cell.rowspan > 1:
+                        spans += f' rowspan="{cell.rowspan}"'
+                    if cell.colspan > 1:
+                        spans += f' colspan="{cell.colspan}"'
+                    rendered_cells.append(f"<{cell.tag}{spans}>{cell_text}</{cell.tag}>")
+                rendered_rows.append(f"<tr>{''.join(rendered_cells)}</tr>")
+            rendered = f"<table>{''.join(rendered_rows)}</table>"
+            table_css = (
+                " table { width: 100%; border-collapse: collapse; table-layout: fixed; }"
+                " th, td { border: 0.5pt solid #555; padding: 1pt; vertical-align: top; }"
+            )
+        else:
+            escaped = html.escape(region.translated_text)
+            paragraphs = [part.strip() for part in re.split(r"\n\s*\n", escaped) if part.strip()]
+            rendered = "".join(
+                f"<p>{part.replace(chr(10), '<br>')}</p>" for part in paragraphs
+            )
+            if not rendered:
+                rendered = f"<p>{escaped}</p>"
         style_hints = {
             **self._source_style_hints(page, region.bbox),
             **region.style_hints,
@@ -3820,6 +3727,7 @@ class OriginalLayoutReconstructor:
             f"* {{ font-family: {family}; font-size: {font_size:.2f}pt; "
             f"font-weight: {weight}; font-style: {style}; color: #111; }} "
             f"p {{ margin: 0; padding: 0; line-height: {line_height:.2f}; text-align: {align}; }}"
+            f"{table_css}"
         )
         return f"<div>{rendered}</div>", css
 
