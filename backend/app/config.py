@@ -67,6 +67,18 @@ DEFAULT_LLM_TOP_K = int(os.getenv("LLM_TOP_K", "10"))
 DEFAULT_LLM_MIN_P = float(os.getenv("LLM_MIN_P", "0.0"))
 DEFAULT_LLM_PRESENCE_PENALTY = float(os.getenv("LLM_PRESENCE_PENALTY", "1.5"))
 DEFAULT_LLM_REPETITION_PENALTY = float(os.getenv("LLM_REPETITION_PENALTY", "1.0"))
+DEFAULT_TRANSLATION_BATCH_SIZE = max(1, int(os.getenv("TRANSLATION_BATCH_SIZE", "4")))
+DEFAULT_TRANSLATION_BATCH_TOKEN_BUDGET = max(
+    1024,
+    int(os.getenv("TRANSLATION_BATCH_TOKEN_BUDGET", "8192")),
+)
+DEFAULT_TRANSLATION_PYTHON = os.getenv(
+    "TRANSLATION_PYTHON",
+    str(BASE_DIR / ".venv" / "bin" / "python"),
+)
+# Zero selects a conservative hardware-aware value in the translation worker.
+# An explicit environment value always wins over the automatic selection.
+DEFAULT_MLX_CPU_THREADS = max(0, int(os.getenv("MLX_CPU_THREADS", "0")))
 DEFAULT_QWEN_OCR_TEMPERATURE = float(os.getenv("QWEN_OCR_TEMPERATURE", "0.0"))
 DEFAULT_QWEN_OCR_TOP_P = float(os.getenv("QWEN_OCR_TOP_P", "0.9"))
 DEFAULT_QWEN_OCR_TOP_K = int(os.getenv("QWEN_OCR_TOP_K", "5"))

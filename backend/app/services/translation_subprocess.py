@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
+from app.config import DEFAULT_TRANSLATION_PYTHON
 from app.services.profiler import PipelineProfiler
 
 
@@ -25,7 +26,7 @@ def run_translation_subprocess(
     profiler: PipelineProfiler | None = None,
 ) -> None:
     cmd = [
-        sys.executable,
+        _translation_python_executable(),
         "-m",
         "app.services.translation_worker",
         "--document",
@@ -96,6 +97,13 @@ def run_translation_subprocess(
             on_process_finished(process)
 
 
+def _translation_python_executable() -> str:
+    configured = Path(DEFAULT_TRANSLATION_PYTHON).expanduser()
+    if configured.is_file() and os.access(configured, os.X_OK):
+        return str(configured)
+    return sys.executable
+
+
 def _stream_events(
     process: subprocess.Popen,
     on_chunk_started: Callable[[int, int], None] | None,
@@ -120,14 +128,18 @@ def _stream_events(
         if event.get("event") == "chunk_started" and on_chunk_started is not None:
             on_chunk_started(int(event["index"]), int(event["total"]))
         elif event.get("event") == "chunk_translated" and on_chunk_translated is not None:
-            on_chunk_translated(int(event["index"]), int(event["total"]), str(event.get("preview", "")))
+            on_chunk_translated(
+                int(event["index"]), int(event["total"]), str(event.get("preview", ""))
+            )
         elif event.get("event") == "table_progress" and on_table_progress is not None:
             on_table_progress(int(event["index"]), int(event["total"]), str(event.get("label", "")))
 
     stderr = process.stderr.read() if process.stderr is not None else ""
     return_code = process.wait()
     if return_code != 0:
-        raise RuntimeError(f"Translation subprocess failed with exit code {return_code}: {stderr[-4000:]}")
+        raise RuntimeError(
+            f"Translation subprocess failed with exit code {return_code}: {stderr[-4000:]}"
+        )
 
     if not output_document_path.exists() or not output_markdown_path.exists():
         raise RuntimeError("Translation subprocess finished without writing translated artifacts")

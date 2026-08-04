@@ -375,6 +375,15 @@ function warningsSection(warnings) {
 
 function runDetailsSection(job) {
   const translation = job.translation || {};
+  const mlxRuntime = translation.mlx_runtime && typeof translation.mlx_runtime === "object"
+    ? translation.mlx_runtime
+    : {};
+  const instructionCache = mlxRuntime.instruction_cache && typeof mlxRuntime.instruction_cache === "object"
+    ? mlxRuntime.instruction_cache
+    : {};
+  const generationRuntime = mlxRuntime.generation && typeof mlxRuntime.generation === "object"
+    ? mlxRuntime.generation
+    : {};
   const config = savedRunConfig(job);
   const modelConfig = config.translation_model && typeof config.translation_model === "object"
     ? config.translation_model
@@ -399,6 +408,13 @@ function runDetailsSection(job) {
     ["Min P", translation.min_p ?? modelConfig.min_p ?? config.min_p],
     ["Presence penalty", translation.presence_penalty ?? modelConfig.presence_penalty ?? config.presence_penalty],
     ["Repetition penalty", translation.repetition_penalty ?? modelConfig.repetition_penalty ?? config.repetition_penalty],
+    ["MLX device", mlxRuntime.device_name || mlxRuntime.device],
+    ["Attention backend", mlxRuntime.attention_backend],
+    ["Translation batch size", mlxRuntime.batch_size],
+    ["CPU helper threads", mlxRuntime.cpu_threads],
+    ["Instruction cache", humanizeValue(instructionCache.mode)],
+    ["MLX batch calls", generationRuntime.batch_calls],
+    ["Sequential fallbacks", generationRuntime.sequential_fallback_requests],
   ].filter(([, value]) => value !== undefined && value !== null && String(value).trim() !== "");
 
   const configDisclosureKey = `config:${job.job_id}`;

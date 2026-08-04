@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import re
+import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from difflib import SequenceMatcher
@@ -30,6 +31,9 @@ from app.config import (
     DEFAULT_LLM_TEMPERATURE,
     DEFAULT_LLM_TOP_K,
     DEFAULT_LLM_TOP_P,
+    DEFAULT_MLX_CPU_THREADS,
+    DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_BATCH_TOKEN_BUDGET,
     DEFAULT_TRANSLATION_MODEL,
 )
 from app.models.schema import Block, BlockType, DocumentModel, TranslationChunk
@@ -49,6 +53,9 @@ class TranslationSettings:
     presence_penalty: float = DEFAULT_LLM_PRESENCE_PENALTY
     repetition_penalty: float = DEFAULT_LLM_REPETITION_PENALTY
     max_tokens: int = 1024
+    batch_size: int = DEFAULT_TRANSLATION_BATCH_SIZE
+    batch_token_budget: int = DEFAULT_TRANSLATION_BATCH_TOKEN_BUDGET
+    cpu_threads: int = DEFAULT_MLX_CPU_THREADS
 
 
 @dataclass
@@ -64,6 +71,48 @@ class _LanguageResolution:
     language: str | None
     origin: str | None
     confidence: float | None
+
+
+@dataclass(frozen=True)
+class _BatchTranslationRequest:
+    text: str
+    context: str
+    source_language: str | None
+    block_type: BlockType | None
+    source_language_authoritative: bool = False
+
+
+@dataclass(frozen=True)
+class _PreparedBatchPrompt:
+    request: _BatchTranslationRequest
+    prompt: str
+    prompt_tokens: tuple[int, ...]
+    max_tokens: int
+
+    @property
+    def token_cost(self) -> int:
+        return len(self.prompt_tokens) + self.max_tokens
+
+
+@dataclass(frozen=True)
+class _InstructionTemplateCache:
+    system: str
+    prefix: str
+    suffix: str
+    prefix_tokens: tuple[int, ...] | None
+    token_composition_safe: bool
+
+
+@dataclass(frozen=True)
+class _ChunkTranslationPlan:
+    index: int
+    chunk: TranslationChunk
+    block_type: BlockType | None
+    effective_context: str
+    source_language_authoritative: bool
+    is_table_like: bool
+    is_english: bool
+    physical_segments: tuple[tuple[str, str, BlockType], ...]
 
 
 @dataclass(frozen=True)
@@ -393,9 +442,16 @@ class MlxTranslator:
         self.settings = settings
         self._model = None
         self._tokenizer = None
+        self._mlx_stream = None
         self._document_language: str | None = None
         self._document_defined_acronyms: set[str] = set()
         self._last_load_error: str | None = None
+        self._instruction_template_cache: _InstructionTemplateCache | None = None
+        self._instruction_cache_hits = 0
+        self._instruction_cache_misses = 0
+        self._cpu_threads = 0
+        self._mlx_runtime: dict[str, Any] = {}
+        self._batch_stats: Counter[str] = Counter()
 
     def _ensure_loaded(self) -> bool:
         if os.getenv("DISABLE_MLX", "0") == "1":
@@ -406,8 +462,11 @@ class MlxTranslator:
             self._last_load_error = None
             return True
         try:
+            self._configure_cpu_threads()
             self._configure_mlx_thread()
             self._model, self._tokenizer = self._load_model_and_tokenizer(self.settings.model_name)
+            self._instruction_template_cache = None
+            self._record_mlx_runtime()
             self._last_load_error = None
             return True
         except Exception as exc:
@@ -586,25 +645,77 @@ class MlxTranslator:
         }
 
         total_chunks = len(chunks)
-        for index, chunk in enumerate(chunks, start=1):
-            block_type = self._chunk_block_type(chunk, block_by_id)
-            effective_context = self._augment_context_for_block_type(chunk.context, block_type)
-            source_language_authoritative = self._source_language_is_authoritative(chunk)
-            is_table_like = self._is_table_heavy_markup(chunk.source_text)
-            preserve_verbatim = block_type in {
-                BlockType.EQUATION,
-                BlockType.PAGE_NUMBER,
-                BlockType.REFERENCE,
-            }
-            structural_translation = self._structural_label_translation(
-                chunk.source_text,
-                chunk.source_language,
-                block_type,
-            )
-            is_english = loaded and (
-                preserve_verbatim
-                or (structural_translation is None and self._is_already_english(chunk))
-            )
+        plans = [
+            self._chunk_translation_plan(index, chunk, loaded, block_by_id)
+            for index, chunk in enumerate(chunks, start=1)
+        ]
+        native_batching = loaded and self._native_batch_translation_enabled()
+        cursor = 0
+        while cursor < len(plans):
+            plan = plans[cursor]
+            if native_batching and self._is_batchable_plan(plan):
+                batch_plans = [plan]
+                next_cursor = cursor + 1
+                while (
+                    next_cursor < len(plans)
+                    and len(batch_plans) < max(1, int(self.settings.batch_size or 1))
+                    and self._is_batchable_plan(plans[next_cursor])
+                ):
+                    batch_plans.append(plans[next_cursor])
+                    next_cursor += 1
+
+                if on_chunk_started is not None:
+                    for batch_plan in batch_plans:
+                        on_chunk_started(batch_plan.index, total_chunks)
+                requests = [
+                    _BatchTranslationRequest(
+                        text=batch_plan.chunk.source_text,
+                        context=batch_plan.effective_context,
+                        source_language=batch_plan.chunk.source_language,
+                        block_type=batch_plan.block_type,
+                        source_language_authoritative=(batch_plan.source_language_authoritative),
+                    )
+                    for batch_plan in batch_plans
+                ]
+                translations = self._translate_requests_with_validation_batch(requests)
+                for batch_plan, translated in zip(
+                    batch_plans,
+                    translations,
+                    strict=True,
+                ):
+                    chunk = batch_plan.chunk
+                    batch_validation_issue = self._translation_acceptance_issue(
+                        chunk.source_text,
+                        translated,
+                        chunk.source_language,
+                        batch_plan.block_type,
+                        source_language_authoritative=(batch_plan.source_language_authoritative),
+                    )
+                    chunk.translated_text = translated
+                    if batch_validation_issue is not None:
+                        self._mark_translation_failure(chunk, batch_validation_issue)
+                    else:
+                        chunk.status = "ready_for_translation"
+                        chunk.reason = None
+                    application_chunks.append(chunk)
+                    if on_chunk_translated is not None:
+                        preview = translated.replace("\n", " ").strip()
+                        on_chunk_translated(
+                            batch_plan.index,
+                            total_chunks,
+                            preview[:160],
+                        )
+                cursor = next_cursor
+                continue
+
+            chunk = plan.chunk
+            index = plan.index
+            block_type = plan.block_type
+            effective_context = plan.effective_context
+            source_language_authoritative = plan.source_language_authoritative
+            is_table_like = plan.is_table_like
+            is_english = plan.is_english
+            physical_segments = list(plan.physical_segments)
             validation_issue: str | None = None
 
             if on_chunk_started is not None:
@@ -617,7 +728,6 @@ class MlxTranslator:
                     f"chunk-{index}",
                 )
 
-            physical_segments = self._physical_translation_segments(chunk, block_by_id)
             if not loaded or is_english:
                 translated = chunk.source_text
                 if physical_segments:
@@ -688,6 +798,7 @@ class MlxTranslator:
             if on_chunk_translated is not None:
                 preview = translated.replace("\n", " ").strip()
                 on_chunk_translated(index, total_chunks, preview[:160])
+            cursor += 1
 
         application_chunks = self._coalesce_translated_chunks(application_chunks)
         document.translation_chunks = application_chunks
@@ -711,7 +822,95 @@ class MlxTranslator:
             if warning not in document.warnings:
                 document.warnings.append(warning)
 
+        document.metadata.translation["mlx_runtime"] = self.runtime_metadata()
+
         return document, translated_md
+
+    def _chunk_translation_plan(
+        self,
+        index: int,
+        chunk: TranslationChunk,
+        loaded: bool,
+        block_by_id: dict[str, Block],
+    ) -> _ChunkTranslationPlan:
+        block_type = self._chunk_block_type(chunk, block_by_id)
+        effective_context = self._augment_context_for_block_type(chunk.context, block_type)
+        source_language_authoritative = self._source_language_is_authoritative(chunk)
+        is_table_like = self._is_table_heavy_markup(chunk.source_text)
+        preserve_verbatim = block_type in {
+            BlockType.EQUATION,
+            BlockType.PAGE_NUMBER,
+            BlockType.REFERENCE,
+        }
+        structural_translation = self._structural_label_translation(
+            chunk.source_text,
+            chunk.source_language,
+            block_type,
+        )
+        is_english = loaded and (
+            preserve_verbatim
+            or (structural_translation is None and self._is_already_english(chunk))
+        )
+        return _ChunkTranslationPlan(
+            index=index,
+            chunk=chunk,
+            block_type=block_type,
+            effective_context=effective_context,
+            source_language_authoritative=source_language_authoritative,
+            is_table_like=is_table_like,
+            is_english=is_english,
+            physical_segments=tuple(self._physical_translation_segments(chunk, block_by_id)),
+        )
+
+    def _native_batch_translation_enabled(self) -> bool:
+        """Respect test/application overrides of the established translation hooks."""
+
+        translate_chunk = getattr(self._translate_chunk, "__func__", None)
+        translate_validated = getattr(
+            self._translate_chunk_with_validation,
+            "__func__",
+            None,
+        )
+        return (
+            translate_chunk is MlxTranslator._translate_chunk
+            and translate_validated is MlxTranslator._translate_chunk_with_validation
+        )
+
+    def _is_batchable_plan(self, plan: _ChunkTranslationPlan) -> bool:
+        if (
+            plan.is_english
+            or plan.is_table_like
+            or plan.physical_segments
+            or not plan.chunk.source_text.strip()
+        ):
+            return False
+        if plan.block_type not in {
+            BlockType.HEADING,
+            BlockType.PARAGRAPH,
+            BlockType.LIST,
+            BlockType.FOOTNOTE,
+            BlockType.HEADER,
+            BlockType.FOOTER,
+            BlockType.UNKNOWN,
+        }:
+            return False
+        if (
+            self._structural_label_translation(
+                plan.chunk.source_text,
+                plan.chunk.source_language,
+                plan.block_type,
+            )
+            is not None
+        ):
+            return False
+        return (
+            self._structural_caption_parts(
+                plan.chunk.source_text,
+                plan.chunk.source_language,
+                plan.block_type,
+            )
+            is None
+        )
 
     def _physical_translation_segments(
         self,
@@ -1359,6 +1558,8 @@ class MlxTranslator:
     def cleanup(self) -> None:
         self._model = None
         self._tokenizer = None
+        self._instruction_template_cache = None
+        self._mlx_stream = None
         try:
             import mlx.core as mx
 
@@ -1372,9 +1573,116 @@ class MlxTranslator:
             import mlx.core as mx
 
             mx.set_default_device(mx.gpu)
-            mx.set_default_stream(mx.new_stream(mx.gpu))
+            if self._mlx_stream is None:
+                self._mlx_stream = mx.new_stream(mx.gpu)
+            mx.set_default_stream(self._mlx_stream)
         except Exception as exc:
-            logger.debug("MLX thread stream setup skipped: %s", exc)
+            raise RuntimeError("Unable to configure the MLX Metal GPU runtime.") from exc
+
+    def _configure_cpu_threads(self) -> None:
+        """Bound CPU helper pools without consuming every efficiency core.
+
+        MLX model operations stay on Metal. These variables only govern CPU-side
+        tokenization and library helpers in the isolated translation process.
+        Existing explicit environment choices are preserved.
+        """
+
+        configured = max(0, int(self.settings.cpu_threads or 0))
+        threads = configured or self._recommended_cpu_threads()
+        self._cpu_threads = max(1, threads)
+        for variable in (
+            "RAYON_NUM_THREADS",
+            "OMP_NUM_THREADS",
+            "VECLIB_MAXIMUM_THREADS",
+            "OPENBLAS_NUM_THREADS",
+            "NUMEXPR_NUM_THREADS",
+        ):
+            os.environ.setdefault(variable, str(self._cpu_threads))
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
+
+    def _recommended_cpu_threads(self) -> int:
+        logical_cores = max(1, int(os.cpu_count() or 1))
+        performance_cores = 0
+        if os.uname().sysname == "Darwin":
+            try:
+                result = subprocess.run(
+                    ["sysctl", "-n", "hw.perflevel0.logicalcpu"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                performance_cores = int(result.stdout.strip())
+            except (OSError, ValueError, subprocess.SubprocessError):
+                performance_cores = 0
+        preferred_pool = performance_cores or logical_cores
+        if preferred_pool > 2:
+            preferred_pool -= 1
+        return max(1, min(6, preferred_pool))
+
+    def _record_mlx_runtime(self) -> None:
+        try:
+            import mlx.core as mx
+
+            device_info = mx.device_info()
+            fast_sdpa = bool(
+                hasattr(mx, "fast") and hasattr(mx.fast, "scaled_dot_product_attention")
+            )
+            if "gpu" not in str(mx.default_device()).casefold():
+                raise RuntimeError("MLX default device is not the Metal GPU.")
+            self._mlx_runtime = {
+                "device": "metal_gpu",
+                "device_name": str(device_info.get("device_name", "Apple GPU")),
+                # MLX-LM's Qwen 3.5 attention implementation calls this fused
+                # primitive. MLX selects the appropriate Metal attention kernel;
+                # it does not expose a separate third-party FlashAttention flag.
+                "attention_backend": (
+                    "mlx.fast.scaled_dot_product_attention" if fast_sdpa else "model_default"
+                ),
+                "fast_attention_available": fast_sdpa,
+                "cpu_threads": self._cpu_threads,
+                "batch_size": max(1, int(self.settings.batch_size)),
+                "batch_token_budget": max(1024, int(self.settings.batch_token_budget)),
+            }
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            logger.debug("Unable to record MLX runtime capabilities: %s", exc)
+            self._mlx_runtime = {
+                "device": "unknown",
+                "attention_backend": "model_default",
+                "fast_attention_available": False,
+                "cpu_threads": self._cpu_threads,
+                "batch_size": max(1, int(self.settings.batch_size)),
+                "batch_token_budget": max(1024, int(self.settings.batch_token_budget)),
+            }
+
+    def runtime_metadata(self) -> dict[str, Any]:
+        instruction_mode = "disabled"
+        if self._instruction_template_cache is not None:
+            instruction_mode = (
+                "tokenized_prefix"
+                if self._instruction_template_cache.token_composition_safe
+                else "formatted_prefix"
+            )
+        generation = {
+            "batch_calls": 0,
+            "first_pass_requests": 0,
+            "retry_requests": 0,
+            "sequential_fallback_requests": 0,
+            "batch_failures": 0,
+            "batch_preparation_failures": 0,
+            **dict(self._batch_stats),
+        }
+        return {
+            **self._mlx_runtime,
+            "instruction_cache": {
+                "mode": instruction_mode,
+                "hits": self._instruction_cache_hits,
+                "misses": self._instruction_cache_misses,
+            },
+            "generation": generation,
+        }
 
     def _build_translation_units(self, document: DocumentModel) -> list[TranslationUnit]:
         units: list[TranslationUnit] = []
@@ -2468,15 +2776,32 @@ class MlxTranslator:
         self._configure_mlx_thread()
         from mlx_lm import generate, sample_utils
 
+        model = self._model
+        tokenizer = self._tokenizer
+        if model is None or tokenizer is None:
+            logger.warning("Translation requested before the MLX model was loaded.")
+            return text
         prompt = self._build_prompt(text, context, source_language)
         sampler = self._make_sampler(sample_utils)
         logits_processors = self._make_logits_processors(sample_utils)
-        max_tokens = force_max_tokens or self._estimated_output_tokens(prompt)
+        prompt_for_generation: str | list[int] = prompt
+        prompt_token_count: int | None = None
+        try:
+            encoded_prompt = self._encode_prompts([prompt])[0]
+            prompt_for_generation = encoded_prompt
+            prompt_token_count = len(encoded_prompt)
+        except Exception as exc:
+            logger.debug("Cached prompt tokenization unavailable; using MLX tokenizer: %s", exc)
+        max_tokens = force_max_tokens or (
+            self._estimated_output_tokens_from_count(prompt_token_count)
+            if prompt_token_count is not None
+            else self._estimated_output_tokens(prompt)
+        )
         try:
             out = generate(
-                self._model,
-                self._tokenizer,
-                prompt=prompt,
+                model,
+                tokenizer,
+                prompt=prompt_for_generation,
                 max_tokens=max_tokens,
                 sampler=sampler,
                 logits_processors=logits_processors,
@@ -2488,6 +2813,226 @@ class MlxTranslator:
                 "Chunk translation failed; returning source text for this chunk: %s", exc
             )
             return text
+
+    def _translate_requests_with_validation_batch(
+        self,
+        requests: list[_BatchTranslationRequest],
+    ) -> list[str]:
+        """Translate independent chunks in two ordered batch passes.
+
+        The first pass covers every request. Only failed validations are placed
+        in the retry pass. Rare specialised third attempts remain serial so the
+        existing heading/contact recovery policy is unchanged.
+        """
+
+        if not requests:
+            return []
+        try:
+            first_outputs = self._translate_requests_batch(requests, phase="first_pass")
+        except Exception as exc:
+            logger.warning(
+                "Unable to prepare MLX batch prompts; translating %d request(s) sequentially: %s",
+                len(requests),
+                exc,
+            )
+            self._batch_stats["batch_preparation_failures"] += 1
+            self._batch_stats["sequential_fallback_requests"] += len(requests)
+            return [
+                self._translate_chunk_with_validation(
+                    request.text,
+                    request.context,
+                    request.source_language,
+                    request.block_type,
+                    source_language_authoritative=request.source_language_authoritative,
+                )
+                for request in requests
+            ]
+        results: list[str | None] = [None] * len(requests)
+        retry_requests: list[_BatchTranslationRequest] = []
+        retry_indexes: list[int] = []
+        retry_contexts: dict[int, str] = {}
+
+        for index, (request, translated) in enumerate(zip(requests, first_outputs, strict=True)):
+            if self._is_acceptable_chunk_translation(
+                request.text,
+                translated,
+                request.source_language,
+                request.block_type,
+                source_language_authoritative=request.source_language_authoritative,
+            ):
+                results[index] = translated
+                continue
+            retry_context = self._translation_retry_context(
+                request.text,
+                translated,
+                request.context,
+                request.block_type,
+            )
+            retry_indexes.append(index)
+            retry_contexts[index] = retry_context
+            retry_requests.append(
+                _BatchTranslationRequest(
+                    text=request.text,
+                    context=retry_context,
+                    source_language=request.source_language,
+                    block_type=request.block_type,
+                    source_language_authoritative=request.source_language_authoritative,
+                )
+            )
+
+        if retry_requests:
+            try:
+                retry_outputs = self._translate_requests_batch(
+                    retry_requests,
+                    phase="retry",
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Unable to prepare MLX retry batch; retrying %d request(s) sequentially: %s",
+                    len(retry_requests),
+                    exc,
+                )
+                self._batch_stats["batch_preparation_failures"] += 1
+                self._batch_stats["sequential_fallback_requests"] += len(retry_requests)
+                retry_outputs = [
+                    self._translate_chunk(
+                        request.text,
+                        request.context,
+                        request.source_language,
+                    )
+                    for request in retry_requests
+                ]
+            for result_index, retried in zip(
+                retry_indexes,
+                retry_outputs,
+                strict=True,
+            ):
+                request = requests[result_index]
+                results[result_index] = self._finish_translation_after_retry(
+                    request.text,
+                    retried,
+                    retry_contexts[result_index],
+                    request.source_language,
+                    request.block_type,
+                    source_language_authoritative=request.source_language_authoritative,
+                    original_context=request.context,
+                )
+
+        return [
+            result if result is not None else request.text
+            for request, result in zip(requests, results, strict=True)
+        ]
+
+    def _translate_requests_batch(
+        self,
+        requests: list[_BatchTranslationRequest],
+        *,
+        phase: str,
+    ) -> list[str]:
+        prompts = [
+            self._build_prompt(
+                request.text,
+                request.context,
+                request.source_language,
+            )
+            for request in requests
+        ]
+        encoded_prompts = self._encode_prompts(prompts)
+        prepared = [
+            _PreparedBatchPrompt(
+                request=request,
+                prompt=prompt,
+                prompt_tokens=tuple(prompt_tokens),
+                max_tokens=self._estimated_output_tokens_from_count(len(prompt_tokens)),
+            )
+            for request, prompt, prompt_tokens in zip(
+                requests,
+                prompts,
+                encoded_prompts,
+                strict=True,
+            )
+        ]
+        outputs: list[str] = []
+        for batch in self._adaptive_prompt_batches(prepared):
+            outputs.extend(self._generate_prepared_batch(batch, phase=phase))
+        return outputs
+
+    def _adaptive_prompt_batches(
+        self,
+        prompts: list[_PreparedBatchPrompt],
+    ) -> list[list[_PreparedBatchPrompt]]:
+        maximum_size = max(1, int(self.settings.batch_size or 1))
+        token_budget = max(1024, int(self.settings.batch_token_budget or 1024))
+        batches: list[list[_PreparedBatchPrompt]] = []
+        current: list[_PreparedBatchPrompt] = []
+        current_cost = 0
+        for prompt in prompts:
+            if current and (
+                len(current) >= maximum_size or current_cost + prompt.token_cost > token_budget
+            ):
+                batches.append(current)
+                current = []
+                current_cost = 0
+            current.append(prompt)
+            current_cost += prompt.token_cost
+        if current:
+            batches.append(current)
+        return batches
+
+    def _generate_prepared_batch(
+        self,
+        batch: list[_PreparedBatchPrompt],
+        *,
+        phase: str,
+    ) -> list[str]:
+        self._configure_mlx_thread()
+        try:
+            from mlx_lm import batch_generate, sample_utils
+
+            response = batch_generate(
+                self._model,
+                self._tokenizer,
+                [list(prompt.prompt_tokens) for prompt in batch],
+                max_tokens=[prompt.max_tokens for prompt in batch],
+                sampler=self._make_sampler(sample_utils),
+                logits_processors=self._make_logits_processors(sample_utils),
+            )
+            texts = list(response.texts)
+            if len(texts) != len(batch):
+                raise RuntimeError(
+                    f"MLX batch returned {len(texts)} outputs for {len(batch)} prompts."
+                )
+            self._batch_stats["batch_calls"] += 1
+            self._batch_stats[f"{phase}_requests"] += len(batch)
+            self._batch_stats["maximum_observed_batch_size"] = max(
+                self._batch_stats["maximum_observed_batch_size"],
+                len(batch),
+            )
+            stats = getattr(response, "stats", None)
+            if stats is not None:
+                self._batch_stats["prompt_tokens"] += int(getattr(stats, "prompt_tokens", 0) or 0)
+                self._batch_stats["generation_tokens"] += int(
+                    getattr(stats, "generation_tokens", 0) or 0
+                )
+            return [self._postprocess_translated_text(str(text).strip()) for text in texts]
+        except Exception as exc:
+            logger.warning(
+                "MLX %s batch generation failed; retrying %d request(s) sequentially: %s",
+                phase,
+                len(batch),
+                exc,
+            )
+            self._batch_stats["batch_failures"] += 1
+            self._batch_stats["sequential_fallback_requests"] += len(batch)
+            return [
+                self._translate_chunk(
+                    prompt.request.text,
+                    prompt.request.context,
+                    prompt.request.source_language,
+                    force_max_tokens=prompt.max_tokens,
+                )
+                for prompt in batch
+            ]
 
     def _translate_chunk_with_validation(
         self,
@@ -2536,6 +3081,30 @@ class MlxTranslator:
         ):
             return translated
 
+        retry_context = self._translation_retry_context(
+            text,
+            translated,
+            context,
+            block_type,
+        )
+        retried = self._translate_chunk(text, retry_context, source_language)
+        return self._finish_translation_after_retry(
+            text,
+            retried,
+            retry_context,
+            source_language,
+            block_type,
+            source_language_authoritative=source_language_authoritative,
+            original_context=context,
+        )
+
+    def _translation_retry_context(
+        self,
+        text: str,
+        translated: str,
+        context: str,
+        block_type: BlockType | None,
+    ) -> str:
         missing_acronyms = self._missing_source_acronyms(text, translated, block_type)
         invented_acronyms = self._invented_target_acronyms(text, translated, block_type)
         missing_identifiers = self._missing_verbatim_identifiers(text, translated)
@@ -2556,7 +3125,7 @@ class MlxTranslator:
                 f"{', '.join(invented_acronyms)}. Translate the source wording directly instead "
                 "of importing terminology or abbreviations from nearby context."
             )
-        retry_context = (
+        return (
             f"{context}\n"
             "The previous output was not an acceptable English translation. Return English only and "
             "translate every substantive source-language phrase; do not repeat source-language prose. "
@@ -2565,7 +3134,18 @@ class MlxTranslator:
             "separate logical blocks. Preserve every numeric value exactly. "
             f"Do not summarize, omit, or collapse content.{verbatim_requirements}"
         ).strip()
-        retried = self._translate_chunk(text, retry_context, source_language)
+
+    def _finish_translation_after_retry(
+        self,
+        text: str,
+        retried: str,
+        retry_context: str,
+        source_language: str | None,
+        block_type: BlockType | None,
+        *,
+        source_language_authoritative: bool,
+        original_context: str,
+    ) -> str:
         if self._is_acceptable_chunk_translation(
             text,
             retried,
@@ -2618,7 +3198,7 @@ class MlxTranslator:
                 block_type,
                 source_language_authoritative=source_language_authoritative,
             )
-            structural_fallback = self._structural_heading_fallback(context)
+            structural_fallback = self._structural_heading_fallback(original_context)
             if structural_fallback is not None and self._is_acceptable_chunk_translation(
                 text,
                 structural_fallback,
@@ -3700,6 +4280,14 @@ class MlxTranslator:
             return []
 
     def _format_chat_prompt(self, system: str, user: str) -> str:
+        if system == self._system_prompt():
+            template = self._instruction_template(system)
+            if template is not None:
+                self._instruction_cache_hits += 1
+                return f"{template.prefix}{user}{template.suffix}"
+        return self._render_chat_prompt(system, user)
+
+    def _render_chat_prompt(self, system: str, user: str) -> str:
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -3723,6 +4311,117 @@ class MlxTranslator:
             except Exception as exc:
                 logger.debug("Tokenizer chat template failed; using plain prompt: %s", exc)
         return f"{system}\n\n{user}\n\nENGLISH:"
+
+    def _instruction_template(self, system: str) -> _InstructionTemplateCache | None:
+        cached = self._instruction_template_cache
+        if cached is not None and cached.system == system:
+            return cached
+        if self._tokenizer is None:
+            return None
+
+        self._instruction_cache_misses += 1
+        marker = "\u241fTRANSLATHOR_USER_CONTENT_BOUNDARY\u241f"
+        rendered = self._render_chat_prompt(system, marker)
+        if rendered.count(marker) != 1:
+            logger.debug("Chat template rewrote the instruction-cache marker; caching disabled.")
+            return None
+        prefix, suffix = rendered.split(marker, maxsplit=1)
+        prefix_tokens: tuple[int, ...] | None = None
+        token_composition_safe = False
+        try:
+            prefix_tokens = tuple(
+                int(token) for token in self._tokenizer.encode(prefix, add_special_tokens=True)
+            )
+            probes = (
+                "TEXT:\nA short sentence.",
+                "SOURCE LANGUAGE: es\n\nTEXT:\nTexto clínico.",
+                "TEXT:\n<table><tr><td>6 m</td></tr></table>",
+            )
+            token_composition_safe = all(
+                list(prefix_tokens)
+                + list(
+                    self._tokenizer.encode(
+                        f"{probe}{suffix}",
+                        add_special_tokens=False,
+                    )
+                )
+                == list(
+                    self._tokenizer.encode(
+                        f"{prefix}{probe}{suffix}",
+                        add_special_tokens=True,
+                    )
+                )
+                for probe in probes
+            )
+        except (AttributeError, TypeError, ValueError):
+            prefix_tokens = None
+            token_composition_safe = False
+
+        cached = _InstructionTemplateCache(
+            system=system,
+            prefix=prefix,
+            suffix=suffix,
+            prefix_tokens=prefix_tokens,
+            token_composition_safe=token_composition_safe,
+        )
+        self._instruction_template_cache = cached
+        return cached
+
+    def _encode_prompts(self, prompts: list[str]) -> list[list[int]]:
+        if not prompts:
+            return []
+        template = self._instruction_template_cache
+        if (
+            template is not None
+            and template.token_composition_safe
+            and template.prefix_tokens is not None
+            and all(
+                prompt.startswith(template.prefix) and prompt.endswith(template.suffix)
+                for prompt in prompts
+            )
+        ):
+            bodies = [prompt[len(template.prefix) :] for prompt in prompts]
+            encoded_bodies = self._batch_encode_texts(
+                bodies,
+                add_special_tokens=False,
+            )
+            prefix_tokens = list(template.prefix_tokens)
+            return [prefix_tokens + body_tokens for body_tokens in encoded_bodies]
+        return self._batch_encode_texts(prompts, add_special_tokens=True)
+
+    def _batch_encode_texts(
+        self,
+        texts: list[str],
+        *,
+        add_special_tokens: bool,
+    ) -> list[list[int]]:
+        if self._tokenizer is None:
+            raise RuntimeError("Cannot tokenize translation prompts before the model is loaded.")
+        inner_tokenizer = getattr(self._tokenizer, "_tokenizer", None)
+        if callable(inner_tokenizer):
+            try:
+                encoded = inner_tokenizer(
+                    texts,
+                    add_special_tokens=add_special_tokens,
+                    padding=False,
+                    truncation=False,
+                )
+                input_ids = encoded["input_ids"]
+                return [list(map(int, tokens)) for tokens in input_ids]
+            except (KeyError, TypeError, ValueError):
+                pass
+        return [
+            list(
+                map(
+                    int,
+                    self._tokenizer.encode(
+                        text,
+                        add_special_tokens=add_special_tokens,
+                    ),
+                )
+            )
+            for text in texts
+        ]
 
     def _chat_template_kwargs(self) -> dict[str, Any]:
         if self._is_qwen35_model_name(self.settings.model_name):
@@ -3977,5 +4676,9 @@ class MlxTranslator:
             prompt_tokens = len(self._tokenizer.encode(prompt))
         except Exception:
             return self.settings.max_tokens
-        estimated = max(128, min(self.settings.max_tokens, int(prompt_tokens * 0.75)))
-        return estimated
+        return self._estimated_output_tokens_from_count(prompt_tokens)
+
+    def _estimated_output_tokens_from_count(self, prompt_tokens: int | None) -> int:
+        if prompt_tokens is None:
+            return self.settings.max_tokens
+        return max(128, min(self.settings.max_tokens, int(prompt_tokens * 0.75)))

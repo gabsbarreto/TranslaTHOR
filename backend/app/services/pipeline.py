@@ -533,6 +533,10 @@ class TranslationPipeline:
                     "strip_existing_ocr": result.stripped_existing_ocr,
                     "local_vlm_repair_used": result.used_local_vlm_repair,
                     "extraction_time_seconds": result.metadata.get("extraction_time_seconds"),
+                    "mlx_runtime": translated_document.metadata.translation.get(
+                        "mlx_runtime",
+                        {},
+                    ),
                     "warnings": result.warnings,
                 },
                 artifacts=artifacts,

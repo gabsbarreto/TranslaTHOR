@@ -23,10 +23,12 @@ This browser-based app translates PDFs locally.
    agree.
 9. Figure regions are deduplicated, validated, associated with captions, and captured as
    high-resolution PNG previews plus clipped vector SVG assets when the source supports them.
-10. A local MLX Qwen model translates the document into English.
-    Substantive output is checked for source-language residue, unchanged source text, and damaged
-    table topology. One stricter English-only retry is attempted; if it still fails, the source is
-    retained and the failure is recorded instead of claiming a successful translation.
+10. A local MLX Qwen model translates the document into English. Compatible prose first passes run
+    in adaptive batches of up to four on Metal, while results are applied in the original document
+    order. Substantive output is checked for source-language residue, unchanged source text, and
+    damaged table topology. Only failed validations enter a stricter second batch; if recovery still
+    fails, the source is retained and the failure is recorded instead of claiming success. Table,
+    caption, and grouped physical-region safeguards keep their specialised translation paths.
 11. The browser presents the readable PDF and conservative original-layout PDF as the two primary
     results after translation completes. Structured Markdown, JSON, faithful reconstruction, and
     diagnostic artifacts remain available to the backend and existing API routes without
@@ -210,6 +212,20 @@ bash scripts/run_dev.sh
 
 Open `http://127.0.0.1:8000`.
 
+The isolated translation worker prefers `.venv/bin/python`, so the tested MLX stack is used even
+when the web server was started by another Python installation. MLX model operations are explicitly
+scheduled on the Metal GPU. Qwen 3.5 uses MLX's fused
+`mlx.fast.scaled_dot_product_attention` primitive for its softmax-attention layers; its remaining
+linear-attention layers use the model's MLX Metal kernels. There is no separate third-party
+FlashAttention switch in MLX.
+
+Ordinary prose uses adaptive `batch_generate()` groups of up to four prompts with an 8192-token
+combined input/output budget. The shared chat template and translation-instruction prefix are
+rendered once and, when tokenizer-boundary checks pass, their token IDs are reused. CPU helper pools
+default to a hardware-aware value that reserves system capacity; on the tested 12-core M4 Pro,
+six tokenizer threads outperformed eight or twelve. Runtime metadata records the selected device,
+attention backend, thread count, instruction-cache mode, batch calls, and fallback counts.
+
 After a job finishes, use **Readable PDF** to test the reflowed output and **Original layout PDF**
 to test source-page reconstruction. If original-layout reconstruction is partial, open
 **View details** to inspect its warning and reconstruction report, and use the readable PDF as the
@@ -336,6 +352,13 @@ ten-case specification is always tested.
 
 ## Optional Environment Variables
 
+- `TRANSLATION_PYTHON`: isolated translation worker executable; defaults to `.venv/bin/python` and
+  falls back to the server interpreter when that file is unavailable.
+- `TRANSLATION_BATCH_SIZE`: maximum compatible prose prompts per MLX batch; defaults to `4`.
+- `TRANSLATION_BATCH_TOKEN_BUDGET`: combined estimated input/output tokens per batch; defaults to
+  `8192` and automatically splits long groups.
+- `MLX_CPU_THREADS`: CPU tokenizer/helper threads. `0` or unset selects a conservative
+  hardware-aware value instead of using every core.
 - `QWEN_OCR_PYTHON`: Python executable containing `mlx-vlm`.
 - `QWEN_OCR_MODEL`: Qwen OCR model identifier.
 - `QWEN_OCR_PROMPT`: OCR transcription prompt.

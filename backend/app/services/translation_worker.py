@@ -11,6 +11,9 @@ from app.config import (
     DEFAULT_LLM_TEMPERATURE,
     DEFAULT_LLM_TOP_K,
     DEFAULT_LLM_TOP_P,
+    DEFAULT_MLX_CPU_THREADS,
+    DEFAULT_TRANSLATION_BATCH_SIZE,
+    DEFAULT_TRANSLATION_BATCH_TOKEN_BUDGET,
     DEFAULT_TRANSLATION_MODEL,
 )
 from app.models.schema import DocumentModel
@@ -23,7 +26,9 @@ def emit(event: dict) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Translate a structured document with MLX in an isolated process.")
+    parser = argparse.ArgumentParser(
+        description="Translate a structured document with MLX in an isolated process."
+    )
     parser.add_argument("--document", required=True)
     parser.add_argument("--markdown", required=True)
     parser.add_argument("--output-document", required=True)
@@ -57,6 +62,27 @@ def main() -> int:
         )
     )
     max_tokens = int(model_cfg.get("max_tokens", settings.get("max_tokens", 2048)))
+    batch_size = int(
+        model_cfg.get(
+            "batch_size",
+            settings.get("translation_batch_size", DEFAULT_TRANSLATION_BATCH_SIZE),
+        )
+    )
+    batch_token_budget = int(
+        model_cfg.get(
+            "batch_token_budget",
+            settings.get(
+                "translation_batch_token_budget",
+                DEFAULT_TRANSLATION_BATCH_TOKEN_BUDGET,
+            ),
+        )
+    )
+    cpu_threads = int(
+        model_cfg.get(
+            "cpu_threads",
+            settings.get("mlx_cpu_threads", DEFAULT_MLX_CPU_THREADS),
+        )
+    )
     document_path = Path(args.document)
     markdown_path = Path(args.markdown)
     output_document_path = Path(args.output_document)
@@ -77,6 +103,9 @@ def main() -> int:
             presence_penalty=presence_penalty,
             repetition_penalty=repetition_penalty,
             max_tokens=max_tokens,
+            batch_size=batch_size,
+            batch_token_budget=batch_token_budget,
+            cpu_threads=cpu_threads,
         )
     )
     if not translator._ensure_loaded():
@@ -109,6 +138,7 @@ def main() -> int:
             "min_p": min_p,
             "presence_penalty": presence_penalty,
             "repetition_penalty": repetition_penalty,
+            "mlx_runtime": translator.runtime_metadata(),
         }
         translated_md = MarkdownBuilder().build(translated_doc)
         output_document_path.write_text(translated_doc.model_dump_json(indent=2), encoding="utf-8")

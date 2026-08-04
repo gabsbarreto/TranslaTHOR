@@ -104,6 +104,10 @@ def test_job_details_hold_warnings_configuration_and_reconstruction_information(
     assert "original_layout_reconstruction" in APP_JS
     assert "warnings" in APP_JS
     assert "Translation model" in APP_JS
+    assert "mlx_runtime" in APP_JS
+    assert "Attention backend" in APP_JS
+    assert "Translation batch size" in APP_JS
+    assert "Instruction cache" in APP_JS
 
 
 def test_archive_unarchive_delete_and_cancel_use_scoped_job_routes() -> None:
