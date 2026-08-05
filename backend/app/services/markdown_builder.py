@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.models.schema import Block, BlockType, DocumentModel, FigureAsset, TableModel
+from app.services.cross_page_continuation import (
+    CONTINUATION_GROUP_ID,
+    CONTINUATION_VISIBLE_INTERVENING_IDS,
+)
 from app.services.table_markup import parse_table_rows, rows_have_consistent_shape
 
 
@@ -35,9 +39,7 @@ class MarkdownBuilder:
         lines: list[str] = []
         page = 0
         caption_by_id = {
-            block.id: block
-            for block in document.blocks
-            if block.block_type == BlockType.CAPTION
+            block.id: block for block in document.blocks if block.block_type == BlockType.CAPTION
         }
         table_caption_by_id = self._table_caption_map(document, caption_by_id)
         associated_caption_ids = {
@@ -49,9 +51,7 @@ class MarkdownBuilder:
                 or self._available_asset(figure.image_path)
             )
         }
-        associated_caption_ids.update(
-            caption.id for caption in table_caption_by_id.values()
-        )
+        associated_caption_ids.update(caption.id for caption in table_caption_by_id.values())
         figure_anchors = self._figure_anchors(document, caption_by_id)
         translation_flow_text = self._translation_flow_text(document)
         rendered_figures: set[str] = set()
@@ -165,24 +165,37 @@ class MarkdownBuilder:
             try:
                 ordered = sorted(
                     blocks,
-                    key=lambda block: int(
-                        block.metadata.get("translation_placement_index")
-                    ),
+                    key=lambda block: int(block.metadata.get("translation_placement_index")),
                 )
-                expected_count = int(
-                    ordered[0].metadata.get("translation_placement_count")
-                )
+                expected_count = int(ordered[0].metadata.get("translation_placement_count"))
                 indexes = [
-                    int(block.metadata.get("translation_placement_index"))
-                    for block in ordered
+                    int(block.metadata.get("translation_placement_index")) for block in ordered
                 ]
             except (TypeError, ValueError):
                 continue
             if expected_count != len(ordered) or indexes != list(range(expected_count)):
                 continue
+            if len({block.page_number for block in ordered}) > 1:
+                continuation_group_ids = {
+                    str(block.metadata.get(CONTINUATION_GROUP_ID) or "").strip()
+                    for block in ordered
+                }
+                visible_intervening_ids = {
+                    str(block_id)
+                    for block in ordered
+                    for block_id in (block.metadata.get(CONTINUATION_VISIBLE_INTERVENING_IDS) or [])
+                }
+                # Legacy placement groups have no proof metadata. Keep them
+                # page-local. Proven groups may be reflowed only when margins
+                # are the sole blocks between their physical fragments.
+                if (
+                    len(continuation_group_ids) != 1
+                    or "" in continuation_group_ids
+                    or visible_intervening_ids
+                ):
+                    continue
             parts = [
-                self._readable_block_text(block, document.figures).strip()
-                for block in ordered
+                self._readable_block_text(block, document.figures).strip() for block in ordered
             ]
             if not all(parts):
                 continue
@@ -227,10 +240,7 @@ class MarkdownBuilder:
             return []
         remote_images = list(QWEN_REMOTE_MARKDOWN_IMAGE_PATTERN.finditer(block.text))
         local_asset_count = len(self._matching_materialized_figures(block, figures))
-        return [
-            self._missing_image_fallback(match)
-            for match in remote_images[local_asset_count:]
-        ]
+        return [self._missing_image_fallback(match) for match in remote_images[local_asset_count:]]
 
     def _missing_image_fallback(self, match: re.Match[str]) -> str:
         alt = re.sub(r"\s+", " ", match.group("alt")).strip()
@@ -422,9 +432,7 @@ class MarkdownBuilder:
                 continue
             candidates = table_blocks_by_page.get(page_number, [])
             source_id = str(
-                table.debug.get("source_block_id")
-                or table.debug.get("marker_block_id")
-                or ""
+                table.debug.get("source_block_id") or table.debug.get("marker_block_id") or ""
             )
             table_block = next(
                 (candidate for candidate in candidates if candidate.id == source_id),
@@ -506,8 +514,7 @@ class MarkdownBuilder:
         graph: list[list[_CaptionFlowEdge]] = [[] for _ in range(sink + 1)]
         table_node = {table_id: table_offset + index for index, table_id in enumerate(table_ids)}
         caption_node = {
-            caption_id: caption_offset + index
-            for index, caption_id in enumerate(caption_ids)
+            caption_id: caption_offset + index for index, caption_id in enumerate(caption_ids)
         }
         zero = tuple(0.0 for _ in candidates[0][0])
 
@@ -685,8 +692,7 @@ class MarkdownBuilder:
             [
                 (
                     table.cells[row_index][column_index].model_copy(update={"text": cell.text})
-                    if row_index < len(table.cells)
-                    and column_index < len(table.cells[row_index])
+                    if row_index < len(table.cells) and column_index < len(table.cells[row_index])
                     else TableModel.TableCell(text=cell.text)
                 )
                 for column_index, cell in enumerate(row)
@@ -745,9 +751,7 @@ class MarkdownBuilder:
                 continue
             original_position, anchor_id = min(source_positions)
             caption = (
-                caption_by_id.get(figure.caption_block_id)
-                if figure.caption_block_id
-                else None
+                caption_by_id.get(figure.caption_block_id) if figure.caption_block_id else None
             )
             mention = self._first_figure_mention(document, caption)
             if mention is not None:
@@ -794,11 +798,7 @@ class MarkdownBuilder:
         if not asset_path:
             return ""
         source = self._asset_uri(asset_path)
-        caption = (
-            caption_by_id.get(figure.caption_block_id)
-            if figure.caption_block_id
-            else None
-        )
+        caption = caption_by_id.get(figure.caption_block_id) if figure.caption_block_id else None
         caption_html = ""
         if caption is not None and caption.text.strip():
             caption_html = f"<figcaption>{html.escape(caption.text.strip())}</figcaption>"

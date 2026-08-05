@@ -146,6 +146,11 @@ class TranslationChunk(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     continues_from_previous_page: bool = False
     continues_to_next_page: bool = False
+    continuation_group_id: str | None = None
+    continuation_decision_level: str | None = None
+    continuation_confidence: float | None = None
+    continuation_evidence: list[str] = Field(default_factory=list)
+    continuation_intervening_block_ids: list[str] = Field(default_factory=list)
 
 
 class DocumentMetadata(BaseModel):

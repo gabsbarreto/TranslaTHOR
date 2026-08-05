@@ -37,6 +37,18 @@ from app.config import (
     DEFAULT_TRANSLATION_MODEL,
 )
 from app.models.schema import Block, BlockType, DocumentModel, TranslationChunk
+from app.services.cross_page_continuation import (
+    CONTINUATION_CONFIDENCE,
+    CONTINUATION_DECISION,
+    CONTINUATION_EVIDENCE,
+    CONTINUATION_GROUP_ID,
+    CONTINUATION_INDEX,
+    CONTINUATION_INTERVENING_IDS,
+    CONTINUATION_SEAMS,
+    CONTINUES_FROM_PREVIOUS_PAGE,
+    CONTINUES_TO_NEXT_PAGE,
+    CrossPageContinuationResolver,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -534,6 +546,13 @@ class MlxTranslator:
                     unit.block_type,
                     nearby_context,
                 )
+                continuation_metadata = self._continuation_chunk_metadata(
+                    [
+                        block_by_id[block_id]
+                        for block_id in unit.block_ids
+                        if block_id in block_by_id
+                    ]
+                )
                 chunk = TranslationChunk(
                     id=f"chunk-{len(chunks)}",
                     block_ids=unit.block_ids,
@@ -545,6 +564,9 @@ class MlxTranslator:
                     source_token_count=self._token_count(text_part),
                     page_start=unit_pages[0] if unit_pages else None,
                     page_end=unit_pages[-1] if unit_pages else None,
+                    continues_from_previous_page=len(unit_pages) > 1,
+                    continues_to_next_page=len(unit_pages) > 1,
+                    **continuation_metadata,
                 )
                 chunks.append(chunk)
                 chunk_block_types[chunk.id] = unit.block_type
@@ -617,6 +639,24 @@ class MlxTranslator:
             "reference": BlockType.REFERENCE,
             "table": BlockType.TABLE,
         }.get(chunk_type, BlockType.PARAGRAPH)
+
+    def _continuation_chunk_metadata(self, blocks: list[Block]) -> dict[str, Any]:
+        continuation_block = next(
+            (block for block in blocks if block.metadata.get(CONTINUATION_GROUP_ID)),
+            None,
+        )
+        if continuation_block is None:
+            return {}
+        metadata = continuation_block.metadata
+        return {
+            "continuation_group_id": str(metadata[CONTINUATION_GROUP_ID]),
+            "continuation_decision_level": str(metadata.get(CONTINUATION_DECISION) or "proven"),
+            "continuation_confidence": float(metadata.get(CONTINUATION_CONFIDENCE) or 0.0),
+            "continuation_evidence": list(metadata.get(CONTINUATION_EVIDENCE) or []),
+            "continuation_intervening_block_ids": list(
+                metadata.get(CONTINUATION_INTERVENING_IDS) or []
+            ),
+        }
 
     def translate_document(
         self,
@@ -736,6 +776,7 @@ class MlxTranslator:
                             chunk,
                             physical_segments,
                             [source_text for _, source_text, _ in physical_segments],
+                            block_by_id,
                         )
                     )
             elif is_table_like:
@@ -769,6 +810,7 @@ class MlxTranslator:
                         chunk,
                         physical_segments,
                         segment_targets,
+                        block_by_id,
                         validation_issue=validation_issue,
                     )
                 )
@@ -945,12 +987,16 @@ class MlxTranslator:
         block_by_id: dict[str, Block],
     ) -> list[str]:
         targets: list[str] = []
-        shared_context = (
-            f"{context}\n"
-            "Translate only TEXT below. It belongs to the following continuous source passage; use that "
-            f"passage only for terminology and grammatical context:\n{logical_source_text}"
-        ).strip()
-        for batch in self._physical_segment_batches(segments):
+        batches = self._physical_segment_batches(segments)
+        segment_offset = 0
+        for batch in batches:
+            shared_context = self._physical_batch_shared_context(
+                context,
+                logical_source_text,
+                segments,
+                segment_offset,
+                len(batch),
+            )
             if len(batch) == 1:
                 _, source_text, block_type = batch[0]
                 targets.append(
@@ -961,6 +1007,7 @@ class MlxTranslator:
                         block_type,
                     )
                 )
+                segment_offset += len(batch)
                 continue
             targets.extend(
                 self._translate_tagged_physical_segments(
@@ -975,7 +1022,71 @@ class MlxTranslator:
                     ),
                 )
             )
+            segment_offset += len(batch)
         return targets
+
+    def _physical_batch_shared_context(
+        self,
+        context: str,
+        logical_source_text: str,
+        segments: list[tuple[str, str, BlockType]],
+        start: int,
+        count: int,
+    ) -> str:
+        token_budget = self._physical_segment_token_budget()
+        if self._token_count(logical_source_text) <= token_budget:
+            passage_label = "complete continuous source passage"
+            passage_context = logical_source_text
+        else:
+            # Keep oversized continuation groups seam-aware without placing the
+            # complete multi-page passage in every prompt. Whole physical
+            # regions remain the batching boundary; immediate neighboring text
+            # supplies grammar at the cut.
+            excerpt_budget = max(48, min(256, token_budget // 3))
+            end = start + count
+            excerpts: list[str] = []
+            if start > 0:
+                excerpts.append(
+                    "[preceding fragment] "
+                    + self._bounded_context_excerpt(
+                        segments[start - 1][1],
+                        excerpt_budget // 2,
+                        from_end=True,
+                    )
+                )
+            if end < len(segments):
+                excerpts.append(
+                    "[following fragment] "
+                    + self._bounded_context_excerpt(
+                        segments[end][1],
+                        excerpt_budget // 2,
+                        from_end=False,
+                    )
+                )
+            passage_label = "adjacent seam context from an oversized continuous passage"
+            passage_context = (
+                "\n".join(excerpts) or "No additional neighboring fragment fits safely."
+            )
+        return (
+            f"{context}\n"
+            f"Translate only TEXT below. It belongs to the following {passage_label}; use that "
+            f"passage only for terminology and grammatical context:\n{passage_context}"
+        ).strip()
+
+    def _bounded_context_excerpt(
+        self,
+        text: str,
+        token_budget: int,
+        *,
+        from_end: bool,
+    ) -> str:
+        words = text.split()
+        if not words:
+            return ""
+        while len(words) > 1 and self._token_count(" ".join(words)) > token_budget:
+            remove_count = max(1, len(words) // 4)
+            words = words[remove_count:] if from_end else words[:-remove_count]
+        return " ".join(words)
 
     def _physical_segments_form_continuous_paragraph(
         self,
@@ -987,8 +1098,10 @@ class MlxTranslator:
         Adjacent chunks are batched for linguistic context, but adjacency does
         not make them one paragraph. Redistribution is safe only for blocks
         that the normal paragraph join accepts, or for an explicit hyphenated
-        word continuation across a column boundary. Missing geometry is
-        deliberately not guessed.
+        word continuation across a column boundary. An adjacent-page pair is
+        accepted only when the shared resolver recorded the exact source-order
+        seam and every intervening block. Ordinary unproven groups retain the
+        same-page protections.
         """
 
         if len(segments) < 2 or any(
@@ -1005,20 +1118,32 @@ class MlxTranslator:
             current = block_by_id.get(current_segment[0])
             if previous is None or current is None:
                 return False
-            if previous.page_number != current.page_number:
-                return False
             previous_position = document_positions.get(previous.id)
             current_position = document_positions.get(current.id)
             if (
                 previous_position is None
                 or current_position is None
-                or current_position != previous_position + 1
-                or current.reading_order_index <= previous.reading_order_index
+                or current_position <= previous_position
             ):
                 return False
             previous_section = previous.metadata.get("section_hierarchy")
             current_section = current.metadata.get("section_hierarchy")
             if previous_section and current_section and previous_section != current_section:
+                return False
+            if previous.page_number != current.page_number:
+                if not self._is_proven_cross_page_segment_pair(
+                    previous,
+                    current,
+                    previous_position,
+                    current_position,
+                    block_by_id,
+                ):
+                    return False
+                continue
+            if (
+                current_position != previous_position + 1
+                or current.reading_order_index <= previous.reading_order_index
+            ):
                 return False
             if self._belongs_to_same_paragraph(previous, current):
                 continue
@@ -1030,6 +1155,44 @@ class MlxTranslator:
             ):
                 return False
         return True
+
+    def _is_proven_cross_page_segment_pair(
+        self,
+        previous: Block,
+        current: Block,
+        previous_position: int,
+        current_position: int,
+        block_by_id: dict[str, Block],
+    ) -> bool:
+        if current.page_number != previous.page_number + 1:
+            return False
+        previous_group = previous.metadata.get(CONTINUATION_GROUP_ID)
+        current_group = current.metadata.get(CONTINUATION_GROUP_ID)
+        if not previous_group or previous_group != current_group:
+            return False
+        if (
+            int(current.metadata.get(CONTINUATION_INDEX, -1))
+            != int(previous.metadata.get(CONTINUATION_INDEX, -1)) + 1
+        ):
+            return False
+
+        seam = next(
+            (
+                item
+                for item in (previous.metadata.get(CONTINUATION_SEAMS) or [])
+                if isinstance(item, dict)
+                and item.get("previous_block_id") == previous.id
+                and item.get("current_block_id") == current.id
+                and item.get("decision_level") == "proven"
+            ),
+            None,
+        )
+        if seam is None:
+            return False
+        expected_intervening = [str(value) for value in seam.get("intervening_block_ids") or []]
+        document_ids = list(block_by_id)
+        actual_intervening = document_ids[previous_position + 1 : current_position]
+        return actual_intervening == expected_intervening
 
     def _is_explicit_cross_column_continuation(
         self,
@@ -1065,9 +1228,7 @@ class MlxTranslator:
         self,
         segments: list[tuple[str, str, BlockType]],
     ) -> list[list[tuple[str, str, BlockType]]]:
-        token_budget = max(128, int(self.settings.chunk_size or DEFAULT_CHUNK_SIZE))
-        token_budget = min(token_budget, self.PROSE_CHUNK_TOKEN_CAP)
-        token_budget = min(token_budget, max(128, int(self.settings.max_tokens * 0.75)))
+        token_budget = self._physical_segment_token_budget()
         batches: list[list[tuple[str, str, BlockType]]] = []
         current: list[tuple[str, str, BlockType]] = []
         current_tokens = 0
@@ -1082,6 +1243,11 @@ class MlxTranslator:
         if current:
             batches.append(current)
         return batches
+
+    def _physical_segment_token_budget(self) -> int:
+        token_budget = max(128, int(self.settings.chunk_size or DEFAULT_CHUNK_SIZE))
+        token_budget = min(token_budget, self.PROSE_CHUNK_TOKEN_CAP)
+        return min(token_budget, max(128, int(self.settings.max_tokens * 0.75)))
 
     def _translate_single_physical_segment(
         self,
@@ -1530,26 +1696,38 @@ class MlxTranslator:
         chunk: TranslationChunk,
         segments: list[tuple[str, str, BlockType]],
         targets: list[str],
+        block_by_id: dict[str, Block],
         *,
         validation_issue: str | None = None,
     ) -> list[TranslationChunk]:
-        application_chunks = [
-            chunk.model_copy(
-                update={
-                    "id": f"{chunk.id}-block{index + 1:02d}",
-                    "block_ids": [block_id],
-                    "source_text": source_text,
-                    "translated_text": target,
-                    "placement_group_id": chunk.id,
-                    "placement_index": index,
-                    "placement_count": len(segments),
-                    "source_token_count": self._token_count(source_text),
-                }
+        application_chunks: list[TranslationChunk] = []
+        for index, ((block_id, source_text, _), target) in enumerate(
+            zip(segments, targets, strict=True)
+        ):
+            block = block_by_id.get(block_id)
+            page_number = block.page_number if block is not None else None
+            application_chunks.append(
+                chunk.model_copy(
+                    update={
+                        "id": f"{chunk.id}-block{index + 1:02d}",
+                        "block_ids": [block_id],
+                        "source_text": source_text,
+                        "translated_text": target,
+                        "placement_group_id": chunk.id,
+                        "placement_index": index,
+                        "placement_count": len(segments),
+                        "source_token_count": self._token_count(source_text),
+                        "page_start": page_number,
+                        "page_end": page_number,
+                        "continues_from_previous_page": bool(
+                            block and block.metadata.get(CONTINUES_FROM_PREVIOUS_PAGE)
+                        ),
+                        "continues_to_next_page": bool(
+                            block and block.metadata.get(CONTINUES_TO_NEXT_PAGE)
+                        ),
+                    }
+                )
             )
-            for index, ((block_id, source_text, _), target) in enumerate(
-                zip(segments, targets, strict=True)
-            )
-        ]
         if validation_issue is not None:
             for application_chunk in application_chunks:
                 self._mark_translation_failure(application_chunk, validation_issue)
@@ -1688,6 +1866,11 @@ class MlxTranslator:
         units: list[TranslationUnit] = []
         pending: list[Block] = []
         section_context = ""
+        continuation_resolution = CrossPageContinuationResolver().resolve(document)
+        document.metadata.translation["cross_page_continuation_group_count"] = len(
+            continuation_resolution.groups
+        )
+        active_continuation_group_id: str | None = None
 
         for block in document.blocks:
             if self._is_marker_table_cell_block(block):
@@ -1699,9 +1882,27 @@ class MlxTranslator:
             if not block.text.strip():
                 continue
 
+            if (
+                active_continuation_group_id is not None
+                and continuation_resolution.is_intervening_for(
+                    block.id,
+                    active_continuation_group_id,
+                )
+            ):
+                units.append(
+                    TranslationUnit(
+                        [block.id],
+                        block.text.strip(),
+                        block.block_type,
+                        section_context,
+                    )
+                )
+                continue
+
             if block.block_type == BlockType.HEADING:
                 self._flush_paragraph_unit(pending, units, section_context)
                 pending = []
+                active_continuation_group_id = None
                 heading_text = block.text.strip()
                 units.append(
                     TranslationUnit([block.id], heading_text, block.block_type, section_context)
@@ -1712,11 +1913,30 @@ class MlxTranslator:
             if block.block_type != BlockType.PARAGRAPH:
                 self._flush_paragraph_unit(pending, units, section_context)
                 pending = []
+                active_continuation_group_id = None
                 units.append(
                     TranslationUnit(
                         [block.id], block.text.strip(), block.block_type, section_context
                     )
                 )
+                continue
+
+            continuation_group = continuation_resolution.group_for(block.id)
+            if continuation_group is not None:
+                continuation_index = int(block.metadata.get(CONTINUATION_INDEX, 0))
+                if continuation_index == 0:
+                    if pending and not self._belongs_to_same_paragraph(pending[-1], block):
+                        self._flush_paragraph_unit(pending, units, section_context)
+                        pending = []
+                    pending.append(block)
+                    active_continuation_group_id = continuation_group.id
+                elif active_continuation_group_id == continuation_group.id:
+                    pending.append(block)
+                else:
+                    self._flush_paragraph_unit(pending, units, section_context)
+                    pending = [block]
+                if continuation_index == len(continuation_group.block_ids) - 1:
+                    active_continuation_group_id = None
                 continue
 
             if pending and not self._belongs_to_same_paragraph(pending[-1], block):

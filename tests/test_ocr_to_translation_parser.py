@@ -1,6 +1,13 @@
 from __future__ import annotations
 
-from app.models.schema import Block, BlockType, DocumentMetadata, DocumentModel, PageMetadata, SourceType
+from app.models.schema import (
+    Block,
+    BlockType,
+    DocumentMetadata,
+    DocumentModel,
+    PageMetadata,
+    SourceType,
+)
 from app.services.ocr_to_translation_parser import OCRToTranslationParser
 from app.services.translator_mlx import MlxTranslator, TranslationSettings
 
@@ -22,10 +29,26 @@ def test_ocr_cleaning_repairs_line_break_hyphenation_without_removing_real_hyphe
 def test_ocr_parser_merges_body_across_page_headers_and_excludes_page_elements() -> None:
     document = _document(
         [
-            _block("body-1", 1, BlockType.PARAGRAPH, "Kinder stellen sowohl", 1),
-            _block("footer", 1, BlockType.FOOTER, "Journal 1", 2),
-            _block("header", 2, BlockType.HEADER, "Repeated title 2", 1),
-            _block("body-2", 2, BlockType.PARAGRAPH, "aus klinischer als auch ethischer Sicht Fragen.", 2),
+            _block(
+                "body-1",
+                1,
+                BlockType.PARAGRAPH,
+                "Kinder stellen sowohl",
+                1,
+                y0=800,
+                y1=900,
+            ),
+            _block("footer", 1, BlockType.FOOTER, "Journal 1", 2, y0=940, y1=970),
+            _block("header", 2, BlockType.HEADER, "Repeated title 2", 1, y0=10, y1=40),
+            _block(
+                "body-2",
+                2,
+                BlockType.PARAGRAPH,
+                "aus klinischer als auch ethischer Sicht Fragen.",
+                2,
+                y0=60,
+                y1=160,
+            ),
         ]
     )
 
@@ -38,7 +61,14 @@ def test_ocr_parser_merges_body_across_page_headers_and_excludes_page_elements()
     assert chunk.page_end == 2
     assert chunk.source_region_ids == ["page_0001-r001", "page_0002-r002"]
     assert chunk.source_region_indexes == [1, 2]
-    assert chunk.source_text == "Kinder stellen sowohl aus klinischer als auch ethischer Sicht Fragen."
+    assert (
+        chunk.source_text == "Kinder stellen sowohl aus klinischer als auch ethischer Sicht Fragen."
+    )
+    assert chunk.continuation_group_id == "xpage-p0001-p0002-g001"
+    assert chunk.continuation_decision_level == "proven"
+    assert "transparent_margin_blocks" in chunk.continuation_evidence
+    assert result.document.blocks[0].metadata["continues_to_next_page"] is True
+    assert result.document.blocks[-1].metadata["continues_from_previous_page"] is True
     assert [item["block_id"] for item in result.excluded_regions] == ["footer", "header"]
 
 
@@ -74,9 +104,25 @@ def test_ocr_parser_groups_keywords_and_preserves_section_path() -> None:
 def test_ocr_parser_keeps_footnote_continuation_separate_from_body() -> None:
     document = _document(
         [
-            _block("footnote-1", 1, BlockType.FOOTNOTE, "2 Der Begriff endet zuletzt", 1, y0=750, y1=800),
+            _block(
+                "footnote-1",
+                1,
+                BlockType.FOOTNOTE,
+                "2 Der Begriff endet zuletzt",
+                1,
+                y0=750,
+                y1=800,
+            ),
             _block("body", 2, BlockType.PARAGRAPH, "normaler Haupttext.", 1, y0=100, y1=200),
-            _block("footnote-2", 2, BlockType.PARAGRAPH, "ist fraglich und wird erklärt.", 2, y0=760, y1=900),
+            _block(
+                "footnote-2",
+                2,
+                BlockType.PARAGRAPH,
+                "ist fraglich und wird erklärt.",
+                2,
+                y0=760,
+                y1=900,
+            ),
         ]
     )
 

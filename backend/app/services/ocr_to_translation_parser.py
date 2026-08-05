@@ -6,6 +6,15 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.models.schema import Block, BlockType, DocumentModel, TranslationChunk
+from app.services.cross_page_continuation import (
+    CONTINUATION_CONFIDENCE,
+    CONTINUATION_DECISION,
+    CONTINUATION_EVIDENCE,
+    CONTINUATION_GROUP_ID,
+    CONTINUATION_INDEX,
+    CONTINUATION_INTERVENING_IDS,
+    CrossPageContinuationResolver,
+)
 
 KEYWORD_HEADINGS = {
     "keywords",
@@ -44,11 +53,24 @@ class OCRLogicalParseResult:
 class OCRToTranslationParser:
     """Convert Surya OCR layout blocks into semantic translation chunks."""
 
-    def prepare(self, document: DocumentModel, *, document_id: str | None = None) -> OCRLogicalParseResult:
+    def prepare(
+        self, document: DocumentModel, *, document_id: str | None = None
+    ) -> OCRLogicalParseResult:
         prepared = document.model_copy(deep=True)
         prepared.blocks = [self._clean_block(block) for block in prepared.blocks]
         repeated_margin_text = self._repeated_margin_text(prepared.blocks)
         excluded_regions: list[dict[str, Any]] = []
+        exclusion_reasons: dict[str, str] = {}
+        for block in prepared.blocks:
+            exclusion_reason = self._exclusion_reason(block, repeated_margin_text)
+            if not exclusion_reason:
+                continue
+            block.metadata["excluded_from_translation"] = True
+            block.metadata["translation_exclusion_reason"] = exclusion_reason
+            exclusion_reasons[block.id] = exclusion_reason
+            excluded_regions.append(self._excluded_region(block, exclusion_reason))
+
+        continuation_resolution = CrossPageContinuationResolver().resolve(prepared)
         warnings: list[str] = []
         chunks: list[TranslationChunk] = []
         sequence = 0
@@ -58,6 +80,7 @@ class OCRToTranslationParser:
         pending_footnote: list[Block] = []
         pending_footnote_section_path: list[str] = []
         pending_keyword_heading: Block | None = None
+        active_continuation_group_id: str | None = None
 
         def append_chunk(
             chunk_type: str,
@@ -85,7 +108,7 @@ class OCRToTranslationParser:
                 block.metadata["logical_translation_chunk_id"] = chunk.id
 
         def flush_body(*, warning: str | None = None) -> None:
-            nonlocal pending_body, pending_body_section_path
+            nonlocal pending_body, pending_body_section_path, active_continuation_group_id
             if not pending_body:
                 return
             append_chunk(
@@ -97,6 +120,7 @@ class OCRToTranslationParser:
             )
             pending_body = []
             pending_body_section_path = []
+            active_continuation_group_id = None
 
         def flush_footnote(*, warning: str | None = None) -> None:
             nonlocal pending_footnote, pending_footnote_section_path
@@ -113,11 +137,7 @@ class OCRToTranslationParser:
             pending_footnote_section_path = []
 
         for block in prepared.blocks:
-            exclusion_reason = self._exclusion_reason(block, repeated_margin_text)
-            if exclusion_reason:
-                block.metadata["excluded_from_translation"] = True
-                block.metadata["translation_exclusion_reason"] = exclusion_reason
-                excluded_regions.append(self._excluded_region(block, exclusion_reason))
+            if block.id in exclusion_reasons:
                 continue
 
             if block.block_type == BlockType.HEADING:
@@ -139,7 +159,9 @@ class OCRToTranslationParser:
 
             if block.block_type == BlockType.FOOTNOTE:
                 if pending_keyword_heading is not None:
-                    append_chunk("heading", [pending_keyword_heading], chunk_section_path=section_path)
+                    append_chunk(
+                        "heading", [pending_keyword_heading], chunk_section_path=section_path
+                    )
                     pending_keyword_heading = None
                 if pending_footnote:
                     if self._footnote_continues(pending_footnote[-1], block):
@@ -158,12 +180,34 @@ class OCRToTranslationParser:
             if (
                 block.block_type == BlockType.PARAGRAPH
                 and pending_footnote
+                and continuation_resolution.group_for(block.id) is None
                 and self._looks_like_footnote_continuation(pending_footnote[-1], block)
             ):
                 flush_body(warning=self._pending_warning(pending_body))
                 pending_footnote.append(block)
                 if not self._ends_mid_sentence(block.text):
                     flush_footnote()
+                continue
+
+            if (
+                active_continuation_group_id is not None
+                and continuation_resolution.is_intervening_for(
+                    block.id,
+                    active_continuation_group_id,
+                )
+            ):
+                if pending_keyword_heading is not None:
+                    append_chunk(
+                        "heading",
+                        [pending_keyword_heading],
+                        chunk_section_path=section_path,
+                    )
+                    pending_keyword_heading = None
+                append_chunk(
+                    self._chunk_type(block),
+                    [block],
+                    chunk_section_path=section_path,
+                )
                 continue
 
             if block.block_type == BlockType.PARAGRAPH:
@@ -175,6 +219,27 @@ class OCRToTranslationParser:
                         chunk_section_path=section_path,
                     )
                     pending_keyword_heading = None
+                    continue
+                continuation_group = continuation_resolution.group_for(block.id)
+                if continuation_group is not None:
+                    continuation_index = int(block.metadata.get(CONTINUATION_INDEX, 0))
+                    if continuation_index == 0:
+                        if pending_body and not self._paragraph_continues(pending_body[-1], block):
+                            flush_body(warning=self._pending_warning(pending_body))
+                        if not pending_body:
+                            pending_body_section_path = list(section_path)
+                        pending_body.append(block)
+                        active_continuation_group_id = continuation_group.id
+                    elif active_continuation_group_id == continuation_group.id:
+                        if not pending_body:
+                            pending_body_section_path = list(section_path)
+                        pending_body.append(block)
+                    else:
+                        flush_body(warning=self._pending_warning(pending_body))
+                        pending_body_section_path = list(section_path)
+                        pending_body = [block]
+                    if continuation_index == len(continuation_group.block_ids) - 1:
+                        active_continuation_group_id = None
                     continue
                 if pending_body and not self._paragraph_continues(pending_body[-1], block):
                     flush_body(warning=self._pending_warning(pending_body))
@@ -196,13 +261,16 @@ class OCRToTranslationParser:
             append_chunk("heading", [pending_keyword_heading], chunk_section_path=section_path)
 
         if any(chunk.warnings for chunk in chunks):
-            warnings.append("Some OCR chunks ended without a confirmed continuation and were released with warnings.")
+            warnings.append(
+                "Some OCR chunks ended without a confirmed continuation and were released with warnings."
+            )
         prepared.translation_chunks = chunks
         prepared.metadata.translation = {
             **prepared.metadata.translation,
             "ocr_logical_chunks_prepared": True,
             "ocr_logical_chunk_count": len(chunks),
             "ocr_excluded_region_count": len(excluded_regions),
+            "cross_page_continuation_group_count": len(continuation_resolution.groups),
         }
         return OCRLogicalParseResult(
             document=prepared,
@@ -244,7 +312,9 @@ class OCRToTranslationParser:
     ) -> TranslationChunk:
         page_start = min(block.page_number for block in blocks)
         page_end = max(block.page_number for block in blocks)
-        prefix = f"p{page_start:04d}" if page_start == page_end else f"p{page_start:04d}-p{page_end:04d}"
+        prefix = (
+            f"p{page_start:04d}" if page_start == page_end else f"p{page_start:04d}-p{page_end:04d}"
+        )
         separator = "\n" if chunk_type == "keywords" else " "
         source_text = self._join_text([block.text for block in blocks], separator=separator)
         raw_text = separator.join(
@@ -252,6 +322,7 @@ class OCRToTranslationParser:
             for block in blocks
             if block.text.strip()
         )
+        continuation_metadata = self._continuation_metadata(blocks)
         return TranslationChunk(
             id=f"{prefix}-c{sequence:03d}",
             block_ids=[block.id for block in blocks],
@@ -271,7 +342,26 @@ class OCRToTranslationParser:
             warnings=list(warnings),
             continues_from_previous_page=page_end > page_start,
             continues_to_next_page=page_end > page_start,
+            **continuation_metadata,
         )
+
+    def _continuation_metadata(self, blocks: list[Block]) -> dict[str, Any]:
+        continuation_block = next(
+            (block for block in blocks if block.metadata.get(CONTINUATION_GROUP_ID)),
+            None,
+        )
+        if continuation_block is None:
+            return {}
+        metadata = continuation_block.metadata
+        return {
+            "continuation_group_id": str(metadata[CONTINUATION_GROUP_ID]),
+            "continuation_decision_level": str(metadata.get(CONTINUATION_DECISION) or "proven"),
+            "continuation_confidence": float(metadata.get(CONTINUATION_CONFIDENCE) or 0.0),
+            "continuation_evidence": list(metadata.get(CONTINUATION_EVIDENCE) or []),
+            "continuation_intervening_block_ids": list(
+                metadata.get(CONTINUATION_INTERVENING_IDS) or []
+            ),
+        }
 
     def _join_text(self, parts: list[str], *, separator: str = " ") -> str:
         text = ""
@@ -290,6 +380,16 @@ class OCRToTranslationParser:
     def _paragraph_continues(self, previous: Block, current: Block) -> bool:
         if current.page_number < previous.page_number:
             return False
+        if current.page_number != previous.page_number:
+            previous_group = previous.metadata.get(CONTINUATION_GROUP_ID)
+            current_group = current.metadata.get(CONTINUATION_GROUP_ID)
+            return bool(
+                current.page_number == previous.page_number + 1
+                and previous_group
+                and previous_group == current_group
+                and int(current.metadata.get(CONTINUATION_INDEX, -1))
+                == int(previous.metadata.get(CONTINUATION_INDEX, -1)) + 1
+            )
         previous_text = previous.text.rstrip()
         current_text = current.text.lstrip()
         if not previous_text or not current_text:
@@ -307,12 +407,16 @@ class OCRToTranslationParser:
             return False
         if FOOTNOTE_MARKER_PATTERN.match(current.text.strip()):
             return False
-        return self._ends_mid_sentence(previous.text) and self._starts_like_continuation(current.text)
+        return self._ends_mid_sentence(previous.text) and self._starts_like_continuation(
+            current.text
+        )
 
     def _looks_like_footnote_continuation(self, previous: Block, current: Block) -> bool:
         if current.page_number != previous.page_number + 1:
             return False
-        if not self._ends_mid_sentence(previous.text) or not self._starts_like_continuation(current.text):
+        if not self._ends_mid_sentence(previous.text) or not self._starts_like_continuation(
+            current.text
+        ):
             return False
         bbox = current.metadata.get("surya_bbox")
         page_height = current.metadata.get("surya_page_height")
@@ -322,7 +426,9 @@ class OCRToTranslationParser:
 
     def _starts_like_continuation(self, text: str) -> bool:
         stripped = text.strip()
-        return bool(stripped) and (stripped[:1].islower() or stripped[:1] in {",", ".", ";", ":", ")", "]"})
+        return bool(stripped) and (
+            stripped[:1].islower() or stripped[:1] in {",", ".", ";", ":", ")", "]"}
+        )
 
     def _ends_mid_sentence(self, text: str) -> bool:
         stripped = text.rstrip()
@@ -336,11 +442,16 @@ class OCRToTranslationParser:
         stripped = blocks[-1].text.rstrip()
         if stripped.endswith(":"):
             return None
-        if len(stripped) < 180 and stripped.split()[-1].lower().strip(".,;:") not in CONTINUATION_WORDS:
+        if (
+            len(stripped) < 180
+            and stripped.split()[-1].lower().strip(".,;:") not in CONTINUATION_WORDS
+        ):
             return None
         if end_of_document:
             return "Chunk ended mid-sentence at end of document; no continuation was found."
-        return "Chunk ended mid-sentence before a structural boundary; no continuation was confirmed."
+        return (
+            "Chunk ended mid-sentence before a structural boundary; no continuation was confirmed."
+        )
 
     def _chunk_type(self, block: Block) -> str:
         return {
@@ -394,7 +505,10 @@ class OCRToTranslationParser:
         page_height = block.metadata.get("surya_page_height")
         if not isinstance(bbox, list) or len(bbox) != 4 or not page_height:
             return False
-        return float(bbox[1]) / float(page_height) <= 0.2 or float(bbox[3]) / float(page_height) >= 0.82
+        return (
+            float(bbox[1]) / float(page_height) <= 0.2
+            or float(bbox[3]) / float(page_height) >= 0.82
+        )
 
     def _canonical_repeated_text(self, text: str) -> str:
         without_numbers = re.sub(r"\b\d+\b", " ", text.lower())
