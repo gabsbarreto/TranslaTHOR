@@ -44,7 +44,10 @@ retaining Marker text-only extraction for good born-digital PDFs.
    `<region>`-wrapped Markdown.
 5. `QwenMarkdownParser` aligns Qwen regions with Surya layout regions.
 6. `OCRToTranslationParser` excludes running furniture from translation and
-   merges logical text continuations while leaving the source blocks intact.
+   uses the shared continuation resolver to merge proven logical text continuations while leaving
+   source blocks and intervening layout objects intact. This includes prose interrupted by a fully
+   table-, figure-, caption-, or equation-only page when both surrounding fragments pass the same
+   conservative textual, section, style, and geometry checks.
 
 This remains available as `surya_qwen_mlx`.
 

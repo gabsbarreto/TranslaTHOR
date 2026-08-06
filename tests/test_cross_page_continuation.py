@@ -36,7 +36,6 @@ def test_nonterminal_paragraph_is_linked_across_consecutive_pages() -> None:
             _block("second", 2, "fortgeführt und regelmäßig kontrolliert.", 1, y0=40, y1=110),
         ]
     )
-
     resolution = CrossPageContinuationResolver().resolve(document)
 
     assert len(resolution.groups) == 1
@@ -270,11 +269,196 @@ def test_et_al_abbreviation_can_continue_with_strong_layout_evidence() -> None:
     assert "abbreviation_terminal_overridden" in group.evidence
 
 
-def test_nonconsecutive_pages_never_form_a_continuation() -> None:
+def test_object_only_page_can_bridge_nonconsecutive_prose_pages() -> None:
+    document = _document(
+        [
+            _block(
+                "first",
+                1,
+                "At the Amsterdam clinic, the ratio was 1.77/1 in favor of the",
+                0,
+                y0=700,
+                y1=780,
+            ),
+            _block(
+                "table",
+                2,
+                "<table><tr><td>Amsterdam</td></tr></table>",
+                1,
+                BlockType.TABLE,
+                y0=35,
+                y1=690,
+            ),
+            _block(
+                "caption",
+                2,
+                "Table 1. International cohorts",
+                2,
+                BlockType.CAPTION,
+                y0=700,
+                y1=735,
+            ),
+            _block(
+                "second",
+                3,
+                "MT; in the second period the ratio favored HT.",
+                3,
+                y0=35,
+                y1=105,
+            ),
+        ]
+    )
+    document.blocks[0].style_hints = {}
+    document.blocks[3].style_hints = {}
+
+    resolution = CrossPageContinuationResolver().resolve(document)
+
+    assert len(resolution.groups) == 1
+    group = resolution.groups[0]
+    assert group.block_ids == ("first", "second")
+    assert group.links[0].previous_page == 1
+    assert group.links[0].current_page == 3
+    assert group.visible_intervening_block_ids == ("table", "caption")
+    assert "consecutive_physical_page_span" in group.evidence
+    assert "object_only_intervening_pages" in group.evidence
+    assert "uppercase_start_layout_supported" in group.evidence
+    seam = document.blocks[0].metadata["cross_page_continuation_seams"][0]
+    assert seam["intermediate_page_numbers"] == [2]
+    segments = [
+        ("first", document.blocks[0].text, BlockType.PARAGRAPH),
+        ("second", document.blocks[3].text, BlockType.PARAGRAPH),
+    ]
+    assert MlxTranslator(TranslationSettings())._physical_segments_form_continuous_paragraph(
+        segments,
+        {block.id: block for block in document.blocks},
+    )
+
+
+def test_multiple_object_only_pages_can_bridge_one_proven_prose_seam() -> None:
+    document = _document(
+        [
+            _block("first", 1, "Die Auswertung berücksichtigt die", 0, y0=700, y1=780),
+            _block(
+                "table",
+                2,
+                "<table><tr><td>Daten</td></tr></table>",
+                1,
+                BlockType.TABLE,
+                y0=35,
+                y1=735,
+            ),
+            _block("figure", 3, "", 2, BlockType.FIGURE, y0=35, y1=735),
+            _block("second", 4, "NASA-Ergebnisse der Folgestudie.", 3, y0=35, y1=105),
+        ]
+    )
+
+    group = CrossPageContinuationResolver().resolve(document).groups[0]
+
+    assert group.block_ids == ("first", "second")
+    assert group.visible_intervening_block_ids == ("table", "figure")
+    seam = document.blocks[0].metadata["cross_page_continuation_seams"][0]
+    assert seam["intermediate_page_numbers"] == [2, 3]
+
+
+def test_object_only_page_bridge_is_shared_by_ocr_and_marker_units() -> None:
+    blocks = [
+        _block(
+            "first",
+            1,
+            "La proporción fue favorable a las",
+            0,
+            y0=700,
+            y1=780,
+            source=SourceType.OCR,
+        ),
+        _block(
+            "table-1",
+            2,
+            "<table><tr><td>Datos</td></tr></table>",
+            1,
+            BlockType.TABLE,
+            y0=35,
+            y1=350,
+            source=SourceType.OCR,
+        ),
+        _block(
+            "table-2",
+            2,
+            "<table><tr><td>Más datos</td></tr></table>",
+            2,
+            BlockType.TABLE,
+            y0=360,
+            y1=735,
+            source=SourceType.OCR,
+        ),
+        _block(
+            "second",
+            3,
+            "MT; durante el segundo período cambió la proporción.",
+            3,
+            y0=35,
+            y1=105,
+            source=SourceType.OCR,
+        ),
+    ]
+    base = _document(blocks, detected_language="es")
+    prepared = OCRToTranslationParser().prepare(base.model_copy(deep=True)).document
+    marker = base.model_copy(deep=True)
+    for block in marker.blocks:
+        block.source_type = SourceType.EMBEDDED
+    marker_chunks = MlxTranslator(TranslationSettings(chunk_group_size=1)).build_chunks(marker)
+
+    prepared_chunk = next(
+        chunk for chunk in prepared.translation_chunks if chunk.continuation_group_id
+    )
+    marker_chunk = next(chunk for chunk in marker_chunks if chunk.continuation_group_id)
+    assert prepared_chunk.block_ids == marker_chunk.block_ids == ["first", "second"]
+    assert "object_only_intervening_pages" in prepared_chunk.continuation_evidence
+    assert prepared_chunk.continuation_evidence == marker_chunk.continuation_evidence
+    for table_id in ("table-1", "table-2"):
+        assert sum(chunk.block_ids == [table_id] for chunk in prepared.translation_chunks) == 1
+        assert sum(chunk.block_ids == [table_id] for chunk in marker_chunks) == 1
+
+
+def test_blank_intervening_page_does_not_bridge_nonconsecutive_prose() -> None:
     document = _document(
         [
             _block("first", 1, "Der Absatz setzt sich fort", 0, y0=700, y1=780),
             _block("second", 3, "auf einer nicht angrenzenden Seite.", 1, y0=35, y1=105),
+        ]
+    )
+
+    assert CrossPageContinuationResolver().resolve(document).groups == ()
+
+
+@pytest.mark.parametrize(
+    "blocker_type,blocker_text",
+    [
+        (BlockType.HEADING, "Neue Ergebnisse"),
+        (BlockType.PARAGRAPH, "Ein eigenständiger Absatz."),
+        (BlockType.LIST, "1. Eigenständiger Listenpunkt"),
+        (BlockType.REFERENCE, "[1] Eigenständige Referenz"),
+        (BlockType.FOOTNOTE, "1 Eigenständige Fußnote"),
+    ],
+)
+def test_structural_content_on_intermediate_page_blocks_object_page_bridge(
+    blocker_type: BlockType,
+    blocker_text: str,
+) -> None:
+    document = _document(
+        [
+            _block("first", 1, "Der Absatz setzt sich fort", 0, y0=700, y1=780),
+            _block(
+                "table",
+                2,
+                "<table><tr><td>Daten</td></tr></table>",
+                1,
+                BlockType.TABLE,
+                y0=35,
+                y1=560,
+            ),
+            _block("blocker", 2, blocker_text, 2, blocker_type, y0=590, y1=630),
+            _block("second", 3, "auf der dritten Seite.", 3, y0=35, y1=105),
         ]
     )
 
@@ -368,7 +552,7 @@ def test_prepared_ocr_and_marker_units_use_the_same_resolver_group() -> None:
     assert prepared_chunk.continuation_evidence == marker_chunk.continuation_evidence
 
 
-def test_proven_passage_is_translated_once_and_mapped_to_page_local_blocks() -> None:
+def test_proven_passage_across_object_page_is_translated_once_and_mapped_locally() -> None:
     document = _document(
         [
             _block(
@@ -380,10 +564,19 @@ def test_proven_passage_is_translated_once_and_mapped_to_page_local_blocks() -> 
                 y1=780,
             ),
             _block(
-                "second",
+                "figure",
                 2,
-                "respuesta terapéutica durante los meses siguientes.",
+                "",
                 1,
+                BlockType.FIGURE,
+                y0=35,
+                y1=735,
+            ),
+            _block(
+                "second",
+                3,
+                "respuesta terapéutica durante los meses siguientes.",
+                2,
                 y0=35,
                 y1=110,
             ),
@@ -417,13 +610,14 @@ def test_proven_passage_is_translated_once_and_mapped_to_page_local_blocks() -> 
     translated, _ = translator.translate_document(document, "")
 
     assert calls == [logical_source]
-    assert " ".join(block.text for block in translated.blocks) == logical_target
+    paragraphs = [block for block in translated.blocks if block.block_type == BlockType.PARAGRAPH]
+    assert " ".join(block.text for block in paragraphs) == logical_target
     assert [chunk.block_ids for chunk in translated.translation_chunks] == [["first"], ["second"]]
     assert [(chunk.page_start, chunk.page_end) for chunk in translated.translation_chunks] == [
         (1, 1),
-        (2, 2),
+        (3, 3),
     ]
-    for block in translated.blocks:
+    for block in paragraphs:
         assert block.metadata["translated_from_block_ids"] == [block.id]
         assert "merged_into_block_id" not in block.metadata
         assert all(
@@ -431,6 +625,8 @@ def test_proven_passage_is_translated_once_and_mapped_to_page_local_blocks() -> 
             == block.page_number
             for source_id in block.metadata["translated_from_block_ids"]
         )
+    figure = next(block for block in translated.blocks if block.id == "figure")
+    assert figure.metadata["translation_exclusion_reason"] == "figure_internal_text_preserved"
 
 
 def test_page_six_to_seven_margin_interruption_does_not_duplicate_continuation() -> None:
@@ -620,7 +816,7 @@ def test_oversized_continuation_uses_seam_aware_bounded_context() -> None:
     assert all(len(context.split()) < 128 for context in contexts)
 
 
-def test_readable_output_keeps_table_between_translated_fragments() -> None:
+def test_readable_output_keeps_object_only_page_between_translated_fragments() -> None:
     document = _document(
         [
             _block("first", 1, "Source first", 0, y0=700, y1=780),
@@ -633,7 +829,7 @@ def test_readable_output_keeps_table_between_translated_fragments() -> None:
                 y0=30,
                 y1=150,
             ),
-            _block("second", 2, "source second.", 2, y0=160, y1=230),
+            _block("second", 3, "source second.", 2, y0=35, y1=105),
         ]
     )
     CrossPageContinuationResolver().resolve(document)
@@ -655,20 +851,26 @@ def test_readable_output_keeps_table_between_translated_fragments() -> None:
     assert document.blocks[0].metadata[CONTINUATION_VISIBLE_INTERVENING_IDS] == ["table"]
 
 
-def test_original_layout_reconstructor_receives_only_page_local_regions(tmp_path: Path) -> None:
+def test_original_layout_reconstructor_receives_page_local_regions_across_object_page(
+    tmp_path: Path,
+) -> None:
     source_pdf = tmp_path / "source.pdf"
     pdf = fitz.open()
     page_one = pdf.new_page(width=600, height=800)
     page_one.insert_textbox(fitz.Rect(40, 690, 280, 780), "QUELLTEXT EINS", fontsize=10)
-    page_two = pdf.new_page(width=600, height=800)
-    page_two.insert_textbox(fitz.Rect(40, 35, 280, 110), "QUELLTEXT ZWEI", fontsize=10)
+    object_page = pdf.new_page(width=600, height=800)
+    object_page.draw_rect(fitz.Rect(40, 35, 560, 735), color=(0, 0, 0))
+    page_three = pdf.new_page(width=600, height=800)
+    page_three.insert_textbox(fitz.Rect(40, 35, 280, 110), "QUELLTEXT ZWEI", fontsize=10)
     pdf.save(source_pdf)
     pdf.close()
 
     first = _block("first", 1, "QUELLTEXT EINS", 0, y0=690, y1=780)
-    second = _block("second", 2, "QUELLTEXT ZWEI", 1, y0=35, y1=110)
-    document = _document([first, second])
-    CrossPageContinuationResolver().resolve(document)
+    figure = _block("figure", 2, "", 1, BlockType.FIGURE, y0=35, y1=735)
+    second = _block("second", 3, "QUELLTEXT ZWEI", 2, y0=35, y1=110)
+    document = _document([first, figure, second])
+    resolution = CrossPageContinuationResolver().resolve(document)
+    assert resolution.groups[0].block_ids == ("first", "second")
     first.metadata.update({"source_text": first.text, "translated_from_block_ids": [first.id]})
     second.metadata.update({"source_text": second.text, "translated_from_block_ids": [second.id]})
     first.text = "TRANSLATED ONE"

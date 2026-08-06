@@ -980,7 +980,46 @@ def test_parenthesized_document_acronym_is_preserved() -> None:
     )
 
 
-def test_sentence_acronym_loss_triggers_exact_preservation_retry() -> None:
+def test_document_acronyms_allow_natural_english_inflection() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    translator._document_defined_acronyms = {"DG", "HT", "MT"}
+    source = (
+        "Los HT tienen mayor visibilidad que las MT. "
+        "La experiencia de la DG depende del contexto."
+    )
+
+    for translated in (
+        "HTs have greater visibility than MTs. The experience of DG depends on context.",
+        "An HT's visibility may differ from that of MTs. DG depends on context.",
+        "HTs' visibility may differ from that of MTs. DG depends on context.",
+    ):
+        assert (
+            translator._chunk_translation_issue(
+                source,
+                translated,
+                "es",
+                BlockType.PARAGRAPH,
+            )
+            is None
+        )
+
+
+def test_document_acronym_prefix_inside_an_unrelated_word_is_not_accepted() -> None:
+    translator = MlxTranslator(TranslationSettings())
+    translator._document_defined_acronyms = {"HT"}
+
+    assert (
+        translator._chunk_translation_issue(
+            "Los HT tienen mayor visibilidad.",
+            "HTsomething has greater visibility.",
+            "es",
+            BlockType.PARAGRAPH,
+        )
+        == "translation_source_acronym_missing"
+    )
+
+
+def test_sentence_acronym_loss_triggers_base_preservation_retry() -> None:
     translator = MlxTranslator(TranslationSettings())
     translator._document_defined_acronyms = {"TMF"}
     contexts: list[str] = []
@@ -1011,7 +1050,8 @@ def test_sentence_acronym_loss_triggers_exact_preservation_retry() -> None:
 
     assert "TMF" in translated
     assert len(contexts) == 2
-    assert "Required source acronyms that must appear unchanged" in contexts[-1]
+    assert "Required source acronyms whose uppercase base letters must remain unchanged" in contexts[-1]
+    assert "plural or possessive suffixes are allowed" in contexts[-1]
 
 
 def test_invented_target_acronym_triggers_direct_translation_retry() -> None:
@@ -2816,8 +2856,9 @@ def test_translation_prompt_preserves_source_acronyms_without_expanding_them() -
         "es",
     )
 
-    assert "Preserve source acronyms" in prompt
-    assert "never expand or reinterpret them" in prompt
+    assert "Preserve the uppercase base letters of source acronyms" in prompt
+    assert "plural or possessive suffixes are allowed" in prompt
+    assert "never expand or reinterpret the base acronym" in prompt
 
 
 def test_compact_table_prompt_does_not_abbreviate_spelled_out_source_terms() -> None:

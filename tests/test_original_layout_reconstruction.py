@@ -232,7 +232,7 @@ def test_original_layout_preserves_page_and_pixels_outside_text_regions(tmp_path
     assert outside.getbbox() is None
 
 
-def test_embedded_text_bbox_with_unexplained_neighbor_is_retained(
+def test_embedded_text_bbox_is_authoritative_over_unexplained_neighbor(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "contaminated-paragraph-source.pdf"
@@ -273,22 +273,19 @@ def test_embedded_text_bbox_with_unexplained_neighbor_is_retained(
         report_path=tmp_path / "contaminated-paragraph-report.json",
     )
 
-    assert report["regions_replaced"] == 0
-    assert report["regions_skipped"] == 1
-    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
-    assert skipped["reason"] == "embedded_source_bbox_contains_unexplained_text"
-    validation = skipped["alignment_diagnostics"]["source_text_validation"]
-    assert validation["safe"] is False
-    assert validation["unexplained_actual_characters"] >= len("DONOTDELETE")
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["regions_replaced"] == 1
+    assert report["regions_skipped"] == 0
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["reconstruction_strategy"] == "authoritative_bbox_overlay"
+    assert replaced["source_text_masks"] == [replaced["bbox"]]
     with fitz.open(output) as translated:
         text = translated[0].get_text("text")
-        assert "Texto fuente correcto" in text
-        assert "DO NOT DELETE" in text
-        assert "Correct source text" not in text
+        assert "Texto fuente correcto" not in text
+        assert "DO NOT DELETE" not in text
+        assert "Correct source text" in text
 
 
-def test_overflow_is_reported_and_source_text_is_retained(tmp_path: Path) -> None:
+def test_long_target_is_scaled_until_it_fits_authoritative_box(tmp_path: Path) -> None:
     source = tmp_path / "overflow-source.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=300, height=200)
@@ -326,20 +323,19 @@ def test_overflow_is_reported_and_source_text_is_retained(tmp_path: Path) -> Non
         report_path=tmp_path / "overflow-report.json",
     )
 
-    assert report["text_boxes_did_not_fit"] == 1
-    assert report["regions_replaced"] == 0
-    assert report["pages_using_fallback_behavior"] == 1
-    overflow_region = next(
-        region
-        for region in report["regions"]
-        if region.get("reason") == "translated_text_did_not_fit_minimum_scale"
-    )
-    assert overflow_region["source_character_count"] == len("SOURCE")
+    assert report["text_boxes_did_not_fit"] == 0
+    assert report["regions_replaced"] == 1
+    assert report["pages_using_fallback_behavior"] == 0
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert 0 < replaced["scale"] < 0.6
+    assert replaced["source_character_count"] == len("SOURCE")
     with fitz.open(output) as output_pdf:
-        assert "SOURCE" in output_pdf[0].get_text("text")
+        text = output_pdf[0].get_text("text")
+        assert "SOURCE" not in text
+        assert " ".join(text.split()).count("This translated sentence") == 8
 
 
-def test_scanned_page_is_retained_with_safe_warning(tmp_path: Path) -> None:
+def test_scanned_page_uses_authoritative_extracted_box(tmp_path: Path) -> None:
     scan_path = tmp_path / "scan.png"
     scan = Image.new("RGB", (400, 500), "white")
     drawing = ImageDraw.Draw(scan)
@@ -385,11 +381,12 @@ def test_scanned_page_is_retained_with_safe_warning(tmp_path: Path) -> None:
         report_path=tmp_path / "scan-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["pages_using_fallback_behavior"] == 1
-    assert report["regions_replaced"] == 0
-    assert any(warning["code"] == "page_not_safely_replaceable" for warning in report["warnings"])
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["status"] == "complete"
+    assert report["pages_using_fallback_behavior"] == 0
+    assert report["regions_replaced"] == 1
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
+    with fitz.open(output) as translated:
+        assert "Translated scan text" in translated[0].get_text("text")
 
 
 def test_intentional_exclusion_is_retained_without_marking_page_fallback(
@@ -506,7 +503,7 @@ def test_intentionally_retained_region_has_null_bbox_only_when_missing(
     assert report["regions"][0]["bbox"] is None
 
 
-def test_failed_target_language_validation_is_reported_as_real_fallback(
+def test_target_language_validation_does_not_veto_authoritative_box(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "validation-source.pdf"
@@ -554,14 +551,15 @@ def test_failed_target_language_validation_is_reported_as_real_fallback(
         report_path=tmp_path / "validation-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["pages_using_fallback_behavior"] == 1
-    assert report["regions_skipped"] == 1
+    assert report["status"] == "complete"
+    assert report["pages_using_fallback_behavior"] == 0
+    assert report["regions_skipped"] == 0
     assert report["regions_retained"] == 0
-    assert report["regions"][0]["reason"] == "translation_output_matches_source"
+    assert report["regions_replaced"] == 1
+    assert report["regions"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
 
 
-def test_failed_table_target_language_validation_is_reported_as_real_fallback(
+def test_table_target_language_validation_does_not_veto_authoritative_box(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "validation-table-source.pdf"
@@ -619,12 +617,11 @@ def test_failed_table_target_language_validation_is_reported_as_real_fallback(
         report_path=tmp_path / "validation-table-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["pages_using_fallback_behavior"] == 1
-    assert report["regions_replaced"] == 0
-    assert report["regions_skipped"] == 1
-    assert report["regions"][0]["reason"] == "translation_output_matches_source"
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["status"] == "complete"
+    assert report["pages_using_fallback_behavior"] == 0
+    assert report["regions_replaced"] == 1
+    assert report["regions_skipped"] == 0
+    assert report["regions"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
 
 
 def test_cross_page_translation_batch_is_recovered_per_source_block(tmp_path: Path) -> None:
@@ -806,7 +803,7 @@ def test_source_pdf_font_size_allows_tight_two_line_replacement(tmp_path: Path) 
         assert "Employment status" in translated[0].get_text("text")
 
 
-def test_vector_grid_table_is_reconstructed_cell_by_cell(tmp_path: Path) -> None:
+def test_vector_grid_table_is_reconstructed_in_authoritative_box(tmp_path: Path) -> None:
     source = tmp_path / "table-source.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=300, height=180)
@@ -865,14 +862,15 @@ def test_vector_grid_table_is_reconstructed_cell_by_cell(tmp_path: Path) -> None
         report_path=tmp_path / "table-report.json",
     )
 
-    with fitz.open(source) as source_pdf, fitz.open(output) as translated:
+    with fitz.open(output) as translated:
         text = translated[0].get_text("text")
         assert "Diagnosis" in text
         assert "Depression" in text
         assert "Dépression" not in text
-        assert len(translated[0].get_drawings()) == len(source_pdf[0].get_drawings())
     assert report["status"] == "complete"
-    assert report["regions_replaced"] == 2
+    assert report["regions_replaced"] == 1
+    assert report["regions"][0]["block_ids"] == ["table"]
+    assert report["regions"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
 
 
 def _horizontal_rule_table_source(path: Path) -> tuple[str, str, Block, list[float], list[float]]:
@@ -996,9 +994,9 @@ def _stored_horizontal_table(
     )
 
 
-def test_horizontal_rule_table_is_semantically_coalesced(tmp_path: Path) -> None:
+def test_horizontal_rule_table_uses_one_authoritative_box(tmp_path: Path) -> None:
     source = tmp_path / "horizontal-table-source.pdf"
-    _source_markup, _translated_markup, block, _x_edges, y_edges = _horizontal_rule_table_source(
+    _source_markup, _translated_markup, block, _x_edges, _y_edges = _horizontal_rule_table_source(
         source
     )
     output = tmp_path / "horizontal-table-output.pdf"
@@ -1009,36 +1007,21 @@ def test_horizontal_rule_table_is_semantically_coalesced(tmp_path: Path) -> None
         report_path=tmp_path / "horizontal-table-report.json",
     )
 
-    with fitz.open(source) as source_pdf, fitz.open(output) as translated:
+    with fitz.open(output) as translated:
         text = translated[0].get_text("text")
         assert "Category" in text
         assert "Additional description" in text
         assert "Kategorie" not in text
         assert "Beschreibung" not in text
         assert "OUTSIDE TABLE" in text
-        assert len(translated[0].get_drawings()) == len(source_pdf[0].get_drawings())
-    strategies = {
-        metadata.get("table_grid_detection")
-        for region in report["regions"]
-        for metadata in region.get("coordinate_metadata", [])
-    }
-    assert "pymupdf_text_lattice_semantic_alignment" in strategies
-    assert not any(
-        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
-    )
-
-    source_image = _render_rgb(source, scale=2)
-    output_image = _render_rgb(output, scale=2)
-    for y in y_edges:
-        rule_strip = (60, round(y * 2) - 1, 780, round(y * 2) + 2)
-        assert source_image.crop(rule_strip).tobytes() == output_image.crop(rule_strip).tobytes()
-    assert (
-        source_image.crop((60, 400, 780, 440)).tobytes()
-        == output_image.crop((60, 400, 780, 440)).tobytes()
-    )
+    assert report["regions_replaced"] == 1
+    replaced = report["regions"][0]
+    assert replaced["block_ids"] == ["horizontal-table"]
+    assert replaced["reconstruction_strategy"] == "authoritative_bbox_overlay"
+    assert replaced["source_text_masks"] == [replaced["bbox"]]
 
 
-def test_marker_cell_polygons_are_preferred_for_table_geometry(tmp_path: Path) -> None:
+def test_marker_cell_polygons_do_not_veto_authoritative_table_box(tmp_path: Path) -> None:
     source = tmp_path / "stored-table-source.pdf"
     source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
         source
@@ -1056,16 +1039,14 @@ def test_marker_cell_polygons_are_preferred_for_table_geometry(tmp_path: Path) -
         report_path=tmp_path / "stored-table-report.json",
     )
 
-    strategies = {
-        metadata.get("table_grid_detection")
-        for region in report["regions"]
-        for metadata in region.get("coordinate_metadata", [])
-    }
-    assert strategies == {"marker_table_cell_polygons"}
+    assert report["regions_replaced"] == 1
     assert report["regions_skipped"] == 0
+    metadata = report["regions"][0]["coordinate_metadata"][-1]
+    assert metadata["geometry_source"] == "extracted_region_bbox"
+    assert metadata["region_policy"] == "authoritative_extracted_bbox_with_full_text_fit"
 
 
-def test_overlapping_marker_cells_fall_back_to_ruled_colspan_grid(tmp_path: Path) -> None:
+def test_overlapping_marker_cells_do_not_veto_authoritative_table_box(tmp_path: Path) -> None:
     source = tmp_path / "ruled-colspan-source.pdf"
     x_edges = [30.0, 120.0, 210.0, 300.0, 390.0]
     y_edges = [30.0, 52.0, 76.0, 112.0, 145.0, 180.0, 215.0]
@@ -1190,53 +1171,19 @@ def test_overlapping_marker_cells_fall_back_to_ruled_colspan_grid(tmp_path: Path
         report_path=tmp_path / "ruled-colspan-report.json",
     )
 
-    strategies = {
-        metadata.get("table_grid_detection")
-        for region in report["regions"]
-        for metadata in region.get("coordinate_metadata", [])
-    }
-    assert strategies == {"pymupdf_find_tables_lines_strict"}
+    assert report["regions_replaced"] == 1
     assert report["regions_skipped"] == 0
-    with fitz.open(source) as original, fitz.open(output) as translated:
+    with fitz.open(output) as translated:
         text = translated[0].get_text("text")
         assert "Assigned sex at birth" in text
         assert "measures" in text
         assert "zugewiesenes Geschlecht" not in text
-        assert len(translated[0].get_drawings()) == len(original[0].get_drawings())
-
-    source_image = _render_rgb(source, scale=2)
-    output_image = _render_rgb(output, scale=2)
-    numeric_cells = (
-        round((x_edges[3] + 2) * 2),
-        round((y_edges[2] + 2) * 2),
-        round((x_edges[4] - 2) * 2),
-        round((y_edges[-1] - 2) * 2),
-    )
-    assert source_image.crop(numeric_cells).tobytes() == output_image.crop(numeric_cells).tobytes()
-
-    difference = ImageChops.difference(source_image, output_image)
-    outside_mask = Image.new("L", difference.size, 255)
-    mask_draw = ImageDraw.Draw(outside_mask)
-    for region in report["regions"]:
-        if region.get("status") != "replaced" or not any(
-            block_id.startswith("ruled-colspan-table#") for block_id in region.get("block_ids", [])
-        ):
-            continue
-        bbox = region["bbox"]
-        mask_draw.rectangle(
-            (
-                round(bbox["x0"] * 2) - 2,
-                round(bbox["y0"] * 2) - 2,
-                round(bbox["x1"] * 2) + 2,
-                round(bbox["y1"] * 2) + 2,
-            ),
-            fill=0,
-        )
-    outside = Image.composite(difference, Image.new("RGB", difference.size), outside_mask)
-    assert outside.getbbox() is None
+    replaced = report["regions"][0]
+    assert replaced["block_ids"] == ["ruled-colspan-table"]
+    assert replaced["source_text_masks"] == [replaced["bbox"]]
 
 
-def test_ruled_table_grid_rejects_unexplained_extra_cell_text(tmp_path: Path) -> None:
+def test_authoritative_table_box_replaces_unexplained_extra_cell_text(tmp_path: Path) -> None:
     source = tmp_path / "contaminated-table-source.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=300, height=150)
@@ -1271,16 +1218,13 @@ def test_ruled_table_grid_rejects_unexplained_extra_cell_text(tmp_path: Path) ->
         report_path=tmp_path / "contaminated-table-report.json",
     )
 
-    assert any(
-        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
-    )
-    assert report["regions_replaced"] == 0
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["regions_replaced"] == 1
+    assert report["regions_skipped"] == 0
     with fitz.open(output) as translated:
         text = translated[0].get_text("text")
-        assert "Kategorie" in text
-        assert "DO NOT DELETE" in text
-        assert "Category" not in text
+        assert "Kategorie" not in text
+        assert "DO NOT DELETE" not in text
+        assert "Category" in text
 
 
 def test_marker_cell_polygons_require_matching_source_topology(tmp_path: Path) -> None:
@@ -1415,8 +1359,8 @@ def test_marker_cell_polygons_allow_proportionally_small_detector_overlap(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "stored-table-proportional-overlap.pdf"
-    source_markup, _translated_markup, block, x_edges, y_edges = (
-        _horizontal_rule_table_source(source)
+    source_markup, _translated_markup, block, x_edges, y_edges = _horizontal_rule_table_source(
+        source
     )
     source_rows = OriginalLayoutReconstructor()._parse_table_rows(source_markup)
     table = _stored_horizontal_table(
@@ -1577,7 +1521,7 @@ def test_semantic_table_geometry_supports_stacked_colspan_tables(
     assert rows[1][0].x1 == rows[1][1].x0
 
 
-def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) -> None:
+def test_source_text_mismatch_does_not_veto_authoritative_table_box(tmp_path: Path) -> None:
     source = tmp_path / "mismatched-horizontal-table.pdf"
     _source_markup, _translated_markup, block, _x_edges, _y_edges = _horizontal_rule_table_source(
         source
@@ -1594,11 +1538,10 @@ def test_semantic_table_geometry_rejects_source_text_mismatch(tmp_path: Path) ->
         report_path=tmp_path / "mismatched-horizontal-table-report.json",
     )
 
-    assert report["regions_replaced"] == 0
-    assert any(
-        region.get("reason") == "table_cell_geometry_unreliable" for region in report["regions"]
-    )
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["regions_replaced"] == 1
+    assert report["regions_skipped"] == 0
+    with fitz.open(output) as translated:
+        assert "Category" in translated[0].get_text("text")
 
 
 def test_semantic_table_geometry_rejects_near_tied_partitions(monkeypatch) -> None:
@@ -1952,7 +1895,8 @@ def test_surya2_image_only_scan_uses_authoritative_bbox_and_preserves_other_visu
     )
 
     assert report["status"] == "complete"
-    assert report["pages"][0]["reconstruction_strategy"] == "surya2_image_overlay"
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
+    assert report["authoritative_bbox_overlay_pages"] == 1
     assert report["surya2_image_overlay_pages"] == 1
     assert report["surya2_image_text_masks"] >= 1
     replaced = next(region for region in report["regions"] if region["status"] == "replaced")
@@ -1962,9 +1906,9 @@ def test_surya2_image_only_scan_uses_authoritative_bbox_and_preserves_other_visu
     assert replaced["coordinate_metadata"][0]["scale_x"] == 1
     assert replaced["coordinate_metadata"][0]["scale_y"] == 1
     raster_metadata = replaced["coordinate_metadata"][-1]
-    assert raster_metadata["geometry_source"] == "surya2_pdf_bbox"
-    assert raster_metadata["mask_source"] == "surya2_full_region_bbox"
-    assert raster_metadata["region_policy"] == "authoritative_surya_bbox_with_full_text_fit"
+    assert raster_metadata["geometry_source"] == "extracted_region_bbox"
+    assert raster_metadata["mask_source"] == "full_region_bbox"
+    assert raster_metadata["region_policy"] == "authoritative_extracted_bbox_with_full_text_fit"
     assert replaced["source_text_masks"] == [text_bbox.model_dump()]
 
     with fitz.open(output) as translated:
@@ -2023,7 +1967,7 @@ def test_surya2_hidden_ocr_region_bypasses_alignment_and_translation_guards(
     )
 
     assert report["status"] == "complete"
-    assert report["pages"][0]["reconstruction_strategy"] == "surya2_image_overlay"
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
     assert report["scan_text_regions_aligned"] == 0
     assert report["scan_text_regions_alignment_failed"] == 0
     assert report["regions_replaced"] == 1
@@ -2034,7 +1978,7 @@ def test_surya2_hidden_ocr_region_bypasses_alignment_and_translation_guards(
         assert "Translated source content" in translated[0].get_text("text")
 
 
-def test_surya2_region_is_retained_when_translated_text_does_not_fit(
+def test_surya2_region_scales_without_a_readability_floor(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "surya2-overflow.pdf"
@@ -2054,12 +1998,14 @@ def test_surya2_region_is_retained_when_translated_text_does_not_fit(
         report_path=tmp_path / "surya2-overflow-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["regions_replaced"] == 0
-    assert report["text_boxes_did_not_fit"] == 1
-    skipped = next(region for region in report["regions"] if region["status"] == "skipped")
-    assert skipped["reason"] == "translated_text_did_not_fit_minimum_scale"
-    assert _render_rgb(source).tobytes() == _render_rgb(output).tobytes()
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 1
+    assert report["text_boxes_did_not_fit"] == 0
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert 0 < replaced["scale"] < 0.6
+    with fitz.open(output) as translated:
+        output_text = " ".join(translated[0].get_text("text").split())
+        assert output_text.count("This target text") == 200
 
 
 def test_surya2_image_only_scan_trusts_region_over_background_and_visual_guards(
@@ -2149,7 +2095,7 @@ def test_surya2_image_only_scan_trusts_table_region_without_cell_geometry(
         assert "Translated" in translated[0].get_text("text")
 
 
-def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
+def test_hidden_ocr_multiple_tables_use_independent_authoritative_boxes(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "hidden-ocr-table-group.pdf"
@@ -2256,63 +2202,36 @@ def test_hidden_ocr_multiple_tables_fall_back_as_atomic_page_group(
         ],
         blocks=blocks,
     )
-    reconstructor = OriginalLayoutReconstructor()
-    reconstructor._preflight = (  # type: ignore[method-assign]
-        lambda **kwargs: (
-            (-1.0, 0.5) if kwargs["region"].block_ids[0].startswith("scan-table-b#") else (1.0, 1.0)
-        )
-    )
     output = tmp_path / "hidden-ocr-table-group-output.pdf"
-    report = reconstructor.reconstruct(
+    report = OriginalLayoutReconstructor().reconstruct(
         source_pdf_path=source,
         output_pdf_path=output,
         document=document,
         report_path=tmp_path / "hidden-ocr-table-group-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert report["regions_replaced"] == 1
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 3
     assert report["raster_tables_reconstructed"] == 0
-    assert any(
-        region.get("block_ids") == ["scan-table-b"]
-        and region.get("reason") == "table_atomic_reconstruction_overflow"
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
+    assert all(
+        region.get("source_text_masks") == [region.get("bbox")]
         for region in report["regions"]
+        if region.get("status") == "replaced"
     )
-    retained_sibling = next(
-        region
-        for region in report["regions"]
-        if region.get("reason") == "scan_table_group_retained_after_sibling_failure"
-    )
-    assert retained_sibling["block_ids"] == ["scan-table-a"]
-    assert retained_sibling["bbox"] == {
-        "x0": 30.0,
-        "y0": 30.0,
-        "x1": 290.0,
-        "y1": 90.0,
-    }
-    group_warning = next(
-        warning
-        for warning in report["warnings"]
-        if warning["code"] == "scan_table_group_atomic_fallback"
-    )
-    assert "scan-table-b" in group_warning["reason"]
-    assert "scan-table-a" in group_warning["reason"]
     with fitz.open(output) as translated:
         output_text = translated[0].get_text("text")
         assert body_translation in output_text
         assert body_source not in output_text
-        assert "Uno" in output_text
-        assert "One" not in output_text
-
-    source_image = _render_rgb(source, scale=2)
-    output_image = _render_rgb(output, scale=2)
-    assert (
-        source_image.crop((0, 0, 640, 390)).tobytes()
-        == output_image.crop((0, 0, 640, 390)).tobytes()
-    )
+        assert "One" in output_text
+        assert "Five" in output_text
+        assert "Uno" not in output_text
+        assert "Cinco" not in output_text
 
 
-def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Path) -> None:
+def test_hidden_ocr_table_and_caption_use_their_authoritative_boxes(
+    tmp_path: Path,
+) -> None:
     page_width, page_height = 320, 240
     scan_path = tmp_path / "table-scan.png"
     scan = Image.new("RGB", (page_width, page_height), "white")
@@ -2441,25 +2360,24 @@ def test_hidden_ocr_table_masks_text_and_preserves_grid_and_figure(tmp_path: Pat
         assert "Table I. Results" in output_text
         assert "Diagnostico" not in output_text
         assert "Depresion" not in output_text
-    assert report["raster_tables_reconstructed"] == 1
+    assert report["raster_tables_reconstructed"] == 0
     assert report["scan_overlay_pages"] == 1
-    # Only changed text cells plus the caption are masked. Unchanged numeric
-    # and symbol cells stay pixel-identical so arrows and annotations survive.
-    assert report["scan_text_masks"] == 3
-    assert report["pages"][0]["reconstruction_strategy"] == "ocr_table_overlay"
+    assert report["scan_text_masks"] == 2
+    assert report["authoritative_bbox_text_masks"] == 2
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
     assert report["pages"][0]["status"] == "partial"
     assert any(
         region.get("block_ids") == ["untranslated-scan-body"]
-        and region.get("reason") == "scan_table_only_non_table_translation_unavailable"
+        and region.get("reason") == "translation_not_confirmed_for_region"
         for region in report["regions"]
     )
+    replaced = [region for region in report["regions"] if region.get("status") == "replaced"]
+    assert all(region["source_text_masks"] == [region["bbox"]] for region in replaced)
 
     source_image = _render_rgb(source, scale=2)
     output_image = _render_rgb(output, scale=2)
     figure_box = (440, 310, 590, 450)
     assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
-    for coordinate in ((60, 70), (300, 70), (580, 70), (60, 130), (60, 190)):
-        assert source_image.getpixel(coordinate) == output_image.getpixel(coordinate)
 
     approved = Image.new("L", source_image.size, 0)
     approved_draw = ImageDraw.Draw(approved)
@@ -2500,7 +2418,7 @@ def test_hidden_ocr_structural_label_normalizes_roman_numeral_one_confusion() ->
     ) != reconstructor._hidden_ocr_alignment_text("Resultado III")
 
 
-def test_redaction_guard_preserves_figure_when_caption_box_touches_boundary(
+def test_authoritative_caption_box_is_not_trimmed_by_figure_guard(
     tmp_path: Path,
 ) -> None:
     source = tmp_path / "source.pdf"
@@ -2520,10 +2438,10 @@ def test_redaction_guard_preserves_figure_when_caption_box_touches_boundary(
     caption_region = next(
         region for region in report["regions"] if region.get("block_ids") == ["caption"]
     )
-    assert all(mask["y0"] >= 281 for mask in caption_region["applied_redaction_bboxes"])
+    assert caption_region["applied_redaction_bboxes"] == [caption.bbox.model_dump()]
     source_image = _render_rgb(source, scale=3)
     output_image = _render_rgb(output, scale=3)
-    figure_box = (180, 300, 1020, 840)
+    figure_box = (180, 300, 1020, 837)
     assert source_image.crop(figure_box).tobytes() == output_image.crop(figure_box).tobytes()
 
 
@@ -2577,7 +2495,7 @@ def test_source_character_count_uses_visible_table_text() -> None:
     ) == len("Edad media 32")
 
 
-def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -> None:
+def test_hidden_ocr_body_trusts_extracted_bbox_without_realignment(tmp_path: Path) -> None:
     page_width, page_height = 360, 240
     scan_path = tmp_path / "shifted-scan.png"
     scan = Image.new("RGB", (page_width, page_height), "white")
@@ -2618,8 +2536,8 @@ def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -
         page_number=1,
         block_type=BlockType.PARAGRAPH,
         text="Correct translated text on both lines",
-        # Simulate a reading-order reconciliation error: this stored Surya
-        # box points to the unrelated second line.
+        # The extracted box is authoritative even when hidden OCR contains a
+        # stronger textual match elsewhere on the page.
         bbox=BoundingBox(x0=28, y0=135, x1=220, y1=162),
         reading_order_index=0,
         source_type=SourceType.OCR,
@@ -2658,24 +2576,24 @@ def test_hidden_ocr_body_alignment_corrects_shifted_surya_bbox(tmp_path: Path) -
     )
 
     assert report["regions_replaced"] == 1
-    assert report["scan_text_regions_aligned"] == 1
-    assert report["pages"][0]["reconstruction_strategy"] == "ocr_text_overlay"
+    assert report["scan_text_regions_aligned"] == 0
+    assert report["scan_text_regions_alignment_failed"] == 0
+    assert report["pages"][0]["reconstruction_strategy"] == "authoritative_bbox_overlay"
     replaced = next(region for region in report["regions"] if region["status"] == "replaced")
-    assert replaced["bbox"]["y0"] < 70
+    assert replaced["bbox"] == block.bbox.model_dump()
     assert replaced["source_character_count"] == len("Texto fuente correcto segunda linea completa")
     assert replaced["source_text_mask_count"] == len(replaced["source_text_masks"])
-    assert replaced["applied_redaction_bboxes"] == replaced["source_text_masks"]
-    alignment = replaced["coordinate_metadata"][-1]
-    assert alignment["geometry_source"] == "hidden_ocr_contiguous_line_alignment"
-    assert alignment["surya_region_bbox_pdf"]["y0"] > 120
-    assert alignment["matched_hidden_ocr_bbox_pdf"]["y0"] < 70
+    assert replaced["source_text_masks"] == [block.bbox.model_dump()]
+    geometry = replaced["coordinate_metadata"][-1]
+    assert geometry["geometry_source"] == "extracted_region_bbox"
+    assert geometry["extracted_region_bbox_pdf"] == block.bbox.model_dump()
 
     with fitz.open(output) as translated:
         page = translated[0]
-        assert "Correct translated text" in page.get_text("text", clip=fitz.Rect(20, 25, 230, 95))
-        assert "REGION NO RELACIONADA" in page.get_text("text")
-        assert "Texto fuente correcto" not in page.get_text("text")
-        assert "segunda linea completa" not in page.get_text("text")
+        assert "Correct translated text" in page.get_text("text", clip=fitz.Rect(20, 120, 230, 180))
+        assert "REGION NO RELACIONADA" not in page.get_text("text")
+        assert "Texto fuente correcto" in page.get_text("text")
+        assert "segunda linea completa" in page.get_text("text")
     source_image = _render_rgb(source, scale=2)
     output_image = _render_rgb(output, scale=2)
     figure_box = (520, 70, 670, 210)
@@ -2812,7 +2730,9 @@ def test_hidden_ocr_alignment_joins_spatial_continuation_from_malformed_block() 
     assert "unrelated left-column" not in match.text
 
 
-def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -> None:
+def test_hidden_ocr_partial_line_match_does_not_veto_authoritative_box(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "partial-hidden-ocr.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=320, height=150)
@@ -2859,29 +2779,21 @@ def test_hidden_ocr_partial_line_match_is_retained_as_fallback(tmp_path: Path) -
         report_path=tmp_path / "partial-hidden-ocr-report.json",
     )
 
-    assert report["regions_replaced"] == 0
-    assert report["scan_text_regions_alignment_failed"] == 1
-    skipped = next(
-        region
-        for region in report["regions"]
-        if region.get("reason") == "hidden_ocr_text_alignment_low_confidence"
-    )
-    diagnostics = skipped["alignment_diagnostics"]
-    assert diagnostics["reason"] == "hidden_ocr_text_alignment_low_confidence"
-    assert diagnostics["score"] < diagnostics["minimum_score"]
-    assert diagnostics["length_coverage"] < 1.0
-    assert "prefix_score" in diagnostics
-    assert "suffix_score" in diagnostics
-    assert (
-        ImageChops.difference(
-            _render_rgb(source, scale=2),
-            _render_rgb(output, scale=2),
-        ).getbbox()
-        is None
-    )
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 1
+    assert report["scan_text_regions_alignment_failed"] == 0
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] == block.bbox.model_dump()
+    assert replaced["source_text_masks"] == [block.bbox.model_dump()]
+    with fitz.open(output) as translated:
+        output_text = translated[0].get_text("text")
+        assert "Translated complete paragraph" in output_text
+        assert "Comienzo del texto" not in output_text
 
 
-def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -> None:
+def test_scan_table_trusts_authoritative_box_when_target_adds_cell_content(
+    tmp_path: Path,
+) -> None:
     source = tmp_path / "empty-cell-source.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=300, height=150)
@@ -2972,22 +2884,18 @@ def test_scan_table_rejects_content_added_to_empty_visual_cell(tmp_path: Path) -
         report_path=tmp_path / "empty-cell-report.json",
     )
 
-    assert report["regions_replaced"] == 0
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 2
     assert report["raster_tables_reconstructed"] == 0
-    assert any(
-        region.get("reason") == "table_translation_added_content_to_empty_source_cell"
+    assert all(
+        region["source_text_masks"] == [region["bbox"]]
         for region in report["regions"]
+        if region.get("status") == "replaced"
     )
-    assert any(
-        region.get("reason") == "caption_hidden_ocr_text_mismatch" for region in report["regions"]
-    )
-    assert (
-        ImageChops.difference(
-            _render_rgb(source, scale=2),
-            _render_rgb(output, scale=2),
-        ).getbbox()
-        is None
-    )
+    with fitz.open(output) as translated:
+        output_text = translated[0].get_text("text")
+        assert "Invented text" in output_text
+        assert "Table I. Translated caption" in output_text
 
 
 def test_scan_background_sampling_preserves_light_cell_colour(tmp_path: Path) -> None:
@@ -3035,7 +2943,7 @@ def test_scan_background_sampling_rejects_mixed_cell_background(tmp_path: Path) 
     assert metadata["background_uniform_ratio"] < 0.8
 
 
-def test_table_overflow_is_atomic_across_all_cells(
+def test_authoritative_table_box_is_atomic_when_fit_or_insert_fails(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
@@ -3089,14 +2997,9 @@ def test_table_overflow_is_atomic_across_all_cells(
         blocks=[table],
     )
     reconstructor = OriginalLayoutReconstructor()
-    preflight_calls = 0
-
-    def fail_second_preflight(**_kwargs) -> tuple[float, float]:
-        nonlocal preflight_calls
-        preflight_calls += 1
-        return (-1.0, 0.5) if preflight_calls == 2 else (1.0, 1.0)
-
-    reconstructor._preflight = fail_second_preflight  # type: ignore[method-assign]
+    reconstructor._preflight = (  # type: ignore[method-assign]
+        lambda **_kwargs: (-1.0, 0.5)
+    )
     output = tmp_path / "atomic-table-output.pdf"
     report = reconstructor.reconstruct(
         source_pdf_path=source,
@@ -3108,8 +3011,7 @@ def test_table_overflow_is_atomic_across_all_cells(
     assert report["regions_replaced"] == 0
     assert report["text_boxes_did_not_fit"] == 1
     assert any(
-        region.get("reason") == "table_atomic_reconstruction_overflow"
-        for region in report["regions"]
+        region.get("reason") == "translated_text_did_not_fit_box" for region in report["regions"]
     )
     assert (
         ImageChops.difference(
@@ -3126,14 +3028,14 @@ def test_table_overflow_is_atomic_across_all_cells(
     original_insert_htmlbox = fitz.Page.insert_htmlbox
     insert_calls = 0
 
-    def fail_second_real_insert(page, *args, **kwargs):
+    def fail_real_insert(page, *args, **kwargs):
         nonlocal insert_calls
         insert_calls += 1
-        if insert_calls == 2:
+        if insert_calls == 1:
             return -1.0, 0.5
         return original_insert_htmlbox(page, *args, **kwargs)
 
-    monkeypatch.setattr(fitz.Page, "insert_htmlbox", fail_second_real_insert)
+    monkeypatch.setattr(fitz.Page, "insert_htmlbox", fail_real_insert)
     postflight_output = tmp_path / "atomic-postflight-output.pdf"
     postflight_report = postflight_reconstructor.reconstruct(
         source_pdf_path=source,
@@ -3143,7 +3045,7 @@ def test_table_overflow_is_atomic_across_all_cells(
     )
 
     assert postflight_report["regions_replaced"] == 0
-    assert postflight_report["regions_skipped"] == 4
+    assert postflight_report["regions_skipped"] == 1
     assert postflight_report["pages"][0]["status"] == "fallback_original_page"
     assert postflight_report["raster_tables_reconstructed"] == 0
     assert any(
@@ -3160,7 +3062,7 @@ def test_table_overflow_is_atomic_across_all_cells(
     )
 
 
-def test_unreliable_table_structure_is_retained_with_warning(tmp_path: Path) -> None:
+def test_unreliable_table_structure_uses_authoritative_block_box(tmp_path: Path) -> None:
     source = tmp_path / "bad-table-source.pdf"
     pdf = fitz.open()
     page = pdf.new_page(width=300, height=150)
@@ -3206,10 +3108,13 @@ def test_unreliable_table_structure_is_retained_with_warning(tmp_path: Path) -> 
         report_path=tmp_path / "bad-table-report.json",
     )
 
-    assert report["status"] == "partial"
-    assert any(
-        region.get("reason") == "table_translation_structure_unreliable"
-        for region in report["regions"]
-    )
+    assert report["status"] == "complete"
+    assert report["regions_replaced"] == 1
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] == block.bbox.model_dump()
+    assert replaced["source_text_masks"] == [block.bbox.model_dump()]
+    assert 0 < replaced["scale"] < 0.6
     with fitz.open(output) as translated:
-        assert "SOURCE TABLE" in translated[0].get_text("text")
+        output_text = translated[0].get_text("text")
+        assert "Translated" in output_text
+        assert "SOURCE TABLE" not in output_text

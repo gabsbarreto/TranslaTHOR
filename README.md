@@ -289,50 +289,37 @@ ten-case specification is always tested.
 
 ## Reconstruction Limitations
 
-- Surya 2 llama.cpp text regions are authoritative in original-layout output, including on scans
-  with a selectable hidden-OCR layer. Reconstruction covers the complete Surya PDF-space box and
-  places the target text there without hidden-OCR alignment, background, raster-mask, script, table-
-  cell, or overlapping-visual confidence vetoes. Background sampling only chooses a cosmetic fill
-  colour and cannot reject the box. Missing or invalid geometry and target text that cannot fit at
-  the minimum scale are still retained and reported. Surya figure and equation regions remain
-  preserved.
-- Non-Surya hidden-OCR pages can replace body text when the complete source passage has one
-  unambiguous match to a spatially contiguous hidden-OCR line lane. Line lanes may bridge a malformed
-  native PDF text-block boundary, but they cannot jump between columns. Multi-column classification
-  requires a stable gutter across several lines; isolated OCR glyph fragments are ignored.
-  The original scan remains the background; only verified line masks on light, sufficiently uniform
-  paper are covered before translated text is inserted. Partial matches, multi-column regions that
-  require table geometry, already-English passages, and suspicious translation-script changes are
-  retained and reported. A page with any retained translatable region is reported as partial, and
-  the readable PDF remains the safe full-translation fallback.
-- Image-only OCR from Qwen or legacy Marker still requires hidden text geometry for original-layout
-  replacement.
+- Every extracted text, table, and caption box is authoritative in original-layout output, whether
+  it came from Surya 2, Surya + Qwen, Marker, hidden OCR, or a born-digital PDF. Reconstruction paints
+  the complete recorded PDF-space box and inserts the complete target there. It does not use source-
+  text matching, hidden-OCR alignment, table-cell recovery, background uniformity, script checks, or
+  overlap heuristics as competing geometry vetoes. Background sampling only chooses a cosmetic fill
+  colour; an inconclusive sample falls back to white.
+- Text is downscaled as far as PyMuPDF requires, with no readability floor, and is committed only
+  after both preflight and real insertion report that the complete target fits. A failed insertion
+  rolls back the complete page transaction so reconstruction cannot silently delete or clip a
+  fragment. Figure and equation blocks remain protected unless the extractor explicitly classified
+  the region as text. Missing, invalid, cross-page, or unconfirmed placement geometry is still
+  retained and reported because there is no page-local box in which to place it.
 - Rotated pages are retained unchanged by the first original-layout implementation, while their
   original dimensions, crop boxes, rotation, and visual content remain intact.
 - Missing or invalid bounding boxes are skipped and reported rather than guessed. New translations
   preserve one independently placeable target per source block, even when several blocks share one
   model request for linguistic context; long groups are batched without translating a physical block
-  twice.
+  twice. The shared continuation resolver may bridge one or more intervening pages only when every
+  such page contains layout objects (tables, figures, captions, or equations) plus optional margin
+  furniture, and strong text, section, style, and geometry evidence connects the prose on both sides.
+  The prose is translated as one passage while each intervening object remains a separate translation
+  unit in source order. Blank pages, headings, lists, references, ordinary prose, and ambiguous seams
+  block the bridge.
   Legacy cross-page translation batches are recovered only when their preserved source and
   translated paragraph boundaries prove a one-to-one mapping; ambiguous legacy batches remain
   unchanged.
-- Non-Surya tables are translated cell-by-cell in original-layout output only when the translated
-  HTML or Markdown shape can be matched to validated cell geometry and the source cell text validates
-  that mapping. Authoritative Surya tables instead replace and re-typeset their complete region from
-  the translated table markup. New extractions retain Marker cell polygons as the preferred geometry.
-  Older clean digital PDFs with partial horizontal rules or whitespace-separated columns can use a
-  semantic fallback: physical PDF text lines and candidate column edges are coalesced into the logical
-  table only when all source cells align in a unique monotonic solution.
-  For scanned tables, the hidden OCR line boxes and a light, sufficiently uniform background must
-  also pass validation; only cells whose text actually changes are masked. When Marker
-  collapses a ruled digital table into one oversized cell, the extraction stage attempts a clipped
-  PyMuPDF repair and accepts it only with at least 88% source/candidate token agreement. Malformed,
-  duplicated, boxed prose panels, tables whose visible PDF text disagrees with extraction, or
-  otherwise ambiguous tables remain unchanged and are reported. Borderless tables require stored
-  extractor geometry or a uniquely validated text-lattice solution; geometry is never inferred
-  from translated text alone. A failure in any cell retains the
-  complete source table instead of producing a partially translated grid. Such tables can still be
-  translated as reflowed structured content in the readable PDF when OCR recovered their rows.
+- Tables are re-typeset once inside their complete extracted table box. Stored cell polygons,
+  inferred grids, hidden OCR, and visible source-cell agreement may still help extraction and
+  translation, but they cannot veto original-layout placement or split it into competing cell boxes.
+  Figures, captions, and equations remain separate source-order blocks and are never consumed into a
+  table replacement.
 - OCR table repair is deliberately narrow. Ragged Markdown is accepted only when a dominant width
   is close to every row and repair consists solely of inserting missing empty cells. Hidden-OCR
   two-column inference requires at least four aligned rows, stable gutter support, concise cell
@@ -342,8 +329,6 @@ ten-case specification is always tested.
   chunks are retried once and then retained with an explicit warning. Short headings, names,
   citations, formulas, and link-only blocks are exempt where language detection would be
   unreliable. Human review is still required for terminology and fluency.
-- Translated text that cannot fit at the minimum 60% scale is reported and the source region is
-  retained instead of silently deleting text or shrinking it to an unreadable size.
 - Figure detection follows Marker/Surya structured regions. False-positive visual regions or missed
   figures can still occur when upstream layout metadata is unreliable; the JSON report and
   structured document retain the evidence used for each association.

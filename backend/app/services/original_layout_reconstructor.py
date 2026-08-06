@@ -46,7 +46,7 @@ class _ReplacementRegion:
     redaction_bboxes: list[BoundingBox] | None = None
     redaction_fill: tuple[float, float, float] | None = None
     reconstruction_strategy: str = "embedded_text_replacement"
-    authoritative_surya_bbox: bool = False
+    authoritative_bbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -93,7 +93,10 @@ class _HiddenOCRMatch:
 class OriginalLayoutReconstructor:
     """Replace translated text while retaining the source PDF page art."""
 
-    minimum_scale = 0.6
+    # A zero lower bound asks PyMuPDF to find whatever scale is required to
+    # contain the complete target. Placement fidelity, rather than an arbitrary
+    # readability floor, is the only acceptance rule for an extracted text box.
+    minimum_scale = 0.0
     maximum_incidental_table_cell_overlap = 0.25
     locked_redaction_guard = 1.0
     locked_block_types = {BlockType.FIGURE, BlockType.EQUATION}
@@ -171,14 +174,27 @@ class OriginalLayoutReconstructor:
                     )
                     continue
 
+                authoritative_bbox_overlay = strategy in {
+                    "authoritative_bbox_overlay",
+                    # Backward-compatible handling for an unusual Surya page
+                    # that reaches the legacy strategy branch below.
+                    "surya2_image_overlay",
+                }
                 scan_overlay = strategy in {"ocr_text_overlay", "ocr_table_overlay"}
-                surya2_image_overlay = strategy == "surya2_image_overlay"
                 scan_table_only = strategy == "ocr_table_overlay"
                 page_report["reconstruction_strategy"] = strategy
-                if scan_overlay or surya2_image_overlay:
+                page_is_ocr = bool(
+                    page_metadata.get(page_number)
+                    and page_metadata[page_number].extraction_mode == SourceType.OCR
+                )
+                if scan_overlay or (authoritative_bbox_overlay and page_is_ocr):
                     report["scan_overlay_pages"] += 1
-                if surya2_image_overlay:
+                if authoritative_bbox_overlay and any(
+                    self._is_surya2_region(block) for block in blocks_by_page.get(page_number, [])
+                ):
                     report["surya2_image_overlay_pages"] += 1
+                if authoritative_bbox_overlay:
+                    report["authoritative_bbox_overlay_pages"] += 1
 
                 replacements = self._replacement_regions(
                     page=page,
@@ -192,15 +208,13 @@ class OriginalLayoutReconstructor:
                     page_report=page_report,
                     scan_overlay=scan_overlay,
                     scan_table_only=scan_table_only,
-                    surya2_image_overlay=surya2_image_overlay,
+                    authoritative_bbox_overlay=authoritative_bbox_overlay,
                 )
                 guarded_replacements: list[_ReplacementRegion] = []
                 for region in replacements:
-                    if region.authoritative_surya_bbox:
-                        # Surya regions are authoritative. Do not trim or reject
-                        # their redaction boxes against independently detected
-                        # visual regions: doing so would reintroduce a second
-                        # geometry opinion after Surya has labelled the region.
+                    if region.authoritative_bbox:
+                        # Extracted text regions are authoritative. Do not trim
+                        # or reject their boxes using a second geometry opinion.
                         guarded_replacements.append(region)
                         continue
                     region.redaction_bboxes = self._redaction_bboxes_avoiding_locked_regions(
@@ -247,7 +261,7 @@ class OriginalLayoutReconstructor:
                         self._skipped_region(
                             report,
                             region,
-                            reason="translated_text_did_not_fit_minimum_scale",
+                            reason="translated_text_did_not_fit_box",
                             scale=scale,
                         )
                         self._warning(
@@ -255,8 +269,9 @@ class OriginalLayoutReconstructor:
                             page_number=page_number,
                             code="text_box_overflow",
                             reason=(
-                                f"Translated text for {', '.join(region.block_ids)} requires scale "
-                                f"{scale:.3f}, below the minimum {self.minimum_scale:.3f}; source text was retained."
+                                f"Translated text for {', '.join(region.block_ids)} could not fit "
+                                "entirely inside its extracted box, even with automatic scaling; "
+                                "source text was retained."
                             ),
                         )
                         continue
@@ -387,6 +402,10 @@ class OriginalLayoutReconstructor:
                     report["regions_replaced"] += 1
                     page_report["regions_replaced"] += 1
                     report["scan_text_masks"] += len(region.redaction_bboxes or [])
+                    if region.authoritative_bbox:
+                        report["authoritative_bbox_text_masks"] += len(
+                            region.redaction_bboxes or []
+                        )
                     if region.reconstruction_strategy == "surya2_authoritative_bbox_overlay":
                         report["surya2_image_text_masks"] += len(region.redaction_bboxes or [])
                     report["regions"].append({**entry, "status": "replaced"})
@@ -483,6 +502,10 @@ class OriginalLayoutReconstructor:
             "scan_text_regions_alignment_failed": 0,
             "surya2_image_overlay_pages": 0,
             "surya2_image_text_masks": 0,
+            "authoritative_bbox_overlay_pages": 0,
+            "authoritative_bbox_text_masks": 0,
+            "region_policy": "authoritative_extracted_bbox_with_full_text_fit",
+            "fit_policy": "automatic_downscale_without_readability_floor",
             "surya2_region_policy": "authoritative_bbox_with_full_text_fit",
             "raster_tables_reconstructed": 0,
             "safe_fallback": "readable_pdf",
@@ -520,6 +543,19 @@ class OriginalLayoutReconstructor:
                 "unsupported",
                 "Rotated pages are retained unchanged in this first original-layout implementation.",
             )
+        if any(
+            block.bbox is not None
+            and block.block_type not in self.locked_block_types
+            and (
+                bool(block.text.strip())
+                or isinstance(block.metadata.get("translated_from_block_ids"), list)
+            )
+            for block in blocks
+        ):
+            # Every extractor's text-region geometry is authoritative. Source
+            # PDF text, hidden OCR, table-cell recovery, and visual overlap
+            # heuristics are not allowed to veto a valid extracted box.
+            return "authoritative_bbox_overlay", ""
         if metadata is None:
             return (
                 "unsupported",
@@ -658,7 +694,7 @@ class OriginalLayoutReconstructor:
         page_report: dict[str, Any],
         scan_overlay: bool = False,
         scan_table_only: bool = False,
-        surya2_image_overlay: bool = False,
+        authoritative_bbox_overlay: bool = False,
     ) -> list[_ReplacementRegion]:
         block_by_id = {block.id: block for block in all_blocks}
         consumed: set[str] = set()
@@ -720,8 +756,8 @@ class OriginalLayoutReconstructor:
                     bbox=self._block_pdf_bbox(page, block),
                 )
                 continue
-            authoritative_surya_block = surya2_image_overlay and self._is_surya2_region(block)
-            if block.block_type == BlockType.TABLE and not authoritative_surya_block:
+            authoritative_block = authoritative_bbox_overlay
+            if block.block_type == BlockType.TABLE and not authoritative_block:
                 validation = block.metadata.get("translation_validation")
                 if (
                     isinstance(validation, dict)
@@ -755,7 +791,7 @@ class OriginalLayoutReconstructor:
                 elif scan_overlay and page_report["regions_skipped"] > skipped_before:
                     failed_scan_table_ids.add(block.id)
                 continue
-            if block.block_type in self.conservative_skip_types and not authoritative_surya_block:
+            if block.block_type in self.conservative_skip_types and not authoritative_block:
                 self._skip_block(
                     report,
                     page_report,
@@ -801,9 +837,7 @@ class OriginalLayoutReconstructor:
                     continue
                 translated_text = block.text.strip()
 
-            authoritative_surya_region = authoritative_surya_block and all(
-                self._is_surya2_region(source_block) for source_block in source_blocks
-            )
+            authoritative_region = authoritative_block
 
             converted: list[BoundingBox] = []
             conversions: list[dict[str, Any]] = []
@@ -820,7 +854,7 @@ class OriginalLayoutReconstructor:
             consumed.update(item.id for item in source_blocks)
             source_bbox_missing = len(converted) != len(source_blocks)
             recover_bbox_from_hidden_ocr = (
-                scan_overlay and not authoritative_surya_region and source_bbox_missing
+                scan_overlay and not authoritative_region and source_bbox_missing
             )
             if source_bbox_missing and not recover_bbox_from_hidden_ocr:
                 report["regions_missing_or_invalid_bboxes"] += 1
@@ -849,7 +883,7 @@ class OriginalLayoutReconstructor:
             )
             validation = block.metadata.get("translation_validation")
             if (
-                not authoritative_surya_region
+                not authoritative_region
                 and isinstance(validation, dict)
                 and validation.get("status") == "translation_failed"
             ):
@@ -864,13 +898,13 @@ class OriginalLayoutReconstructor:
                 )
                 continue
             if (
-                not authoritative_surya_region
+                not authoritative_region
                 and source_text
                 and self._normalized_text(source_text) == self._normalized_text(translated_text)
             ):
                 # English or otherwise unchanged text already matches the visual base.
                 continue
-            if not scan_overlay and not authoritative_surya_region:
+            if not scan_overlay and not authoritative_region:
                 source_validation = self._embedded_source_text_validation(
                     page,
                     bbox,
@@ -895,7 +929,7 @@ class OriginalLayoutReconstructor:
                         "source_text_validation": source_validation,
                     }
                 )
-            if scan_overlay and not authoritative_surya_region and not source_text:
+            if scan_overlay and not authoritative_region and not source_text:
                 self._skip_block(
                     report,
                     page_report,
@@ -905,7 +939,7 @@ class OriginalLayoutReconstructor:
                 )
                 continue
             scan_match: _HiddenOCRMatch | None = None
-            if scan_overlay and not authoritative_surya_region:
+            if scan_overlay and not authoritative_region:
                 if self._source_text_is_probably_english(source_text):
                     # The application targets English. Re-typesetting an
                     # already-English passage only introduces scan artefacts
@@ -920,7 +954,7 @@ class OriginalLayoutReconstructor:
                         bbox=None if recover_bbox_from_hidden_ocr else bbox,
                     )
                     continue
-            if scan_overlay and not authoritative_surya_region:
+            if scan_overlay and not authoritative_region:
                 scan_match, match_metadata = self._match_hidden_ocr_lines(
                     page,
                     source_text,
@@ -966,7 +1000,7 @@ class OriginalLayoutReconstructor:
                     continue
                 bbox = self._scan_match_envelope(page, scan_match.bbox)
 
-            if not authoritative_surya_region and any(
+            if not authoritative_region and any(
                 self._overlaps_locked_region(bbox, locked) for locked in locked_regions
             ):
                 self._skip_block(
@@ -986,9 +1020,9 @@ class OriginalLayoutReconstructor:
                 source_text=source_text,
                 style_hints=dict(block.style_hints or {}),
                 coordinate_metadata=conversions,
-                authoritative_surya_bbox=authoritative_surya_region,
+                authoritative_bbox=authoritative_region,
             )
-            if scan_overlay and not authoritative_surya_region and scan_match is not None:
+            if scan_overlay and not authoritative_region and scan_match is not None:
                 masks = self._scan_match_masks(page, scan_match.lines)
                 fill, background_metadata = self._scan_background_fill(page, bbox)
                 if fill is None or not masks:
@@ -1033,18 +1067,30 @@ class OriginalLayoutReconstructor:
                 replacement.coordinate_metadata.append(alignment_metadata)
                 claimed_scan_lines.update(scan_match.keys)
                 report["scan_text_regions_aligned"] += 1
-            elif authoritative_surya_region:
-                fill, background_metadata = self._authoritative_surya_background_fill(page, bbox)
+            elif authoritative_region:
+                fill, background_metadata = self._authoritative_background_fill(page, bbox)
                 replacement.redaction_bboxes = [bbox]
                 replacement.redaction_fill = fill
-                replacement.reconstruction_strategy = "surya2_authoritative_bbox_overlay"
+                is_surya2_region = all(
+                    self._is_surya2_region(source_block) for source_block in source_blocks
+                )
+                replacement.reconstruction_strategy = (
+                    "surya2_authoritative_bbox_overlay"
+                    if is_surya2_region
+                    else "authoritative_bbox_overlay"
+                )
                 replacement.coordinate_metadata.append(
                     {
-                        "geometry_source": "surya2_pdf_bbox",
+                        "geometry_source": "extracted_region_bbox",
                         "coordinate_space": "pdf_points_top_left",
-                        "surya2_region_bbox_pdf": bbox.model_dump(),
-                        "mask_source": "surya2_full_region_bbox",
-                        "region_policy": "authoritative_surya_bbox_with_full_text_fit",
+                        "extracted_region_bbox_pdf": bbox.model_dump(),
+                        "mask_source": "full_region_bbox",
+                        "region_policy": "authoritative_extracted_bbox_with_full_text_fit",
+                        "extractor": (
+                            "surya2_llamacpp"
+                            if is_surya2_region
+                            else str(block.metadata.get("parser") or "unknown")
+                        ),
                         "scan_background": background_metadata,
                     }
                 )
@@ -1604,9 +1650,7 @@ class OriginalLayoutReconstructor:
                 intersection = fitz.Rect(rectangle & other)
                 smaller_cell_area = min(rectangle.get_area(), other.get_area())
                 overlap_ratio = (
-                    intersection.get_area() / smaller_cell_area
-                    if smaller_cell_area > 0
-                    else 1.0
+                    intersection.get_area() / smaller_cell_area if smaller_cell_area > 0 else 1.0
                 )
                 if (
                     intersection.get_area() > 0.75
@@ -3061,16 +3105,16 @@ class OriginalLayoutReconstructor:
             return None, metadata
         return tuple(channel / 255.0 for channel in mode), metadata
 
-    def _authoritative_surya_background_fill(
+    def _authoritative_background_fill(
         self,
         page: fitz.Page,
         bbox: BoundingBox,
     ) -> tuple[tuple[float, float, float], dict[str, Any]]:
         """Choose a fill colour without using background analysis as a veto.
 
-        A Surya text-region box is painted in full. Background sampling is used
-        only to make that paint blend into ordinary paper; an inconclusive or
-        failed sample falls back to white and never rejects the region.
+        An extracted text-region box is painted in full. Background sampling is
+        used only to make that paint blend into the source page; an inconclusive
+        or failed sample falls back to white and never rejects the region.
         """
 
         fill, metadata = self._scan_background_fill(page, bbox)
@@ -3552,12 +3596,15 @@ class OriginalLayoutReconstructor:
             # Padding prevents PyMuPDF from returning a truncated word when a
             # detector polygon ends inside its glyph box. Centres are still
             # filtered against the unpadded semantic cell below.
-            word_clip = fitz.Rect(
-                rectangle.x0 - 36.0,
-                rectangle.y0 - 4.0,
-                rectangle.x1 + 36.0,
-                rectangle.y1 + 4.0,
-            ) & page.rect
+            word_clip = (
+                fitz.Rect(
+                    rectangle.x0 - 36.0,
+                    rectangle.y0 - 4.0,
+                    rectangle.x1 + 36.0,
+                    rectangle.y1 + 4.0,
+                )
+                & page.rect
+            )
             words = page.get_text("words", clip=word_clip, sort=True)
         except Exception:
             return ""
@@ -3682,9 +3729,7 @@ class OriginalLayoutReconstructor:
         else:
             escaped = html.escape(region.translated_text)
             paragraphs = [part.strip() for part in re.split(r"\n\s*\n", escaped) if part.strip()]
-            rendered = "".join(
-                f"<p>{part.replace(chr(10), '<br>')}</p>" for part in paragraphs
-            )
+            rendered = "".join(f"<p>{part.replace(chr(10), '<br>')}</p>" for part in paragraphs)
             if not rendered:
                 rendered = f"<p>{escaped}</p>"
         style_hints = {

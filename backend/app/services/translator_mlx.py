@@ -1098,10 +1098,10 @@ class MlxTranslator:
         Adjacent chunks are batched for linguistic context, but adjacency does
         not make them one paragraph. Redistribution is safe only for blocks
         that the normal paragraph join accepts, or for an explicit hyphenated
-        word continuation across a column boundary. An adjacent-page pair is
+        word continuation across a column boundary. A cross-page pair is
         accepted only when the shared resolver recorded the exact source-order
-        seam and every intervening block. Ordinary unproven groups retain the
-        same-page protections.
+        seam and every intervening block, including any proven object-only
+        pages. Ordinary unproven groups retain the same-page protections.
         """
 
         if len(segments) < 2 or any(
@@ -1164,7 +1164,7 @@ class MlxTranslator:
         current_position: int,
         block_by_id: dict[str, Block],
     ) -> bool:
-        if current.page_number != previous.page_number + 1:
+        if current.page_number <= previous.page_number:
             return False
         previous_group = previous.metadata.get(CONTINUATION_GROUP_ID)
         current_group = current.metadata.get(CONTINUATION_GROUP_ID)
@@ -1188,6 +1188,21 @@ class MlxTranslator:
             None,
         )
         if seam is None:
+            return False
+        expected_intermediate_pages = list(range(previous.page_number + 1, current.page_number))
+        try:
+            recorded_previous_page = int(seam.get("previous_page", -1))
+            recorded_current_page = int(seam.get("current_page", -1))
+            recorded_intermediate_pages = [
+                int(value) for value in seam.get("intermediate_page_numbers") or []
+            ]
+        except (TypeError, ValueError):
+            return False
+        if (
+            recorded_previous_page != previous.page_number
+            or recorded_current_page != current.page_number
+            or recorded_intermediate_pages != expected_intermediate_pages
+        ):
             return False
         expected_intervening = [str(value) for value in seam.get("intervening_block_ids") or []]
         document_ids = list(block_by_id)
@@ -3331,8 +3346,9 @@ class MlxTranslator:
         verbatim_requirements = ""
         if missing_acronyms:
             verbatim_requirements += (
-                " Required source acronyms that must appear unchanged in the English output: "
-                f"{', '.join(missing_acronyms)}."
+                " Required source acronyms whose uppercase base letters must remain unchanged "
+                f"in the English output: {', '.join(missing_acronyms)}. Natural lowercase "
+                "English plural or possessive suffixes are allowed."
             )
         if missing_identifiers:
             verbatim_requirements += (
@@ -3498,8 +3514,9 @@ class MlxTranslator:
                 f"{retry_context}\n"
                 "A second attempt was also rejected. Produce a direct, clause-by-clause English "
                 "translation now. Every source-language word or phrase with translatable meaning must "
-                "be rendered in English. Retain only proper names and the exact required identifiers or "
-                "acronyms from the preservation instructions."
+                "be rendered in English. Retain only proper names, the exact required identifiers, and "
+                "the required acronym base letters from the preservation instructions. Natural lowercase "
+                "English plural or possessive suffixes on those acronyms are allowed."
                 f"{invented_acronym_guidance} Return only the translation."
             )
             final_translation = self._translate_chunk(
@@ -3780,13 +3797,25 @@ class MlxTranslator:
         source_counts = Counter(self._source_acronyms_to_preserve(source, block_type))
         if not source_counts:
             return []
-        translated_counts = Counter(
-            re.findall(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", html.unescape(translated))
-        )
+        translated_visible = html.unescape(translated)
+
+        def translated_count(acronym: str) -> int:
+            # Keep the stable uppercase base, but do not reject ordinary English
+            # inflection. Scientific prose naturally turns Spanish bare plurals
+            # such as ``los HT`` and ``las MT`` into ``HTs`` and ``MTs``. The
+            # previous exact word-boundary match treated both as missing and
+            # discarded otherwise valid translations. Apostrophe possessives and
+            # plural possessives follow the same rule; longer word continuations
+            # and changes to the uppercase base still fail validation.
+            pattern = re.compile(
+                rf"(?<![\w]){re.escape(acronym)}(?:['’]s|s['’]?)?(?![\w])"
+            )
+            return sum(1 for _ in pattern.finditer(translated_visible))
+
         return [
             acronym
             for acronym, required_count in source_counts.items()
-            if translated_counts[acronym] < required_count
+            if translated_count(acronym) < required_count
         ]
 
     def _invented_target_acronyms(
@@ -3975,8 +4004,9 @@ class MlxTranslator:
         )
         if missing_acronyms:
             retry_context += (
-                " Preserve these document-defined acronyms character-for-character: "
-                f"{', '.join(missing_acronyms)}."
+                " Preserve the uppercase base letters of these document-defined acronyms: "
+                f"{', '.join(missing_acronyms)}. Natural lowercase English plural or possessive "
+                "suffixes are allowed."
             )
         retried = self._translate_chunk(
             text,
@@ -4465,8 +4495,9 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "units, numeric values, and figure references. Preserve source acronyms and unexplained "
-            "abbreviations exactly; never expand or reinterpret them. Do not invent abbreviations from "
+            "units, numeric values, and figure references. Preserve the uppercase base letters of source "
+            "acronyms and unexplained abbreviations; natural lowercase English plural or possessive suffixes "
+            "are allowed, but never expand or reinterpret the base acronym. Do not invent abbreviations from "
             "ordinary source words. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
             "Translate short section headings and titles as well."

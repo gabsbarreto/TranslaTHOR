@@ -173,10 +173,13 @@ class _GeometryEvidence:
 
 
 class CrossPageContinuationResolver:
-    """Conservatively prove body-paragraph links at adjacent page seams.
+    """Conservatively prove body-paragraph links across physical page seams.
 
     The resolver only records links. It never changes source block order or
-    inserts layout objects into a prose group.
+    inserts layout objects into a prose group. A page containing only tables,
+    figures, captions, equations, and transparent margins may be crossed as an
+    interruption when the prose evidence on both sides independently proves a
+    continuation.
     """
 
     def resolve(self, document: DocumentModel) -> CrossPageContinuationResolution:
@@ -209,22 +212,34 @@ class CrossPageContinuationResolver:
 
         links: list[CrossPageContinuationLink] = []
         for previous_page in sorted(page_blocks):
-            current_page = previous_page + 1
-            if current_page not in page_blocks:
-                continue
             previous = self._edge_candidate(
                 page_blocks[previous_page],
                 reverse=True,
                 transparent_reasons=transparent_reasons,
                 object_roles=object_roles,
             )
-            current = self._edge_candidate(
-                page_blocks[current_page],
-                reverse=False,
-                transparent_reasons=transparent_reasons,
-                object_roles=object_roles,
-            )
-            if previous is None or current is None:
+            if previous is None:
+                continue
+
+            current: Block | None = None
+            current_page = previous_page + 1
+            while current_page in page_blocks:
+                current = self._edge_candidate(
+                    page_blocks[current_page],
+                    reverse=False,
+                    transparent_reasons=transparent_reasons,
+                    object_roles=object_roles,
+                )
+                if current is not None:
+                    break
+                if not self._is_object_only_bridge_page(
+                    page_blocks[current_page],
+                    transparent_reasons,
+                    object_roles,
+                ):
+                    break
+                current_page += 1
+            if current is None:
                 continue
             previous_position = positions[previous.id]
             current_position = positions[current.id]
@@ -232,7 +247,7 @@ class CrossPageContinuationResolver:
                 continue
             between = document.blocks[previous_position + 1 : current_position]
             if any(
-                block.page_number not in {previous_page, current_page}
+                not (previous_page <= block.page_number <= current_page)
                 or (block.id not in transparent_reasons and block.id not in object_roles)
                 for block in between
             ):
@@ -382,6 +397,19 @@ class CrossPageContinuationResolver:
             return None
         return None
 
+    def _is_object_only_bridge_page(
+        self,
+        blocks: list[Block],
+        transparent_reasons: dict[str, str],
+        object_roles: dict[str, str],
+    ) -> bool:
+        visible = [block for block in blocks if block.id not in transparent_reasons]
+        return (
+            bool(visible)
+            and all(block.id in object_roles for block in visible)
+            and any(block.block_type in _LAYOUT_OBJECT_TYPES for block in visible)
+        )
+
     def _decision(
         self,
         previous: Block,
@@ -391,7 +419,7 @@ class CrossPageContinuationResolver:
         object_roles: dict[str, str],
         dimensions: dict[int, tuple[float, float]],
     ) -> tuple[float, tuple[str, ...]] | None:
-        if current.page_number != previous.page_number + 1:
+        if current.page_number <= previous.page_number:
             return None
         previous_text = self._source_text(previous).strip()
         current_text = self._source_text(current).strip()
@@ -425,10 +453,19 @@ class CrossPageContinuationResolver:
         next_kind = self._next_start_kind(current_text)
         if next_kind == "structural" or next_kind == "neutral":
             return None
-        if next_kind == "uppercase" and not style_available and not (split_word or connector):
+        if (
+            next_kind == "uppercase"
+            and not style_available
+            and not (split_word or connector or geometry.compatible)
+        ):
             return None
 
-        evidence = ["consecutive_pages"]
+        bridges_object_pages = current.page_number > previous.page_number + 1
+        evidence = (
+            ["consecutive_physical_page_span", "object_only_intervening_pages"]
+            if bridges_object_pages
+            else ["consecutive_pages"]
+        )
         if terminal == "abbreviation":
             if not geometry.compatible or next_kind not in {
                 "lowercase",
@@ -487,6 +524,8 @@ class CrossPageContinuationResolver:
             confidence = 0.90
         else:
             confidence = 0.88
+        if bridges_object_pages:
+            confidence = min(confidence, 0.92)
         return confidence, tuple(dict.fromkeys(evidence))
 
     def _geometry_evidence(
@@ -712,6 +751,9 @@ class CrossPageContinuationResolver:
                     "current_block_id": link.current_block_id,
                     "previous_page": link.previous_page,
                     "current_page": link.current_page,
+                    "intermediate_page_numbers": list(
+                        range(link.previous_page + 1, link.current_page)
+                    ),
                     "decision_level": link.decision_level,
                     "confidence": link.confidence,
                     "evidence": list(link.evidence),

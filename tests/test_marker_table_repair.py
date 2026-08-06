@@ -90,7 +90,7 @@ def test_collapsed_marker_table_is_retained_when_pdf_text_does_not_match(tmp_pat
     assert "no matching PDF table grid was found" in summary.warnings[0]
 
 
-def test_repaired_table_can_be_reconstructed_cell_by_cell(tmp_path: Path) -> None:
+def test_repaired_table_is_reconstructed_once_in_authoritative_box(tmp_path: Path) -> None:
     pdf_path = tmp_path / "ruled-table.pdf"
     output_path = tmp_path / "translated.pdf"
     report_path = tmp_path / "report.json"
@@ -124,8 +124,16 @@ def test_repaired_table_can_be_reconstructed_cell_by_cell(tmp_path: Path) -> Non
     )
 
     assert output_path.exists()
-    assert report["regions_replaced"] >= 3
+    assert report["regions_replaced"] == 1
     assert report["regions_skipped"] == 0
+    replaced = next(region for region in report["regions"] if region["status"] == "replaced")
+    assert replaced["bbox"] == block.bbox.model_dump()
+    assert replaced["source_text_masks"] == [block.bbox.model_dump()]
+    with fitz.open(output_path) as translated:
+        output_text = translated[0].get_text("text")
+        assert "Measure" in output_text
+        assert "Enabled" in output_text
+        assert "Area" in output_text
     persisted = json.loads(report_path.read_text(encoding="utf-8"))
     assert not any(
         region.get("reason") == "table_translation_structure_unreliable"
@@ -163,10 +171,7 @@ def _collapsed_document(rows: list[list[str]]) -> DocumentModel:
     flattened = "<br>".join(cell for row in rows for cell in row if cell)
     empty_rows = "".join("<tr><td></td><td></td><td></td></tr>" for _ in rows[1:])
     malformed = (
-        "<table><tbody>"
-        f"<tr><th>{flattened}</th><th></th><th></th></tr>"
-        f"{empty_rows}"
-        "</tbody></table>"
+        f"<table><tbody><tr><th>{flattened}</th><th></th><th></th></tr>{empty_rows}</tbody></table>"
     )
     block = Block(
         id="/page/0/Table/1",
