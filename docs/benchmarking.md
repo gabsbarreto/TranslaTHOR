@@ -11,11 +11,19 @@ PYTHONPATH=backend .venv/bin/python scripts/benchmark_ocr_engines.py \
   --warm-runs 3
 ```
 
+Use `--cold-only` for one fresh-process timing per engine. When every page is
+selected, the runner copies the original PDF byte-for-byte instead of rewriting
+it as a page subset. Completed runs are atomically checkpointed to
+`benchmark_results.json` and `benchmark_report.md` after each engine finishes.
+Use `--surya-parallel 5 --surya-context-per-slot 16384` to test five concurrent
+Surya pages without reducing the context available to each page.
+
 `workspace/benchmarks/` is ignored. Do not put private PDFs, reference text,
 or generated OCR in the repository.
 
 Supported engines:
 
+- `marker_balanced` (production Marker 2 balanced path, including source-validated table retry)
 - `marker_surya`
 - `surya_qwen_mlx`
 - `surya2_full_page`

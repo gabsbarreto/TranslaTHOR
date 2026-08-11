@@ -30,4 +30,4 @@ upsert_env() {
 }
 
 echo "Local runtime is ready."
-echo "Run scripts/setup_surya2_runtime.sh to create the isolated Surya 2 environment."
+echo "Run scripts/setup_surya2_runtime.sh to create the shared Marker 2 + Surya 2 environment."

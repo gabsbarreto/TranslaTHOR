@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -82,9 +83,8 @@ def find_region_overlaps(regions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def boxes_overlap(first_bbox: list[int], second_bbox: list[int]) -> bool:
     first_x1, first_y1, first_x2, first_y2 = first_bbox
     second_x1, second_y1, second_x2, second_y2 = second_bbox
-    return (
-        min(first_x2, second_x2) > max(first_x1, second_x1)
-        and min(first_y2, second_y2) > max(first_y1, second_y1)
+    return min(first_x2, second_x2) > max(first_x1, second_x1) and min(first_y2, second_y2) > max(
+        first_y1, second_y1
     )
 
 
@@ -266,17 +266,31 @@ def save_layout_artifacts(
 
 
 def detect_layout(image_paths: list[Path], *, batch_size: int | None = None) -> list[Any]:
-    from surya.foundation import FoundationPredictor
+    # Surya reads these settings at import time. This worker now shares the
+    # Surya 2/Marker 2 environment and uses the same llama.cpp backend as the
+    # primary OCR worker.
+    os.environ["SURYA_INFERENCE_BACKEND"] = "llamacpp"
+    os.environ["SURYA_GUIDED_LAYOUT"] = "false"
+    from surya.inference import SuryaInferenceManager
     from surya.layout import LayoutPredictor
-    from surya.settings import settings
 
     images: list[Image.Image] = []
     for path in image_paths:
         with Image.open(path) as image:
             images.append(image.convert("RGB"))
 
-    predictor = LayoutPredictor(FoundationPredictor(checkpoint=settings.LAYOUT_MODEL_CHECKPOINT))
-    return predictor(images, batch_size=batch_size)
+    manager = SuryaInferenceManager(method="llamacpp")
+    predictor = LayoutPredictor(manager)
+    predictions: list[Any] = []
+    effective_batch_size = max(1, int(batch_size or len(images)))
+    try:
+        for start in range(0, len(images), effective_batch_size):
+            predictions.extend(predictor(images[start : start + effective_batch_size]))
+        return predictions
+    finally:
+        manager.stop()
+        for image in images:
+            image.close()
 
 
 def main() -> int:

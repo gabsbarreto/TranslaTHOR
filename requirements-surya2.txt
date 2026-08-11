@@ -1,5 +1,6 @@
-# Isolated Surya 2 runtime.  Keep this separate from the legacy Marker/Surya v1
-# and mlx-vlm environments because Surya 2 requires Transformers 5.
+# Shared Surya 2 and Marker 2 extraction runtime. Keep it separate from the
+# mlx-vlm environment because this stack requires Transformers 5.
+marker-pdf==2.0.0
 surya-ocr==0.22.1
 torch==2.11.0
 torchvision==0.26.0

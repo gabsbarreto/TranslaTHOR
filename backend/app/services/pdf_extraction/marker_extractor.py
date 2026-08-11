@@ -10,8 +10,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
-from app.models.schema import SourceType
-from app.config import BASE_DIR
+from app.models.schema import DocumentModel, SourceType
+from app.config import (
+    BASE_DIR,
+    DEFAULT_MARKER_CONVERSION_MODE,
+    ENABLE_MARKER_TABLE_OCR_RETRY,
+)
 from app.services.markdown_builder import MarkdownBuilder as AppMarkdownBuilder
 from app.services.pdf_extraction.local_vlm_service import LocalVLMRepairService
 from app.services.pdf_extraction.markdown_builder import MarkerDocumentBuilder
@@ -22,7 +26,10 @@ from app.services.pdf_extraction.models import (
     PDFTypeDetectionResult,
 )
 from app.services.pdf_extraction.pdf_type_detector import PDFTypeDetector
-from app.services.pdf_extraction.table_repair import MarkerTableRepairService
+from app.services.pdf_extraction.table_repair import (
+    MarkerTableRepairService,
+    MarkerTableRepairSummary,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +94,11 @@ class PDFExtractor:
             if job_dir is None or not keep_debug_artifacts
             else None
         )
-        output_root = Path(temp_context.name) if temp_context is not None else (job_dir / "marker")
+        if temp_context is not None:
+            output_root = Path(temp_context.name)
+        else:
+            assert job_dir is not None
+            output_root = job_dir / "marker"
         output_root.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -118,6 +129,7 @@ class PDFExtractor:
                 "extraction_mode": mode,
                 "marker_mode": marker_mode,
                 "marker_requested_mode": requested_marker_mode,
+                "marker_conversion_mode": DEFAULT_MARKER_CONVERSION_MODE,
                 "ocr_used": used_ocr,
                 "force_ocr": used_force_ocr,
                 "strip_existing_ocr": stripped_existing_ocr,
@@ -143,12 +155,27 @@ class PDFExtractor:
                 warnings=warnings,
             )
 
-            table_repair = self.table_repair_service.repair(pdf_path, document)
-            warnings.extend(table_repair.warnings)
-            parser_metadata["table_repair"] = table_repair.as_metadata()
-            document.metadata.translation["table_repair"] = table_repair.as_metadata()
+            _table_repair, table_repair_metadata, table_warnings, tables_changed = (
+                self._repair_tables_with_ocr_retry(
+                    pdf_path=pdf_path,
+                    output_root=output_root,
+                    output_format=output_format,
+                    document=document,
+                    detection=detection,
+                    marker_mode=marker_mode,
+                    keep_debug_artifacts=keep_debug_artifacts,
+                    timeout=timeout,
+                    cancel_requested=cancel_requested,
+                    on_process_started=on_process_started,
+                    on_process_finished=on_process_finished,
+                    marker_config=marker_config,
+                )
+            )
+            warnings.extend(table_warnings)
+            parser_metadata["table_repair"] = table_repair_metadata
+            document.metadata.translation["table_repair"] = table_repair_metadata
             document.warnings = list(warnings)
-            if table_repair.repaired_count:
+            if tables_changed:
                 markdown = AppMarkdownBuilder().build(document)
                 chunks = self.document_builder.chunks_from_blocks(document.blocks)
 
@@ -215,15 +242,126 @@ class PDFExtractor:
             if temp_context is not None:
                 temp_context.cleanup()
 
+    def _repair_tables_with_ocr_retry(
+        self,
+        *,
+        pdf_path: Path,
+        output_root: Path,
+        output_format: str,
+        document: DocumentModel,
+        detection: PDFTypeDetectionResult,
+        marker_mode: MarkerMode,
+        keep_debug_artifacts: bool,
+        timeout: int | None,
+        cancel_requested: Callable[[], bool] | None,
+        on_process_started: Callable[[subprocess.Popen], None] | None,
+        on_process_finished: Callable[[subprocess.Popen], None] | None,
+        marker_config: dict | None,
+    ) -> tuple[MarkerTableRepairSummary, dict, list[str], bool]:
+        initial = self.table_repair_service.repair(pdf_path, document)
+        changed = bool(initial.repaired_count)
+        retry_metadata = {
+            "enabled": ENABLE_MARKER_TABLE_OCR_RETRY,
+            "attempted": False,
+            "pages": [],
+            "mode": "force_ocr",
+        }
+        metadata = {
+            **initial.as_metadata(),
+            "initial": initial.as_metadata(),
+            "ocr_retry": retry_metadata,
+        }
+        if (
+            not ENABLE_MARKER_TABLE_OCR_RETRY
+            or marker_mode != "normal"
+            or not initial.incomplete_block_ids
+        ):
+            return initial, metadata, initial.warnings, changed
+
+        block_by_id = {block.id: block for block in document.blocks}
+        retry_pages = sorted(
+            {
+                block_by_id[block_id].page_number
+                for block_id in initial.incomplete_block_ids
+                if block_id in block_by_id
+            }
+        )
+        if not retry_pages:
+            return initial, metadata, initial.warnings, changed
+
+        retry_metadata["attempted"] = True
+        retry_metadata["pages"] = retry_pages
+        retry_output_dir = output_root / "retry_incomplete_tables_force_ocr"
+        try:
+            retry_payload = self._run_marker(
+                pdf_path=pdf_path,
+                output_dir=retry_output_dir,
+                output_format=output_format,
+                marker_mode="force_ocr",
+                keep_debug_artifacts=keep_debug_artifacts,
+                timeout=timeout,
+                cancel_requested=cancel_requested,
+                on_process_started=on_process_started,
+                on_process_finished=on_process_finished,
+                marker_config=marker_config,
+                page_range=[page_number - 1 for page_number in retry_pages],
+            )
+            retry_document, _retry_markdown, _retry_chunks = self.document_builder.build_document(
+                marker_payload=retry_payload,
+                detection=detection,
+                filename=pdf_path.name,
+                source_type=SourceType.OCR,
+                parser_metadata={
+                    "pdf_classification": detection.classification,
+                    "marker_mode": "force_ocr",
+                    "marker_conversion_mode": DEFAULT_MARKER_CONVERSION_MODE,
+                    "table_completeness_retry": True,
+                },
+                warnings=[],
+            )
+            merge = self.table_repair_service.merge_incomplete_from_ocr_retry(
+                document,
+                retry_document,
+                initial.incomplete_block_ids,
+            )
+            changed = changed or bool(merge.merged_count)
+            final = self.table_repair_service.repair(pdf_path, document)
+            retry_metadata.update(
+                {
+                    "returned_table_count": len(retry_document.tables),
+                    "merge": merge.as_metadata(),
+                    "remaining_incomplete_block_ids": final.incomplete_block_ids,
+                }
+            )
+            metadata = {
+                **final.as_metadata(),
+                "initial": initial.as_metadata(),
+                "ocr_retry": retry_metadata,
+            }
+            logger.info(
+                "Marker table completeness retry filled %s table(s); %s remain incomplete",
+                merge.merged_count,
+                len(final.incomplete_block_ids),
+            )
+            return final, metadata, [*merge.warnings, *final.warnings], changed
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) == "Cancelled by user":
+                raise
+            logger.warning("Marker forced-OCR table completeness retry failed: %s", exc)
+            retry_metadata["error"] = str(exc)
+            warning = (
+                "Marker detected an incomplete table, but the page-local forced-OCR retry "
+                f"failed; the incomplete table will be retained in the source layout: {exc}"
+            )
+            return initial, metadata, [*initial.warnings, warning], changed
+
     def _normalize_mode(self, mode: str) -> ExtractionMode:
         allowed = {"auto", "digital", "scanned", "strip_and_force_ocr", "auto_repair"}
         return mode if mode in allowed else "auto"  # type: ignore[return-value]
 
     def _select_marker_mode(self, mode: ExtractionMode, classification: str) -> MarkerMode:
         if mode == "digital":
-            return "text_only"
-        if mode in {"auto", "auto_repair"}:
-            return "text_only"
+            return "normal"
         if mode == "scanned":
             return "force_ocr"
         if mode == "strip_and_force_ocr":
@@ -250,8 +388,15 @@ class PDFExtractor:
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         env_overrides: dict[str, str] | None = None,
         marker_config: dict | None = None,
+        page_range: list[int] | None = None,
     ):
         marker_bin = os.getenv("MARKER_BIN") or self._default_marker_bin()
+        marker_path = Path(marker_bin).expanduser()
+        if (marker_path.is_absolute() or os.sep in marker_bin) and not marker_path.exists():
+            raise RuntimeError(
+                "Marker 2 is missing from the shared extraction runtime. "
+                "Run `bash scripts/setup_surya2_runtime.sh` or set MARKER_BIN."
+            )
         cmd = [
             marker_bin,
             str(pdf_path),
@@ -259,7 +404,11 @@ class PDFExtractor:
             str(output_dir),
             "--output_format",
             output_format,
+            "--mode",
+            DEFAULT_MARKER_CONVERSION_MODE,
         ]
+        if page_range:
+            cmd.extend(["--page_range", ",".join(str(page) for page in page_range)])
         if marker_mode in {"force_ocr", "strip_existing_ocr_force_ocr"}:
             cmd.append("--force_ocr")
         if marker_mode == "strip_existing_ocr_force_ocr":
@@ -278,6 +427,9 @@ class PDFExtractor:
             cmd.extend(["--config_json", str(config_path)])
 
         env = os.environ.copy()
+        env.setdefault("SURYA_INFERENCE_BACKEND", "llamacpp")
+        env.setdefault("SURYA_GUIDED_LAYOUT", "false")
+        env.setdefault("SURYA_INFERENCE_KEEP_ALIVE", "0")
         if env_overrides:
             env.update(env_overrides)
         process = subprocess.Popen(
@@ -499,18 +651,13 @@ class PDFExtractor:
             return is_page(payload)
         if block_type == "document":
             children = payload.get("children")
-            return bool(
-                isinstance(children, list)
-                and all(is_page(item) for item in children)
-            )
+            return bool(isinstance(children, list) and all(is_page(item) for item in children))
         pages = payload.get("pages")
         return bool(isinstance(pages, list) and pages and all(is_page(item) for item in pages))
 
     def _default_marker_bin(self) -> str:
-        isolated_marker = BASE_DIR / ".venv-marker" / "bin" / "marker_single"
-        if isolated_marker.exists():
-            return str(isolated_marker)
-        return "marker_single"
+        surya2_marker = BASE_DIR / ".venv-surya2" / "bin" / "marker_single"
+        return str(surya2_marker)
 
     def _write_marker_failure(
         self, output_dir: Path, cmd: list[str], return_code: int, stdout: str, stderr: str

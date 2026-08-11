@@ -220,12 +220,20 @@ either dependency changes.
 ```bash
 export OCR_ENGINE=surya2_llamacpp
 export SURYA_INFERENCE_BACKEND=llamacpp
-export SURYA_INFERENCE_PARALLEL=1
+export SURYA_INFERENCE_PARALLEL=5
+export SURYA_INFERENCE_CTX_PER_SLOT=16384
 export SURYA2_STRATEGY=full_page
 export SURYA2_DPI=192
+export MARKER_CONVERSION_MODE=balanced
 ```
 
-Continue to route `digital_good_text` through Marker's text-layer extraction.
+A follow-up test on 2026-08-10 used the same 11-page source PDF with five
+parallel slots and 16,384 context tokens per slot. Direct-Surya extraction fell
+from 663.664 seconds to 371.875 seconds (44% less time), with a 5.22 GiB peak
+RSS. All 179 blocks retained identical text, labels, reading order, and
+skip/error state; eight boxes differed by at most 2.117 rendered-image pixels.
+
+Continue to route `digital_good_text` through Marker 2 balanced extraction.
 Use direct Surya 2 full-page OCR for scans and poor/hidden OCR. Keep
 `surya_qwen_mlx` selectable for text-critical comparison or fallback, and
 keep `marker_surya` only for regression and documents where its postprocessing
@@ -271,8 +279,7 @@ Success: no issues found in 7 source files
 
 bash -n scripts/run_dev.sh scripts/setup_local_runtime.sh scripts/setup_surya2_runtime.sh
 .venv-surya2/bin/python -m pip check
-.venv-marker/bin/python -m pip check
-No broken requirements found in either isolated environment
+No broken requirements found in the shared Marker 2 + Surya 2 environment
 ```
 
 A standalone manager/server lifecycle reported worker exit code 0. Process

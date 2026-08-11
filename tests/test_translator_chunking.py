@@ -849,35 +849,25 @@ def test_table_abbreviations_may_use_equally_compact_target_language_forms() -> 
     )
 
 
-def test_parenthesized_document_acronym_is_preserved_in_table() -> None:
+def test_parenthesized_document_acronym_may_use_target_language_form_in_table() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = (
         "<table><tr><th>Tratamiento para Hombre-a-Mujer (TMF)</th></tr>"
         "<tr><td>ACV</td></tr></table>"
     )
 
-    assert (
-        translator._table_translation_issue(
-            source,
-            (
-                "<table><tr><th>Treatment for Male-to-Female (MTF)</th></tr>"
-                "<tr><td>CVA</td></tr></table>"
-            ),
-            "es",
+    for target_acronym in ("MTF", "TMF"):
+        assert (
+            translator._table_translation_issue(
+                source,
+                (
+                    f"<table><tr><th>Treatment for Male-to-Female ({target_acronym})</th></tr>"
+                    "<tr><td>CVA</td></tr></table>"
+                ),
+                "es",
+            )
+            is None
         )
-        == "translation_source_acronym_missing"
-    )
-    assert (
-        translator._table_translation_issue(
-            source,
-            (
-                "<table><tr><th>Treatment for Male-to-Female (TMF)</th></tr>"
-                "<tr><td>CVA</td></tr></table>"
-            ),
-            "es",
-        )
-        is None
-    )
 
 
 def test_known_short_english_target_is_not_rejected_by_language_detector() -> None:
@@ -957,46 +947,14 @@ def test_translation_validation_ignores_new_uppercase_words_and_statistical_labe
     )
 
 
-def test_parenthesized_document_acronym_is_preserved() -> None:
+def test_parenthesized_document_acronym_may_use_target_language_form() -> None:
     translator = MlxTranslator(TranslationSettings())
 
-    assert (
-        translator._chunk_translation_issue(
-            "Terapia hormonal (TMF) continuada.",
-            "Continued hormonal therapy (MTF).",
-            "es",
-            BlockType.PARAGRAPH,
-        )
-        == "translation_source_acronym_missing"
-    )
-    assert (
-        translator._chunk_translation_issue(
-            "Terapia hormonal (TMF) continuada.",
-            "Continued hormonal therapy (TMF).",
-            "es",
-            BlockType.PARAGRAPH,
-        )
-        is None
-    )
-
-
-def test_document_acronyms_allow_natural_english_inflection() -> None:
-    translator = MlxTranslator(TranslationSettings())
-    translator._document_defined_acronyms = {"DG", "HT", "MT"}
-    source = (
-        "Los HT tienen mayor visibilidad que las MT. "
-        "La experiencia de la DG depende del contexto."
-    )
-
-    for translated in (
-        "HTs have greater visibility than MTs. The experience of DG depends on context.",
-        "An HT's visibility may differ from that of MTs. DG depends on context.",
-        "HTs' visibility may differ from that of MTs. DG depends on context.",
-    ):
+    for target_acronym in ("MTF", "TMF"):
         assert (
             translator._chunk_translation_issue(
-                source,
-                translated,
+                "Terapia hormonal (TMF) continuada.",
+                f"Continued hormonal therapy ({target_acronym}).",
                 "es",
                 BlockType.PARAGRAPH,
             )
@@ -1004,25 +962,43 @@ def test_document_acronyms_allow_natural_english_inflection() -> None:
         )
 
 
-def test_document_acronym_prefix_inside_an_unrelated_word_is_not_accepted() -> None:
+def test_language_specific_acronyms_do_not_gate_valid_english_translation() -> None:
     translator = MlxTranslator(TranslationSettings())
-    translator._document_defined_acronyms = {"HT"}
 
-    assert (
-        translator._chunk_translation_issue(
-            "Los HT tienen mayor visibilidad.",
-            "HTsomething has greater visibility.",
-            "es",
+    cases = (
+        (
+            "La condition est classée selon la CIM-11.",
+            "The condition is classified according to ICD-11.",
             BlockType.PARAGRAPH,
-        )
-        == "translation_source_acronym_missing"
+        ),
+        (
+            "La dysphorie de genre (DG) dépend du contexte.",
+            "Gender dysphoria (GD) depends on context.",
+            BlockType.PARAGRAPH,
+        ),
+        (
+            "[5] Organisation Mondiale de la Santé (OMS). Classification CIM-11.",
+            "[5] World Health Organization (WHO). ICD-11 classification.",
+            BlockType.LIST,
+        ),
     )
+    for source, translated, block_type in cases:
+        assert (
+            translator._chunk_translation_issue(
+                source,
+                translated,
+                "fr",
+                block_type,
+                source_language_authoritative=True,
+            )
+            is None
+        )
 
 
-def test_sentence_acronym_loss_triggers_base_preservation_retry() -> None:
+def test_acronym_change_or_omission_does_not_trigger_a_retry() -> None:
     translator = MlxTranslator(TranslationSettings())
-    translator._document_defined_acronyms = {"TMF"}
-    contexts: list[str] = []
+    calls: list[str] = []
+    model_output = "Two postoperative cases continued treatment."
 
     def fake_translate(
         text: str,
@@ -1031,84 +1007,44 @@ def test_sentence_acronym_loss_triggers_base_preservation_retry() -> None:
         force_max_tokens: int | None = None,
     ) -> str:
         _ = (text, source_language, force_max_tokens)
-        contexts.append(context)
-        if "Required source acronyms" in context:
-            return (
-                "Two cases of TMF after surgery continued cyproterone acetate to reduce body hair."
-            )
-        return "Two cases of postoperative hirsutism continued cyproterone acetate."
+        calls.append(context)
+        return model_output
 
     translator._translate_chunk = fake_translate  # type: ignore[method-assign]
 
     translated = translator._translate_chunk_with_validation(
-        "Dos casos de TMF post-cirugía continuaron con acetato de ciproterona.",
+        "Dos casos de TMF postoperatorios continuaron el tratamiento.",
         "",
         "es",
         BlockType.PARAGRAPH,
         source_language_authoritative=True,
     )
 
-    assert "TMF" in translated
-    assert len(contexts) == 2
-    assert "Required source acronyms whose uppercase base letters must remain unchanged" in contexts[-1]
-    assert "plural or possessive suffixes are allowed" in contexts[-1]
+    assert translated == model_output
+    assert len(calls) == 1
 
 
-def test_invented_target_acronym_triggers_direct_translation_retry() -> None:
+def test_new_target_acronym_is_not_a_validation_gate() -> None:
     translator = MlxTranslator(TranslationSettings())
     source = (
         "No se ha excluido a ningún paciente salvo uno que permanece en actitud "
         "expectante por dependencia del alcohol."
     )
-    contexts: list[str] = []
-
-    def fake_translate(
-        text: str,
-        context: str = "",
-        source_language: str | None = None,
-        force_max_tokens: int | None = None,
-    ) -> str:
-        _ = (text, source_language, force_max_tokens)
-        contexts.append(context)
-        if "Remove these invented target acronyms" in context:
-            return (
-                "No patient was excluded except one who remains under observation "
-                "because of alcohol dependence."
-            )
-        return (
-            "No patient with Female-to-Male Transsexualism (TFM) was excluded except "
-            "one under observation because of alcohol dependence."
-        )
-
-    translator._translate_chunk = fake_translate  # type: ignore[method-assign]
+    translated = (
+        "No patient with Female-to-Male Transsexualism (TFM) was excluded except "
+        "one under observation because of alcohol dependence."
+    )
 
     assert (
         translator._chunk_translation_issue(
             source,
-            fake_translate(source),
+            translated,
             "es",
             BlockType.PARAGRAPH,
             source_language_authoritative=True,
         )
-        == "translation_target_acronym_invented"
+        is None
     )
-    contexts.clear()
-
-    translated = translator._translate_chunk_with_validation(
-        source,
-        "",
-        "es",
-        BlockType.PARAGRAPH,
-        source_language_authoritative=True,
-    )
-
-    assert translated == (
-        "No patient was excluded except one who remains under observation "
-        "because of alcohol dependence."
-    )
-    assert len(contexts) == 2
-    assert "Remove these invented target acronyms" in contexts[-1]
-    assert "TFM" in contexts[-1]
 
 
 def test_spanish_structural_caption_translates_body_separately() -> None:
@@ -2849,16 +2785,16 @@ def test_translation_prompt_includes_context_and_source_language() -> None:
     assert "TEXT:\nTexto que traducir." in prompt
 
 
-def test_translation_prompt_preserves_source_acronyms_without_expanding_them() -> None:
+def test_translation_prompt_allows_standard_english_acronyms() -> None:
     prompt = MlxTranslator(TranslationSettings())._build_prompt(
-        "Dos casos de TMF continuaron el tratamiento.",
+        "La condition est classée selon la CIM-11.",
         "",
-        "es",
+        "fr",
     )
 
-    assert "Preserve the uppercase base letters of source acronyms" in prompt
-    assert "plural or possessive suffixes are allowed" in prompt
-    assert "never expand or reinterpret the base acronym" in prompt
+    assert "Translate language-specific acronyms" in prompt
+    assert "standard English equivalents" in prompt
+    assert "Preserve the uppercase base letters" not in prompt
 
 
 def test_compact_table_prompt_does_not_abbreviate_spelled_out_source_terms() -> None:

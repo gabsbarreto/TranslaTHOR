@@ -155,6 +155,7 @@ class Surya2LlamaCppExtractor:
             "surya2_render_dir": str(render_dir),
             "surya2_error_block_count": error_count,
             "surya2_skipped_block_count": skipped_count,
+            "surya2_batching": raw_payload.get("batching", {}),
             "surya2_worker_timing": raw_payload.get("timing", {}),
             "surya2_render_seconds": round(render_seconds, 6),
             "llama_cpp_version": self._llama_cpp_version(),

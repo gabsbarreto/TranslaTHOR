@@ -51,7 +51,7 @@ def test_surya2_is_default_and_qwen_remains_selectable_for_scans() -> None:
     assert 'value="surya_qwen_mlx"' in selector
     assert "text-critical fallback" in selector
     assert 'form.append("ocr_engine", ocrEngineInput?.value || "surya2_llamacpp")' in submit
-    assert "Good born-digital PDFs continue through Marker text-layer extraction." in INDEX_HTML
+    assert "Good born-digital PDFs continue through Marker 2 balanced extraction." in INDEX_HTML
 
 
 def test_page_uses_current_waiting_and_recent_result_sections() -> None:

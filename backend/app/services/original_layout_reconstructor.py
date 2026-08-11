@@ -737,6 +737,17 @@ class OriginalLayoutReconstructor:
                     bbox=self._block_pdf_bbox(page, block),
                 )
                 continue
+            if block.block_type == BlockType.TABLE and block.metadata.get(
+                "marker_table_incomplete"
+            ):
+                self._retain_block(
+                    report,
+                    page_report,
+                    block,
+                    reason="marker_table_source_completeness_failed",
+                    bbox=self._block_pdf_bbox(page, block),
+                )
+                continue
             recovered_text = recovered_translations.get(block.id)
             if recovered_text is None and not block.text.strip():
                 if block.metadata.get("merged_into_block_id"):

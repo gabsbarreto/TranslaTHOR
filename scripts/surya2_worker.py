@@ -25,10 +25,21 @@ class Surya2Worker:
         from surya.inference import SuryaInferenceManager  # type: ignore[import-untyped]
         from surya.layout import LayoutPredictor  # type: ignore[import-untyped]
         from surya.recognition import RecognitionPredictor  # type: ignore[import-untyped]
+        from surya.settings import settings  # type: ignore[import-untyped]
 
         self.manager = SuryaInferenceManager(method="llamacpp")
         self.layout_predictor = LayoutPredictor(self.manager)
         self.recognition_predictor = RecognitionPredictor(self.manager)
+        parallel_pages = self.manager.capacity()
+        context_per_slot = int(settings.SURYA_INFERENCE_CTX_PER_SLOT)
+        total_context = settings.SURYA_INFERENCE_CTX_SIZE
+        if total_context is None:
+            total_context = max(16384, parallel_pages * context_per_slot)
+        self.batching = {
+            "parallel_pages": parallel_pages,
+            "context_per_slot": context_per_slot,
+            "total_context": int(total_context),
+        }
 
     def run_request(self, request: dict[str, Any]) -> None:
         request_id = str(request["request_id"])
@@ -49,6 +60,10 @@ class Surya2Worker:
                 "request_id": request_id,
                 "strategy": strategy,
                 "pages": len(image_paths),
+                "effective_parallel_pages": min(
+                    len(image_paths),
+                    int(self.batching["parallel_pages"]),
+                ),
             }
         )
         images: list[Image.Image] = []
@@ -124,6 +139,14 @@ class Surya2Worker:
                 "surya_version": importlib.metadata.version("surya-ocr"),
                 "strategy": strategy,
                 "page_count": len(pages),
+                "batching": {
+                    **self.batching,
+                    "requested_pages": len(pages),
+                    "effective_parallel_pages": min(
+                        len(pages),
+                        int(self.batching["parallel_pages"]),
+                    ),
+                },
                 "timing": {
                     "image_load_seconds": round(loaded_at - started, 6),
                     "layout_seconds": round(layout_seconds, 6),
@@ -163,6 +186,7 @@ def serve() -> int:
             "pid": os.getpid(),
             "backend": "llamacpp",
             "surya_version": importlib.metadata.version("surya-ocr"),
+            "batching": worker.batching,
         }
     )
     try:

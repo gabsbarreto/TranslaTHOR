@@ -6,6 +6,7 @@ import json
 import os
 import platform
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -46,6 +47,8 @@ from app.config import (  # noqa: E402
     DEFAULT_QWEN_OCR_TEMPERATURE,
     DEFAULT_QWEN_OCR_TOP_K,
     DEFAULT_QWEN_OCR_TOP_P,
+    DEFAULT_SURYA2_CONTEXT_PER_SLOT,
+    DEFAULT_SURYA2_PARALLEL_PAGES,
     DEFAULT_TRANSLATION_MODEL,
 )
 from app.models.schema import DocumentModel  # noqa: E402
@@ -70,6 +73,7 @@ from pypdf import PdfReader, PdfWriter  # noqa: E402
 
 
 SUPPORTED_ENGINES = (
+    "marker_balanced",
     "marker_surya",
     "surya_qwen_mlx",
     "surya2_full_page",
@@ -308,11 +312,11 @@ class BenchmarkEngine:
         sampler: ProcessTreeMemorySampler,
     ) -> PDFExtractionResult:
         job_dir.mkdir(parents=True, exist_ok=True)
-        if self.engine == "marker_surya":
+        if self.engine in {"marker_balanced", "marker_surya"}:
             return PDFExtractor().extract(
                 pdf_path=pdf_path,
-                mode="scanned",
-                keep_debug_artifacts=True,
+                mode="digital" if self.engine == "marker_balanced" else "scanned",
+                keep_debug_artifacts=self.engine != "marker_balanced",
                 job_dir=job_dir,
                 timeout=self.timeout,
                 marker_config={
@@ -598,9 +602,8 @@ def environment_report() -> dict[str, Any]:
         "python": platform.python_version(),
         "memory_bytes": psutil.virtual_memory().total if psutil is not None else None,
         "versions": {
-            "surya_legacy": package_version(ROOT / ".venv-marker/bin/python", "surya-ocr"),
-            "marker": package_version(ROOT / ".venv-marker/bin/python", "marker-pdf"),
             "surya2": package_version(ROOT / ".venv-surya2/bin/python", "surya-ocr"),
+            "marker": package_version(ROOT / ".venv-surya2/bin/python", "marker-pdf"),
             "mlx_vlm": current_package_version("mlx-vlm"),
             "qwen_model": DEFAULT_QWEN_OCR_MODEL,
             "llama_cpp": command_version(["llama-server", "--version"]),
@@ -809,6 +812,57 @@ def _fmt(value: float | None) -> str:
     return "" if value is None else f"{value:.4f}"
 
 
+def write_benchmark_outputs(
+    *,
+    output_dir: Path,
+    environment: dict[str, Any],
+    manifest: dict[str, Any],
+    results: list[RunMetrics],
+    command: str,
+) -> None:
+    """Atomically checkpoint all completed runs.
+
+    OCR benchmarks can run for many minutes. Persisting after every run keeps a
+    completed engine's measurements available if the terminal or stdout consumer
+    disconnects before the remaining engines finish.
+    """
+    medians = median_rows(results)
+    payload = {
+        "schema_version": 1,
+        "environment": environment,
+        "manifest": manifest,
+        "results": [asdict(result) for result in results],
+        "warm_medians": medians,
+    }
+    output_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_text(
+        output_dir / "benchmark_results.json",
+        json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+    _atomic_write_text(
+        output_dir / "benchmark_report.md",
+        render_report(environment, results, medians, manifest, command),
+    )
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    temporary = path.with_suffix(f"{path.suffix}.tmp")
+    temporary.write_text(content, encoding="utf-8")
+    temporary.replace(path)
+
+
+def configure_surya_batching(*, parallel: int, context_per_slot: int) -> int:
+    if parallel < 1:
+        raise ValueError("--surya-parallel must be at least 1.")
+    if context_per_slot < 1:
+        raise ValueError("--surya-context-per-slot must be at least 1.")
+    total_context = max(16384, parallel * context_per_slot)
+    os.environ["SURYA_INFERENCE_PARALLEL"] = str(parallel)
+    os.environ["SURYA_INFERENCE_CTX_PER_SLOT"] = str(context_per_slot)
+    os.environ["SURYA_INFERENCE_CTX_SIZE"] = str(total_context)
+    return total_context
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Benchmark TranslaTHOR OCR engines on identical PDF pages."
@@ -822,6 +876,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dpi", type=int, default=192)
     parser.add_argument("--warm-runs", type=int, default=3)
+    parser.add_argument(
+        "--surya-parallel",
+        type=int,
+        default=DEFAULT_SURYA2_PARALLEL_PAGES,
+        help="Maximum number of Surya page requests processed concurrently.",
+    )
+    parser.add_argument(
+        "--surya-context-per-slot",
+        type=int,
+        default=DEFAULT_SURYA2_CONTEXT_PER_SLOT,
+        help="llama-server context tokens reserved for each concurrent Surya page.",
+    )
+    parser.add_argument(
+        "--cold-only",
+        action="store_true",
+        help="Run one fresh-process extraction per engine without warm repetitions.",
+    )
     parser.add_argument("--timeout", type=int, default=3600)
     parser.add_argument("--translate-final", action="store_true")
     return parser.parse_args()
@@ -829,7 +900,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if args.warm_runs < 3:
+    if args.warm_runs < 3 and not args.cold_only:
         raise ValueError("--warm-runs must be at least 3.")
     engines = [item.strip() for item in args.engines.split(",") if item.strip()]
     unknown = [engine for engine in engines if engine not in SUPPORTED_ENGINES]
@@ -837,7 +908,10 @@ def main() -> int:
         raise ValueError(f"Unsupported engine(s): {', '.join(unknown)}")
 
     os.environ["SURYA_INFERENCE_BACKEND"] = "llamacpp"
-    os.environ["SURYA_INFERENCE_PARALLEL"] = "1"
+    total_surya_context = configure_surya_batching(
+        parallel=args.surya_parallel,
+        context_per_slot=args.surya_context_per_slot,
+    )
     manifest_path = args.manifest.resolve()
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     output_dir = args.output_dir.resolve()
@@ -846,11 +920,15 @@ def main() -> int:
     environment["configuration"].update(
         {
             "dpi": args.dpi,
-            "warm_runs": args.warm_runs,
+            "warm_runs": 0 if args.cold_only else args.warm_runs,
             "engines": engines,
             "translate_final": args.translate_final,
+            "surya_parallel": args.surya_parallel,
+            "surya_context_per_slot": args.surya_context_per_slot,
+            "surya_total_context": total_surya_context,
         }
     )
+    command = " ".join(sys.argv)
 
     results: list[RunMetrics] = []
     detector = PDFTypeDetector()
@@ -861,7 +939,12 @@ def main() -> int:
         if not selected_pages:
             selected_pages = list(range(1, len(PdfReader(str(source_pdf)).pages) + 1))
         benchmark_pdf = output_dir / "inputs" / f"{document_id}.pdf"
-        subset_pdf(source_pdf, selected_pages, benchmark_pdf)
+        full_page_range = list(range(1, len(PdfReader(str(source_pdf)).pages) + 1))
+        if selected_pages == full_page_range:
+            benchmark_pdf.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_pdf, benchmark_pdf)
+        else:
+            subset_pdf(source_pdf, selected_pages, benchmark_pdf)
         detection = detector.detect(benchmark_pdf)
         reference = resolve_reference_text(
             document_spec,
@@ -876,7 +959,8 @@ def main() -> int:
         for engine_name in engines:
             engine = BenchmarkEngine(engine_name, args.dpi, args.timeout)
             try:
-                for run_index in range(args.warm_runs + 1):
+                run_count = 1 if args.cold_only else args.warm_runs + 1
+                for run_index in range(run_count):
                     run_type = "cold" if run_index == 0 else "warm"
                     run_dir = (
                         output_dir / "runs" / document_id / engine_name / f"{run_type}-{run_index}"
@@ -936,26 +1020,23 @@ def main() -> int:
                             error=exc,
                         )
                     results.append(metrics)
+                    write_benchmark_outputs(
+                        output_dir=output_dir,
+                        environment=environment,
+                        manifest=manifest,
+                        results=results,
+                        command=command,
+                    )
                     print(json.dumps(asdict(metrics), ensure_ascii=False), flush=True)
             finally:
                 engine.close()
 
-    medians = median_rows(results)
-    payload = {
-        "schema_version": 1,
-        "environment": environment,
-        "manifest": manifest,
-        "results": [asdict(result) for result in results],
-        "warm_medians": medians,
-    }
-    (output_dir / "benchmark_results.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    command = " ".join(sys.argv)
-    (output_dir / "benchmark_report.md").write_text(
-        render_report(environment, results, medians, manifest, command),
-        encoding="utf-8",
+    write_benchmark_outputs(
+        output_dir=output_dir,
+        environment=environment,
+        manifest=manifest,
+        results=results,
+        command=command,
     )
     return 0 if all(result.success for result in results) else 2
 

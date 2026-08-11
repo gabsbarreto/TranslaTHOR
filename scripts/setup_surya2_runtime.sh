@@ -20,7 +20,7 @@ python3 -m venv .venv-surya2
 
 export SURYA_INFERENCE_BACKEND=llamacpp
 .venv-surya2/bin/python -c \
-  'import importlib.metadata; print("surya-ocr", importlib.metadata.version("surya-ocr"))'
+  'import importlib.metadata; print("surya-ocr", importlib.metadata.version("surya-ocr")); print("marker-pdf", importlib.metadata.version("marker-pdf"))'
 llama-server --version
 
-echo "Surya 2 llama.cpp runtime is ready."
+echo "Surya 2 llama.cpp and Marker 2 runtime is ready."

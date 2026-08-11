@@ -1,6 +1,6 @@
 # Main application runtime dependencies.
-# Marker is installed separately in .venv-marker because it currently needs
-# a different Transformers stack from the MLX translation runtime.
+# Marker and Surya are installed together in .venv-surya2 because they need a
+# different Transformers stack from the MLX translation runtime.
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9

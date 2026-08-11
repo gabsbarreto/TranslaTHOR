@@ -236,8 +236,12 @@ class QwenFullPageOCRFallback:
                 "force_ocr": False,
                 "strip_existing_ocr": False,
                 "qwen_ocr_model": str(settings.get("qwen_ocr_model", DEFAULT_QWEN_OCR_MODEL)),
-                "qwen_ocr_max_tokens": int(settings.get("qwen_ocr_max_tokens", DEFAULT_QWEN_OCR_MAX_TOKENS)),
-                "qwen_ocr_temperature": float(settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE)),
+                "qwen_ocr_max_tokens": int(
+                    settings.get("qwen_ocr_max_tokens", DEFAULT_QWEN_OCR_MAX_TOKENS)
+                ),
+                "qwen_ocr_temperature": float(
+                    settings.get("qwen_ocr_temperature", DEFAULT_QWEN_OCR_TEMPERATURE)
+                ),
                 "qwen_ocr_top_p": float(settings.get("qwen_ocr_top_p", DEFAULT_QWEN_OCR_TOP_P)),
                 "qwen_ocr_top_k": int(settings.get("qwen_ocr_top_k", DEFAULT_QWEN_OCR_TOP_K)),
                 "qwen_ocr_min_p": float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P)),
@@ -250,15 +254,33 @@ class QwenFullPageOCRFallback:
                 "qwen_ocr_prompt": ocr_prompt,
                 "qwen_ocr_base_prompt": base_prompt,
                 "qwen_ocr_dpi": dpi,
-                "qwen_ocr_batch_size": int(settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)),
-                "qwen_ocr_crop_mode": bool(settings.get("qwen_ocr_crop_mode", DEFAULT_QWEN_OCR_CROP_MODE)),
-                "qwen_ocr_min_crops": int(settings.get("qwen_ocr_min_crops", DEFAULT_QWEN_OCR_MIN_CROPS)),
-                "qwen_ocr_max_crops": int(settings.get("qwen_ocr_max_crops", DEFAULT_QWEN_OCR_MAX_CROPS)),
-                "qwen_ocr_base_size": int(settings.get("qwen_ocr_base_size", DEFAULT_QWEN_OCR_BASE_SIZE)),
-                "qwen_ocr_image_size": int(settings.get("qwen_ocr_image_size", DEFAULT_QWEN_OCR_IMAGE_SIZE)),
-                "qwen_ocr_skip_repeat": bool(settings.get("qwen_ocr_skip_repeat", DEFAULT_QWEN_OCR_SKIP_REPEAT)),
-                "qwen_ocr_ngram_size": int(settings.get("qwen_ocr_ngram_size", DEFAULT_QWEN_OCR_NGRAM_SIZE)),
-                "qwen_ocr_ngram_window": int(settings.get("qwen_ocr_ngram_window", DEFAULT_QWEN_OCR_NGRAM_WINDOW)),
+                "qwen_ocr_batch_size": int(
+                    settings.get("qwen_ocr_batch_size", DEFAULT_QWEN_OCR_BATCH_SIZE)
+                ),
+                "qwen_ocr_crop_mode": bool(
+                    settings.get("qwen_ocr_crop_mode", DEFAULT_QWEN_OCR_CROP_MODE)
+                ),
+                "qwen_ocr_min_crops": int(
+                    settings.get("qwen_ocr_min_crops", DEFAULT_QWEN_OCR_MIN_CROPS)
+                ),
+                "qwen_ocr_max_crops": int(
+                    settings.get("qwen_ocr_max_crops", DEFAULT_QWEN_OCR_MAX_CROPS)
+                ),
+                "qwen_ocr_base_size": int(
+                    settings.get("qwen_ocr_base_size", DEFAULT_QWEN_OCR_BASE_SIZE)
+                ),
+                "qwen_ocr_image_size": int(
+                    settings.get("qwen_ocr_image_size", DEFAULT_QWEN_OCR_IMAGE_SIZE)
+                ),
+                "qwen_ocr_skip_repeat": bool(
+                    settings.get("qwen_ocr_skip_repeat", DEFAULT_QWEN_OCR_SKIP_REPEAT)
+                ),
+                "qwen_ocr_ngram_size": int(
+                    settings.get("qwen_ocr_ngram_size", DEFAULT_QWEN_OCR_NGRAM_SIZE)
+                ),
+                "qwen_ocr_ngram_window": int(
+                    settings.get("qwen_ocr_ngram_window", DEFAULT_QWEN_OCR_NGRAM_WINDOW)
+                ),
                 "qwen_ocr_image_mode": (
                     "surya_boxed_page_png" if use_surya_layout else "rendered_page_png"
                 ),
@@ -278,7 +300,9 @@ class QwenFullPageOCRFallback:
                 "surya_layout_overlap_count": int(surya_layout_manifest.get("overlap_count", 0)),
                 "ocr_logical_chunks_used": use_surya_layout,
                 "ocr_logical_chunks_path": str(logical_chunks_path) if use_surya_layout else "",
-                "ocr_logical_chunk_count": len(document.translation_chunks) if use_surya_layout else 0,
+                "ocr_logical_chunk_count": len(document.translation_chunks)
+                if use_surya_layout
+                else 0,
                 "ocr_excluded_region_count": len(excluded_regions),
                 "marker_first_pass": marker_metadata,
                 "detection": marker_metadata.get("detection", {}),
@@ -307,7 +331,9 @@ class QwenFullPageOCRFallback:
         on_process_finished: Callable[[subprocess.Popen], None] | None,
         on_ocr_progress: Callable[[dict], None] | None,
     ) -> None:
-        worker = Path(os.getenv("QWEN_OCR_WORKER", str(BASE_DIR / "scripts" / "qwen_ocr_worker.py")))
+        worker = Path(
+            os.getenv("QWEN_OCR_WORKER", str(BASE_DIR / "scripts" / "qwen_ocr_worker.py"))
+        )
         cmd = [
             self._resolve_worker_python_executable(),
             str(worker),
@@ -328,13 +354,21 @@ class QwenFullPageOCRFallback:
             "--min-p",
             str(float(settings.get("qwen_ocr_min_p", DEFAULT_QWEN_OCR_MIN_P))),
             "--presence-penalty",
-            str(float(settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY))),
+            str(
+                float(settings.get("qwen_ocr_presence_penalty", DEFAULT_QWEN_OCR_PRESENCE_PENALTY))
+            ),
             "--repetition-penalty",
-            str(float(settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY))),
+            str(
+                float(
+                    settings.get("qwen_ocr_repetition_penalty", DEFAULT_QWEN_OCR_REPETITION_PENALTY)
+                )
+            ),
             "--prompt",
             prompt,
             "--crop-mode",
-            "true" if bool(settings.get("qwen_ocr_crop_mode", DEFAULT_QWEN_OCR_CROP_MODE)) else "false",
+            "true"
+            if bool(settings.get("qwen_ocr_crop_mode", DEFAULT_QWEN_OCR_CROP_MODE))
+            else "false",
             "--min-crops",
             str(int(settings.get("qwen_ocr_min_crops", DEFAULT_QWEN_OCR_MIN_CROPS))),
             "--max-crops",
@@ -344,7 +378,9 @@ class QwenFullPageOCRFallback:
             "--image-size",
             str(int(settings.get("qwen_ocr_image_size", DEFAULT_QWEN_OCR_IMAGE_SIZE))),
             "--skip-repeat",
-            "true" if bool(settings.get("qwen_ocr_skip_repeat", DEFAULT_QWEN_OCR_SKIP_REPEAT)) else "false",
+            "true"
+            if bool(settings.get("qwen_ocr_skip_repeat", DEFAULT_QWEN_OCR_SKIP_REPEAT))
+            else "false",
             "--ngram-size",
             str(int(settings.get("qwen_ocr_ngram_size", DEFAULT_QWEN_OCR_NGRAM_SIZE))),
             "--ngram-window",
@@ -367,7 +403,9 @@ class QwenFullPageOCRFallback:
                 start_new_session=True,
             )
         except FileNotFoundError as exc:
-            raise RuntimeError("Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON.") from exc
+            raise RuntimeError(
+                "Qwen OCR requires a Python environment with mlx-vlm. Set QWEN_OCR_PYTHON."
+            ) from exc
 
         if on_process_started is not None:
             on_process_started(process)
@@ -443,7 +481,9 @@ class QwenFullPageOCRFallback:
                 failures.append(f"{attempt['name']}: {self._short_runtime_error(exc)}")
                 if not self._looks_like_surya_accelerator_failure(exc):
                     break
-                logger.warning("Surya layout attempt %s failed; retrying if possible: %s", attempt["name"], exc)
+                logger.warning(
+                    "Surya layout attempt %s failed; retrying if possible: %s", attempt["name"], exc
+                )
                 continue
 
             manifest["surya_layout_attempt"] = attempt["name"]
@@ -453,11 +493,15 @@ class QwenFullPageOCRFallback:
             manifest_path = output_dir / "layout.json"
             if attempt["output_dir"] != output_dir:
                 output_dir.mkdir(parents=True, exist_ok=True)
-                manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
             return manifest
 
         detail = "; ".join(failures) if failures else "no Surya layout attempts were run"
-        raise RuntimeError(f"Surya layout detection failed after accelerator-safe retries: {detail}")
+        raise RuntimeError(
+            f"Surya layout detection failed after accelerator-safe retries: {detail}"
+        )
 
     def _run_surya_layout_once(
         self,
@@ -664,9 +708,9 @@ class QwenFullPageOCRFallback:
             if path.exists():
                 return str(path)
             logger.warning("Ignoring SURYA_LAYOUT_PYTHON because it does not exist: %s", configured)
-        isolated_marker_python = BASE_DIR / ".venv-marker" / "bin" / "python"
-        if isolated_marker_python.exists():
-            return str(isolated_marker_python)
+        surya2_python = BASE_DIR / ".venv-surya2" / "bin" / "python"
+        if surya2_python.exists():
+            return str(surya2_python)
         return sys.executable
 
     def _worker_line_handler(

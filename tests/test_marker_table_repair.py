@@ -18,6 +18,7 @@ from app.models.schema import (
 from app.services.markdown_builder import MarkdownBuilder
 from app.services.pdf_extraction.table_repair import MarkerTableRepairService
 from app.services.original_layout_reconstructor import OriginalLayoutReconstructor
+from app.services.table_markup import parse_table_rows
 from app.services.translator_mlx import MlxTranslator, TranslationSettings
 
 
@@ -141,11 +142,108 @@ def test_repaired_table_is_reconstructed_once_in_authoritative_box(tmp_path: Pat
     )
 
 
+def test_missing_source_numbers_are_filled_from_ocr_without_moving_existing_value(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "omitted-values.pdf"
+    source_rows = [
+        ["Measure", "Value"],
+        ["Count", "30"],
+        ["Rate", "20"],
+        ["Åge", "20.62"],
+        ["Mean", ""],
+    ]
+    _write_ruled_table_pdf(pdf_path, source_rows)
+    primary = _table_document(
+        [
+            ["Measure", "Value"],
+            ["Count", ""],
+            ["Rate", ""],
+            ["Åge", "20.62"],
+            ["Mean", ""],
+        ]
+    )
+    retry = _table_document(
+        [
+            ["Measure", "Value"],
+            ["Count", "30"],
+            ["Rate", "20"],
+            ["Âge", ""],
+            ["Mean", "20.62"],
+        ],
+        source_type=SourceType.OCR,
+    )
+    service = MarkerTableRepairService()
+
+    initial = service.repair(pdf_path, primary)
+    merge = service.merge_incomplete_from_ocr_retry(
+        primary,
+        retry,
+        initial.incomplete_block_ids,
+    )
+    final = service.repair(pdf_path, primary)
+
+    assert initial.source_incomplete_count == 1
+    assert initial.incomplete_block_ids == ["/page/0/Table/1"]
+    assert initial.validations[0]["missing_numeric_tokens"] == ["20", "30"]
+    assert merge.merged_count == 1
+    assert merge.merges[0]["filled_cells"] == 2
+    assert final.source_incomplete_count == 0
+    rows = [[cell.text for cell in row] for row in parse_table_rows(primary.blocks[0].text)]
+    assert rows == [
+        ["Measure", "Value"],
+        ["Count", "30"],
+        ["Rate", "20"],
+        ["Âge", "20.62"],
+        ["Mean", ""],
+    ]
+    assert primary.tables[0].parse_mode == "marker_balanced_ocr_retry_merged"
+    assert primary.blocks[0].metadata.get("marker_table_incomplete") is None
+
+
+def test_incomplete_marker_table_is_retained_even_in_authoritative_layout_mode(
+    tmp_path: Path,
+) -> None:
+    pdf_path = tmp_path / "incomplete-table.pdf"
+    output_path = tmp_path / "translated.pdf"
+    source_rows = [
+        ["Measure", "Value"],
+        ["Count", "30"],
+        ["Rate", "20"],
+    ]
+    _write_ruled_table_pdf(pdf_path, source_rows)
+    document = _table_document(source_rows)
+    block = document.blocks[0]
+    block.metadata["source_text"] = block.text
+    block.metadata["translated_from_block_ids"] = [block.id]
+    block.metadata["marker_table_incomplete"] = True
+    block.text = block.text.replace("Measure", "Mesure")
+
+    report = OriginalLayoutReconstructor().reconstruct(
+        source_pdf_path=pdf_path,
+        output_pdf_path=output_path,
+        document=document,
+        report_path=tmp_path / "report.json",
+    )
+
+    assert report["regions_replaced"] == 0
+    retained = next(
+        region
+        for region in report["regions"]
+        if region.get("reason") == "marker_table_source_completeness_failed"
+    )
+    assert retained["status"] == "retained"
+    with fitz.open(output_path) as translated:
+        text = translated[0].get_text("text")
+    assert "Measure" in text
+    assert "Mesure" not in text
+
+
 def _write_ruled_table_pdf(pdf_path: Path, rows: list[list[str]]) -> None:
     document = fitz.open()
     page = document.new_page(width=400, height=300)
     x_positions = [40, 190, 270, 350]
-    y_positions = [70, 100, 130, 160, 190]
+    y_positions = [70 + (30 * index) for index in range(len(rows) + 1)]
     for row_index, row in enumerate(rows):
         for column_index, text in enumerate(row):
             page.draw_rect(
@@ -165,6 +263,70 @@ def _write_ruled_table_pdf(pdf_path: Path, rows: list[list[str]]) -> None:
                 )
     document.save(pdf_path)
     document.close()
+
+
+def _table_document(
+    rows: list[list[str]],
+    *,
+    source_type: SourceType = SourceType.EMBEDDED,
+) -> DocumentModel:
+    html_rows = [
+        "<tr>"
+        + "".join(
+            f"<{('th' if row_index == 0 else 'td')}>{cell}</{('th' if row_index == 0 else 'td')}>"
+            for cell in row
+        )
+        + "</tr>"
+        for row_index, row in enumerate(rows)
+    ]
+    markup = f"<table><tbody>{''.join(html_rows)}</tbody></table>"
+    x_positions = [40, 190, 270, 350]
+    block = Block(
+        id="/page/0/Table/1",
+        page_number=1,
+        block_type=BlockType.TABLE,
+        text=markup,
+        bbox=BoundingBox(
+            x0=40,
+            y0=70,
+            x1=x_positions[len(rows[0])],
+            y1=70 + (30 * len(rows)),
+        ),
+        reading_order_index=0,
+        source_type=source_type,
+        metadata={
+            "parser": "marker",
+            "marker_block_type": "Table",
+            "marker_page_width": 400,
+            "marker_page_height": 300,
+        },
+    )
+    return DocumentModel(
+        metadata=DocumentMetadata(filename="table.pdf", page_count=1),
+        pages=[
+            PageMetadata(
+                page_number=1,
+                width=400,
+                height=300,
+                has_embedded_text=True,
+                embedded_text_quality=1.0,
+                extraction_mode=source_type,
+            )
+        ],
+        blocks=[block],
+        tables=[
+            TableModel(
+                id="table-0",
+                page_numbers=[1],
+                page=1,
+                bbox=block.bbox,
+                headers=list(rows[0]),
+                rows=[list(row) for row in rows[1:]],
+                parse_mode="marker_html",
+                debug={"marker_block_id": block.id, "render_from_block_text": True},
+            )
+        ],
+    )
 
 
 def _collapsed_document(rows: list[list[str]]) -> DocumentModel:

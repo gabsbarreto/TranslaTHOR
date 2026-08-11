@@ -220,9 +220,7 @@ def test_marker_payload_selection_uses_nested_canonical_shape(tmp_path: Path) ->
                 "children": [
                     {
                         "block_type": "Page",
-                        "children": [
-                            {"block_type": "Text", "text": "Canonical content"}
-                        ],
+                        "children": [{"block_type": "Text", "text": "Canonical content"}],
                     }
                 ],
             }
@@ -609,18 +607,24 @@ if "--force_ocr" in sys.argv:
     assert any("Falling back to Marker normal mode" in warning for warning in result.warnings)
 
 
-def test_auto_bad_hidden_ocr_uses_marker_text_only_first_pass(
+def test_auto_bad_hidden_ocr_uses_balanced_marker_force_ocr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     marker_bin = tmp_path / "fake_marker_text_only.py"
     marker_bin.write_text(
         """#!/usr/bin/env python3
 import json
+import os
 import sys
 from pathlib import Path
 out = Path(sys.argv[sys.argv.index("--output_dir") + 1])
 out.mkdir(parents=True, exist_ok=True)
 (out / "args.txt").write_text(json.dumps(sys.argv), encoding="utf-8")
+(out / "env.json").write_text(json.dumps({
+  "backend": os.environ.get("SURYA_INFERENCE_BACKEND"),
+  "guided_layout": os.environ.get("SURYA_GUIDED_LAYOUT"),
+  "keep_alive": os.environ.get("SURYA_INFERENCE_KEEP_ALIVE"),
+}), encoding="utf-8")
 (out / "result.json").write_text(json.dumps([{
   "id": "/page/0/Page/0",
   "block_type": "Page",
@@ -631,6 +635,9 @@ out.mkdir(parents=True, exist_ok=True)
     )
     marker_bin.chmod(0o755)
     monkeypatch.setenv("MARKER_BIN", str(marker_bin))
+    monkeypatch.delenv("SURYA_INFERENCE_BACKEND", raising=False)
+    monkeypatch.delenv("SURYA_GUIDED_LAYOUT", raising=False)
+    monkeypatch.delenv("SURYA_INFERENCE_KEEP_ALIVE", raising=False)
 
     result = PDFExtractor(detector=_FakeDetector("bad_hidden_ocr")).extract(
         tmp_path / "input.pdf",
@@ -640,11 +647,20 @@ out.mkdir(parents=True, exist_ok=True)
     )
 
     args = json.loads((tmp_path / "marker" / "args.txt").read_text(encoding="utf-8"))
-    assert "--disable_ocr" in args
-    assert "--force_ocr" not in args
-    assert result.used_ocr is False
-    assert result.used_force_ocr is False
-    assert result.metadata["marker_mode"] == "text_only"
+    marker_env = json.loads((tmp_path / "marker" / "env.json").read_text(encoding="utf-8"))
+    assert args[args.index("--mode") + 1] == "balanced"
+    assert "--disable_ocr" not in args
+    assert "--force_ocr" in args
+    assert "--strip_existing_ocr" in args
+    assert result.used_ocr is True
+    assert result.used_force_ocr is True
+    assert result.metadata["marker_mode"] == "strip_existing_ocr_force_ocr"
+    assert result.metadata["marker_conversion_mode"] == "balanced"
+    assert marker_env == {
+        "backend": "llamacpp",
+        "guided_layout": "false",
+        "keep_alive": "0",
+    }
 
 
 def test_marker_output_becomes_document_and_chunks(
@@ -703,6 +719,46 @@ def test_marker_payload_selection_prefers_document_over_debug_blocks(
     )
 
     assert PDFExtractor()._find_marker_payload(tmp_path / "marker", "json") == document_path
+
+
+def test_marker_builder_preserves_zero_based_page_id_for_page_range_retry() -> None:
+    detection = PDFTypeDetectionResult(
+        classification="digital_good_text",
+        page_count=8,
+        pages=[_page_stats(page_number) for page_number in range(1, 9)],
+        embedded_text_chars=1000,
+        embedded_text_words=160,
+        meaningful_page_count=8,
+        garbled_page_count=0,
+        image_dominant_page_count=0,
+        scanned_page_count=0,
+        mixed=False,
+    )
+    payload = [
+        {
+            "id": "/page/7/Page/0",
+            "page_id": 7,
+            "block_type": "Page",
+            "children": [
+                {
+                    "id": "/page/7/Text/0",
+                    "block_type": "Text",
+                    "text": "Page-local retry text.",
+                }
+            ],
+        }
+    ]
+
+    document, _markdown, _chunks = MarkerDocumentBuilder().build_document(
+        marker_payload=payload,
+        detection=detection,
+        filename="paper.pdf",
+        source_type=SourceType.OCR,
+        parser_metadata={},
+        warnings=[],
+    )
+
+    assert document.blocks[0].page_number == 8
 
 
 def test_marker_table_cells_are_not_duplicated_as_text_blocks(
@@ -861,7 +917,10 @@ def test_marker_builder_persists_table_cell_geometry_spans_and_order() -> None:
     assert markdown.count("Control") == 1
     table = document.tables[0]
     assert table.headers == ["Group", "Measures"]
-    assert [[cell.text for cell in row] for row in table.cells] == [["A", "B"], ["Control", "10", "12"]]
+    assert [[cell.text for cell in row] for row in table.cells] == [
+        ["A", "B"],
+        ["Control", "10", "12"],
+    ]
     assert [(cell.text, cell.row_index, cell.column_index) for cell in table.header_cells] == [
         ("Group", 0, 0),
         ("Measures", 0, 1),
@@ -869,8 +928,18 @@ def test_marker_builder_persists_table_cell_geometry_spans_and_order() -> None:
     assert table.header_cells[0].rowspan == 2
     assert table.header_cells[1].colspan == 2
     assert table.header_cells[0].bbox is not None
-    assert table.header_cells[0].bbox.model_dump() == {"x0": 10.0, "y0": 10.0, "x1": 100.0, "y1": 70.0}
-    assert table.header_cells[0].polygon == [[10.0, 10.0], [100.0, 10.0], [100.0, 70.0], [10.0, 70.0]]
+    assert table.header_cells[0].bbox.model_dump() == {
+        "x0": 10.0,
+        "y0": 10.0,
+        "x1": 100.0,
+        "y1": 70.0,
+    }
+    assert table.header_cells[0].polygon == [
+        [10.0, 10.0],
+        [100.0, 10.0],
+        [100.0, 70.0],
+        [10.0, 70.0],
+    ]
     assert table.header_cells[0].confidence == pytest.approx(0.93)
     assert table.cells[0][0].column_index == 1  # column zero is occupied by the rowspan
     assert table.cells[0][1].colspan == 1  # Reject unsafe Marker span overrides.
@@ -1271,7 +1340,9 @@ def test_qwen_fallback_retries_surya_layout_accelerator_failure_on_cpu(
     fallback = QwenFullPageOCRFallback()
     monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
     monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
-    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen
+    )
 
     def fake_communicate(process, *_args, **_kwargs):
         if process.returncode:
@@ -1318,7 +1389,9 @@ def test_qwen_fallback_stops_surya_layout_retry_for_non_accelerator_failure(
     fallback = QwenFullPageOCRFallback()
     monkeypatch.setenv("SURYA_LAYOUT_PYTHON", sys.executable)
     monkeypatch.setenv("SURYA_LAYOUT_WORKER", str(tmp_path / "worker.py"))
-    monkeypatch.setattr("app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "app.services.pdf_extraction.qwen_ocr_fallback.subprocess.Popen", fake_popen
+    )
     monkeypatch.setattr(
         fallback,
         "_communicate_with_cancel",

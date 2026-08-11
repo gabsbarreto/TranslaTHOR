@@ -16,11 +16,51 @@ from typing import Any, Callable, cast
 
 from app.config import (
     BASE_DIR,
+    DEFAULT_SURYA2_CONTEXT_PER_SLOT,
+    DEFAULT_SURYA2_PARALLEL_PAGES,
     DEFAULT_SURYA2_PYTHON,
     DEFAULT_SURYA2_REQUEST_TIMEOUT,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def build_surya2_worker_environment() -> dict[str, str]:
+    env = os.environ.copy()
+    env["SURYA_INFERENCE_BACKEND"] = "llamacpp"
+    env["SURYA_INFERENCE_KEEP_ALIVE"] = "0"
+    env.setdefault("SURYA_INFERENCE_PARALLEL", str(DEFAULT_SURYA2_PARALLEL_PAGES))
+    env.setdefault(
+        "SURYA_INFERENCE_CTX_PER_SLOT",
+        str(DEFAULT_SURYA2_CONTEXT_PER_SLOT),
+    )
+    configured_total_context = env.get("SURYA_INFERENCE_CTX_SIZE")
+    try:
+        parallel = int(env["SURYA_INFERENCE_PARALLEL"])
+        context_per_slot = int(env["SURYA_INFERENCE_CTX_PER_SLOT"])
+        total_context = (
+            int(configured_total_context) if configured_total_context is not None else None
+        )
+    except ValueError as exc:
+        raise RuntimeError("Surya batching and context settings must be integers.") from exc
+    if parallel < 1 or context_per_slot < 1 or (total_context is not None and total_context < 1):
+        raise RuntimeError("Surya batching and context settings must be positive.")
+    required_total_context = max(16384, parallel * context_per_slot)
+    if total_context is not None and total_context < required_total_context:
+        logger.warning(
+            "Raising Surya total context from %d to %d so all %d parallel page slots "
+            "retain %d tokens.",
+            total_context,
+            required_total_context,
+            parallel,
+            context_per_slot,
+        )
+    env["SURYA_INFERENCE_CTX_SIZE"] = str(max(total_context or 0, required_total_context))
+    # Surya 0.22.1's generated layout grammar contains ``\d`` escapes that
+    # llama.cpp 10090 rejects. Unguided layout output is still parsed and
+    # validated by Surya's LayoutPredictor.
+    env["SURYA_GUIDED_LAYOUT"] = "false"
+    return env
 
 
 class Surya2Runtime:
@@ -134,13 +174,7 @@ class Surya2Runtime:
         if not self.worker_path.exists():
             raise RuntimeError(f"Surya 2 worker is missing: {self.worker_path}")
 
-        env = os.environ.copy()
-        env["SURYA_INFERENCE_BACKEND"] = "llamacpp"
-        env["SURYA_INFERENCE_KEEP_ALIVE"] = "0"
-        # Surya 0.22.1's generated layout grammar contains ``\d`` escapes that
-        # llama.cpp 10090 rejects. Unguided layout output is still parsed and
-        # validated by Surya's LayoutPredictor.
-        env["SURYA_GUIDED_LAYOUT"] = "false"
+        env = build_surya2_worker_environment()
         process = subprocess.Popen(
             [str(python_path), str(self.worker_path), "--serve"],
             stdin=subprocess.PIPE,

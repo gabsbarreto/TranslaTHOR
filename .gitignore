@@ -1,6 +1,7 @@
 __pycache__/
 .pytest_cache/
 .venv/
+.venv-marker/
 .venv-surya2/
 .env.local
 workspace/jobs/

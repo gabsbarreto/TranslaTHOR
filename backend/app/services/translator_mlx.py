@@ -456,7 +456,6 @@ class MlxTranslator:
         self._tokenizer = None
         self._mlx_stream = None
         self._document_language: str | None = None
-        self._document_defined_acronyms: set[str] = set()
         self._last_load_error: str | None = None
         self._instruction_template_cache: _InstructionTemplateCache | None = None
         self._instruction_cache_hits = 0
@@ -496,13 +495,6 @@ class MlxTranslator:
 
     def build_chunks(self, document: DocumentModel) -> list[TranslationChunk]:
         self._document_language = self._normalize_lang_code(document.metadata.detected_language)
-        self._document_defined_acronyms = {
-            acronym
-            for block in document.blocks
-            for acronym in self._ordered_acronyms(
-                str(block.metadata.get("source_text", block.text))
-            )
-        }
         if document.metadata.translation.get("ocr_logical_chunks_prepared"):
             return self._prepared_logical_chunks(document)
 
@@ -2984,12 +2976,6 @@ class MlxTranslator:
             "translation_identifier_missing": (
                 "Translation output omitted a required source URL or email address after retry."
             ),
-            "translation_source_acronym_missing": (
-                "Translation output omitted or reinterpreted a required source acronym after retry."
-            ),
-            "translation_target_acronym_invented": (
-                "Translation output introduced an acronym that was absent from the source after retry."
-            ),
         }
         chunk.status = self.TRANSLATION_FAILED_STATUS
         chunk.reason = issue
@@ -3340,26 +3326,13 @@ class MlxTranslator:
         context: str,
         block_type: BlockType | None,
     ) -> str:
-        missing_acronyms = self._missing_source_acronyms(text, translated, block_type)
-        invented_acronyms = self._invented_target_acronyms(text, translated, block_type)
+        _ = block_type
         missing_identifiers = self._missing_verbatim_identifiers(text, translated)
         verbatim_requirements = ""
-        if missing_acronyms:
-            verbatim_requirements += (
-                " Required source acronyms whose uppercase base letters must remain unchanged "
-                f"in the English output: {', '.join(missing_acronyms)}. Natural lowercase "
-                "English plural or possessive suffixes are allowed."
-            )
         if missing_identifiers:
             verbatim_requirements += (
                 " Required identifiers that must appear character-for-character unchanged: "
                 f"{', '.join(missing_identifiers)}."
-            )
-        if invented_acronyms:
-            verbatim_requirements += (
-                " Remove these invented target acronyms because they are absent from TEXT: "
-                f"{', '.join(invented_acronyms)}. Translate the source wording directly instead "
-                "of importing terminology or abbreviations from nearby context."
             )
         return (
             f"{context}\n"
@@ -3495,29 +3468,14 @@ class MlxTranslator:
                 "translation_output_high_source_overlap",
                 "translation_output_matches_source",
                 "translation_output_not_english",
-                "translation_source_acronym_missing",
-                "translation_target_acronym_invented",
             }
         ):
-            invented_acronyms = self._invented_target_acronyms(
-                text,
-                retried,
-                block_type,
-            )
-            invented_acronym_guidance = (
-                " Remove these invented target acronyms because they do not occur in TEXT: "
-                f"{', '.join(invented_acronyms)}."
-                if invented_acronyms
-                else ""
-            )
             final_context = (
                 f"{retry_context}\n"
                 "A second attempt was also rejected. Produce a direct, clause-by-clause English "
                 "translation now. Every source-language word or phrase with translatable meaning must "
-                "be rendered in English. Retain only proper names, the exact required identifiers, and "
-                "the required acronym base letters from the preservation instructions. Natural lowercase "
-                "English plural or possessive suffixes on those acronyms are allowed."
-                f"{invented_acronym_guidance} Return only the translation."
+                "be rendered in English. Retain only proper names and exact required identifiers. "
+                "Return only the translation."
             )
             final_translation = self._translate_chunk(
                 text,
@@ -3720,10 +3678,6 @@ class MlxTranslator:
             return "translation_structure_invalid"
         if self._missing_verbatim_identifiers(source, translated):
             return "translation_identifier_missing"
-        if self._missing_source_acronyms(source, translated, block_type):
-            return "translation_source_acronym_missing"
-        if self._invented_target_acronyms(source, translated, block_type):
-            return "translation_target_acronym_invented"
         if self.TABLE_DELIMITER in source:
             for source_cell, translated_cell in zip(
                 source.split(self.TABLE_DELIMITER),
@@ -3760,125 +3714,6 @@ class MlxTranslator:
             html.unescape(source),
         )
         return [identifier for identifier in identifiers if identifier not in translated]
-
-    def _source_acronyms_to_preserve(
-        self,
-        source: str,
-        block_type: BlockType | None,
-    ) -> list[str]:
-        if block_type == BlockType.TABLE:
-            # Compact medical/statistical table abbreviations may have a
-            # standard English form (for example ACV -> CVA). Acronyms
-            # explicitly introduced in parentheses remain document-defined
-            # labels and must stay exact.
-            return list(dict.fromkeys(self._ordered_acronyms(source)))
-
-        visible = self._TAG_RE.sub(" ", html.unescape(source))
-        acronyms = list(self._ordered_acronyms(visible))
-        if re.search(r"[a-zà-öø-ÿ]", visible):
-            for match in re.finditer(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", visible):
-                token = match.group(1)
-                suffix = visible[match.end() : match.end() + 1]
-                if (
-                    suffix == "="
-                    or re.fullmatch(r"[IVXLCDM]+", token)
-                    or token not in self._document_defined_acronyms
-                ):
-                    continue
-                acronyms.append(token)
-        return list(dict.fromkeys(acronyms))
-
-    def _missing_source_acronyms(
-        self,
-        source: str,
-        translated: str,
-        block_type: BlockType | None,
-    ) -> list[str]:
-        source_counts = Counter(self._source_acronyms_to_preserve(source, block_type))
-        if not source_counts:
-            return []
-        translated_visible = html.unescape(translated)
-
-        def translated_count(acronym: str) -> int:
-            # Keep the stable uppercase base, but do not reject ordinary English
-            # inflection. Scientific prose naturally turns Spanish bare plurals
-            # such as ``los HT`` and ``las MT`` into ``HTs`` and ``MTs``. The
-            # previous exact word-boundary match treated both as missing and
-            # discarded otherwise valid translations. Apostrophe possessives and
-            # plural possessives follow the same rule; longer word continuations
-            # and changes to the uppercase base still fail validation.
-            pattern = re.compile(
-                rf"(?<![\w]){re.escape(acronym)}(?:['’]s|s['’]?)?(?![\w])"
-            )
-            return sum(1 for _ in pattern.finditer(translated_visible))
-
-        return [
-            acronym
-            for acronym, required_count in source_counts.items()
-            if translated_count(acronym) < required_count
-        ]
-
-    def _invented_target_acronyms(
-        self,
-        source: str,
-        translated: str,
-        block_type: BlockType | None,
-    ) -> list[str]:
-        """Return stable-looking target acronyms that have no source evidence.
-
-        Only parenthesized or slash-delimited target acronyms are considered.
-        This avoids treating uppercase headings as acronyms while preventing
-        the model from importing context-only expansions such as ``(TFM)`` into
-        a narrow continuation block. Tables remain exempt because compact
-        source abbreviations may legitimately have different English forms.
-        """
-
-        if block_type == BlockType.TABLE:
-            return []
-        source_visible = self._TAG_RE.sub(" ", html.unescape(source))
-        source_acronyms = set(re.findall(r"(?<![\w])([A-Z][A-Z0-9]{1,5})(?![\w])", source_visible))
-        return list(
-            dict.fromkeys(
-                acronym
-                for acronym in self._ordered_acronyms(translated)
-                if not re.fullmatch(r"[IVXLCDM]+", acronym) and acronym not in source_acronyms
-            )
-        )
-
-    def _ordered_acronyms(self, text: str) -> list[str]:
-        """Return acronyms whose surrounding syntax marks them as stable.
-
-        Uppercase typography alone is not acronym evidence: headings and table
-        labels commonly contain ordinary words such as ``HOMBRES`` or
-        ``HOMMES``. Protect slash-delimited sequences and compact acronyms
-        explicitly introduced in parentheses instead.
-        """
-
-        visible = self._TAG_RE.sub(" ", html.unescape(text))
-        token_pattern = r"[A-Z][A-Z0-9]{1,4}"
-        results: list[tuple[int, str]] = []
-        occupied: list[tuple[int, int]] = []
-
-        slash_pattern = re.compile(
-            rf"(?<![\w])(?P<sequence>{token_pattern}(?:\s*/\s*{token_pattern})+)(?![\w])"
-        )
-        for sequence in slash_pattern.finditer(visible):
-            occupied.append((sequence.start(), sequence.end()))
-            for token in re.finditer(token_pattern, sequence.group("sequence")):
-                results.append((sequence.start("sequence") + token.start(), token.group(0)))
-
-        for group in re.finditer(r"\((?P<body>[^()]{0,120})\)", visible):
-            body = group.group("body")
-            if "=" in body:
-                # Statistical labels such as (DT=11.2) may correctly change
-                # to their English counterpart (SD=11.2).
-                continue
-            for token in re.finditer(rf"(?<![\w]){token_pattern}(?![\w])", body):
-                absolute_start = group.start("body") + token.start()
-                if any(start <= absolute_start < end for start, end in occupied):
-                    continue
-                results.append((absolute_start, token.group(0)))
-        return [token for _, token in sorted(results)]
 
     def _is_valid_chunk_translation_structure(
         self,
@@ -3997,17 +3832,6 @@ class MlxTranslator:
             "translate every substantive non-English table label or sentence, and do not repeat "
             "source-language prose. Do not truncate output. Keep the same number of rows and cells."
         )
-        missing_acronyms = self._missing_source_acronyms(
-            text,
-            translated,
-            BlockType.TABLE,
-        )
-        if missing_acronyms:
-            retry_context += (
-                " Preserve the uppercase base letters of these document-defined acronyms: "
-                f"{', '.join(missing_acronyms)}. Natural lowercase English plural or possessive "
-                "suffixes are allowed."
-            )
         retried = self._translate_chunk(
             text,
             retry_context,
@@ -4322,12 +4146,6 @@ class MlxTranslator:
             return "translation_table_structure_invalid"
         if not self._table_nonempty_cells_preserved(source_table, translated_table):
             return "translation_table_cell_missing"
-        if self._missing_source_acronyms(
-            source_table,
-            translated_table,
-            BlockType.TABLE,
-        ):
-            return "translation_source_acronym_missing"
         if (
             self._base_language(source_language) not in {None, "en"}
             and self._normalized_table_cell(source_table)
@@ -4495,10 +4313,9 @@ class MlxTranslator:
             "You are translating OCR-derived scientific paper content into English for PDF reconstruction. "
             "TEXT may contain plain text, Markdown, or HTML. Translate only human-readable natural language. "
             "Preserve existing Markdown syntax, HTML tags, attributes, table rows/cells, citations, formulas, "
-            "units, numeric values, and figure references. Preserve the uppercase base letters of source "
-            "acronyms and unexplained abbreviations; natural lowercase English plural or possessive suffixes "
-            "are allowed, but never expand or reinterpret the base acronym. Do not invent abbreviations from "
-            "ordinary source words. "
+            "units, numeric values, and figure references. Translate language-specific acronyms and "
+            "abbreviations to their standard English equivalents when appropriate; otherwise leave "
+            "unexplained abbreviations as written. "
             "Do not add wrapper text such as labels, explanations, notes, summaries, source text, or code fences. "
             "Translate short section headings and titles as well."
         )

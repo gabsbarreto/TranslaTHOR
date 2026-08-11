@@ -66,7 +66,11 @@ class MarkerDocumentBuilder:
             for node in self._iter_content_blocks(page_payload):
                 block_type = self._map_block_type(str(node.get("block_type", "")))
                 text = self._node_text(node)
-                caption_text = self._caption_text_from_table_html(text) if block_type == BlockType.TABLE else None
+                caption_text = (
+                    self._caption_text_from_table_html(text)
+                    if block_type == BlockType.TABLE
+                    else None
+                )
                 if caption_text is not None:
                     block_type = BlockType.CAPTION
                     text = caption_text
@@ -121,8 +125,7 @@ class MarkerDocumentBuilder:
                             detection_confidence=block.confidence,
                             source_block_ids=[block.id],
                             source_region_ids=[
-                                str(value)
-                                for value in block.metadata.get("source_region_ids", [])
+                                str(value) for value in block.metadata.get("source_region_ids", [])
                             ],
                             extraction_metadata={
                                 "marker_block_type": node.get("block_type"),
@@ -147,7 +150,9 @@ class MarkerDocumentBuilder:
                 reading_order += 1
 
         if not blocks and isinstance(marker_payload, str):
-            blocks, chunks = self._fallback_blocks_from_markdown(marker_payload, detection, source_type)
+            blocks, chunks = self._fallback_blocks_from_markdown(
+                marker_payload, detection, source_type
+            )
         else:
             chunks = self._chunks_from_blocks(blocks)
 
@@ -245,20 +250,17 @@ class MarkerDocumentBuilder:
                 return [
                     item
                     for item in children
-                    if isinstance(item, dict)
-                    and str(item.get("block_type", "")).lower() == "page"
+                    if isinstance(item, dict) and str(item.get("block_type", "")).lower() == "page"
                 ]
-            if (
-                str(payload.get("block_type", "")).lower() == "page"
-                and isinstance(payload.get("children"), list)
+            if str(payload.get("block_type", "")).lower() == "page" and isinstance(
+                payload.get("children"), list
             ):
                 return [payload]
             if "pages" in payload and isinstance(payload["pages"], list):
                 return [
                     item
                     for item in payload["pages"]
-                    if isinstance(item, dict)
-                    and str(item.get("block_type", "")).lower() == "page"
+                    if isinstance(item, dict) and str(item.get("block_type", "")).lower() == "page"
                 ]
         if isinstance(payload, list):
             return [
@@ -369,8 +371,7 @@ class MarkerDocumentBuilder:
                     continue
 
                 horizontal_offset = abs(
-                    (note_bbox.x0 + note_bbox.x1) / 2
-                    - (anchor_bbox.x0 + anchor_bbox.x1) / 2
+                    (note_bbox.x0 + note_bbox.x1) / 2 - (anchor_bbox.x0 + anchor_bbox.x1) / 2
                 ) / max(1.0, anchor_width)
                 score = gap + horizontal_offset
                 if best is None or score < best[0]:
@@ -404,7 +405,7 @@ class MarkerDocumentBuilder:
             if key in page_payload:
                 try:
                     value = int(page_payload[key])
-                    return value + 1 if key == "page_id" and value == fallback - 1 else max(1, value)
+                    return value + 1 if key == "page_id" else max(1, value)
                 except Exception:
                     pass
         block_id = str(page_payload.get("id") or "")
@@ -453,7 +454,11 @@ class MarkerDocumentBuilder:
         raw = node.get("polygon") or node.get("bbox")
         if not raw:
             return None
-        if isinstance(raw, list) and len(raw) == 4 and all(isinstance(item, (int, float)) for item in raw):
+        if (
+            isinstance(raw, list)
+            and len(raw) == 4
+            and all(isinstance(item, (int, float)) for item in raw)
+        ):
             x0, y0, x1, y1 = [float(item) for item in raw]
             return [[x0, y0], [x1, y0], [x1, y1], [x0, y1]]
         if isinstance(raw, list):
@@ -591,13 +596,18 @@ class MarkerDocumentBuilder:
                     (
                         index
                         for index in unmatched
-                        if descriptors[index][0] == marker_row and descriptors[index][1] == marker_column
+                        if descriptors[index][0] == marker_row
+                        and descriptors[index][1] == marker_column
                     ),
                     None,
                 )
 
             child_text = self._node_text(child).strip()
-            if match_index is None and len(children) == len(descriptors) and child_index in unmatched:
+            if (
+                match_index is None
+                and len(children) == len(descriptors)
+                and child_index in unmatched
+            ):
                 descriptor_text = descriptors[child_index][2].text
                 if self._same_cell_text(child_text, descriptor_text):
                     match_index = child_index
@@ -650,7 +660,9 @@ class MarkerDocumentBuilder:
                 }
             )
             row_cell_index = next(
-                index for index, existing in enumerate(logical_rows[row_index]) if existing is current
+                index
+                for index, existing in enumerate(logical_rows[row_index])
+                if existing is current
             )
             logical_rows[row_index][row_cell_index] = enriched
             descriptors[match_index] = (row_index, column_index, parsed_cell, enriched)
@@ -840,8 +852,7 @@ class MarkerDocumentBuilder:
         if len(texts) > max_blocks:
             last_index = len(texts) - 1
             texts = [
-                texts[round(index * last_index / (max_blocks - 1))]
-                for index in range(max_blocks)
+                texts[round(index * last_index / (max_blocks - 1))] for index in range(max_blocks)
             ]
         budget = 50_000
         per_block = max(1, (budget - len(texts)) // len(texts))
@@ -851,7 +862,7 @@ class MarkerDocumentBuilder:
                 sampled.append(text)
                 continue
             head = per_block // 2
-            sampled.append(f"{text[:head]} {text[-(per_block - head - 1):]}")
+            sampled.append(f"{text[:head]} {text[-(per_block - head - 1) :]}")
         return "\n".join(sampled)[:budget]
 
 
@@ -892,7 +903,11 @@ class _TableExtractor(HTMLParser):
     def extract(cls, html: str) -> list[list[str]]:
         parser = cls()
         parser.feed(html)
-        return [[cell.strip() for cell in row] for row in parser.rows if any(cell.strip() for cell in row)]
+        return [
+            [cell.strip() for cell in row]
+            for row in parser.rows
+            if any(cell.strip() for cell in row)
+        ]
 
     def handle_starttag(self, tag: str, attrs) -> None:
         tag = tag.lower()

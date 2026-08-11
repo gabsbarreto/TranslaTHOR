@@ -168,16 +168,8 @@ For an editable development install:
 pip install -e ".[mlx,qwen_ocr,dev]"
 ```
 
-Install Marker in its own virtual environment:
-
-```bash
-python -m venv .venv-marker
-.venv-marker/bin/python -m pip install -U pip
-.venv-marker/bin/python -m pip install "marker-pdf==1.10.2" "transformers<5" "regex<2025"
-```
-
-Install the isolated Surya 2 runtime and its officially supported Apple
-Silicon backend:
+Install the shared Marker 2 + Surya 2 extraction runtime and its officially
+supported Apple Silicon backend:
 
 ```bash
 bash scripts/setup_surya2_runtime.sh
@@ -187,22 +179,24 @@ The script installs the fully resolved `requirements-surya2.lock.txt`. The
 shorter `requirements-surya2.txt` records the intentionally selected top-level
 compatibility set.
 
-This pins `surya-ocr==0.22.1` and sets
-`SURYA_INFERENCE_BACKEND=llamacpp`. The app reuses one Surya inference
-manager/server across pages and queued jobs.
+This pins `marker-pdf==2.0.0` and `surya-ocr==0.22.1`, and sets
+`SURYA_INFERENCE_BACKEND=llamacpp`. Marker uses explicit `balanced` conversion
+for born-digital documents. The direct OCR path reuses one Surya inference
+manager/server across pages and queued jobs, with up to five page requests in
+flight at once.
 
 Inspect Surya layout boxes for rendered OCR pages:
 
 ```bash
-.venv-marker/bin/python scripts/surya_layout_worker.py \
+.venv-surya2/bin/python scripts/surya_layout_worker.py \
   --input-dir workspace/jobs/<job-id>/qwen_ocr/rendered_pages \
   --output-dir workspace/jobs/<job-id>/qwen_ocr/surya_layout
 ```
 
 This writes `layout.json`, padded region crops, annotated page previews, and full-page
 `boxed_pages` overlays. The app generates those overlays automatically for `scanned_no_text`
-and `bad_hidden_ocr` PDFs, then sends each complete overlay page to Qwen. Run the worker with
-`.venv-marker` because Surya is installed with Marker and requires `transformers<5`.
+and `bad_hidden_ocr` PDFs, then sends each complete overlay page to Qwen. The worker uses the
+same `.venv-surya2` runtime as Marker and direct Surya OCR.
 
 ## Run
 
@@ -345,15 +339,23 @@ ten-case specification is always tested.
 - `QWEN_OCR_PYTHON`: Python executable containing `mlx-vlm`.
 - `QWEN_OCR_MODEL`: Qwen OCR model identifier.
 - `QWEN_OCR_PROMPT`: OCR transcription prompt.
-- `SURYA_LAYOUT_PYTHON`: Python executable containing Surya; defaults to `.venv-marker/bin/python`.
+- `SURYA_LAYOUT_PYTHON`: Python executable containing Surya; defaults to `.venv-surya2/bin/python`.
 - `OCR_ENGINE`: `surya2_llamacpp` (branch default), `surya_qwen_mlx`, or `marker_surya`.
 - `SURYA2_PYTHON`: isolated Surya 2 Python; defaults to `.venv-surya2/bin/python`.
 - `SURYA2_DPI`: render DPI; defaults to `192`.
 - `SURYA2_STRATEGY`: `full_page` (default) or `layout_then_block`.
 - `SURYA_INFERENCE_BACKEND`: must be `llamacpp` for the experimental engine.
-- The worker forces `SURYA_GUIDED_LAYOUT=false` for compatibility with the
-  tested llama.cpp 10090 grammar parser.
-- `MARKER_BIN`: Marker executable path.
+- `SURYA_INFERENCE_PARALLEL`: concurrent direct-Surya pages; defaults to `5`.
+- `SURYA_INFERENCE_CTX_PER_SLOT`: context reserved per concurrent page; defaults to `16384`.
+- `SURYA_INFERENCE_CTX_SIZE`: optional total llama.cpp context override. Values below the
+  per-slot requirement are automatically raised to prevent batched-page truncation.
+- The Surya workers and Marker subprocess default `SURYA_GUIDED_LAYOUT=false`
+  for compatibility with the tested llama.cpp 10090 grammar parser.
+- `MARKER_BIN`: Marker executable path; `run_dev.sh` defaults it to
+  `.venv-surya2/bin/marker_single`.
+- `MARKER_CONVERSION_MODE`: Marker 2 conversion mode; defaults to `balanced`.
+- `ENABLE_MARKER_TABLE_OCR_RETRY`: validate extracted table numbers against the source PDF and
+  retry only affected pages with forced OCR; defaults to `true`.
 - `ENABLE_QWEN_OCR_FALLBACK`: Enable full-page Qwen OCR fallback.
 - `ENABLE_LOCAL_VLM_REPAIR`: Enable Marker block repair through the optional local VLM endpoint.
 

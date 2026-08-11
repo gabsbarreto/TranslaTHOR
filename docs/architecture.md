@@ -20,25 +20,30 @@ if it preserves this boundary.
 `raw_label`, `html`, `polygon`, `skipped`, and `error`. Legacy extractors leave
 these optional fields at their defaults.
 
-## Legacy Surya + Marker
+## Marker 2 + Surya 2 for born-digital PDFs
 
 1. `PDFTypeDetector` classifies the PDF text layer.
-2. `PDFExtractor` invokes `marker_single` in the isolated `.venv-marker`
-   environment.
-3. Marker 1.10.2 performs PDF parsing and, when OCR is forced, calls Surya
-   0.17.1 for layout/OCR.
+2. `PDFExtractor` invokes Marker 2.0.0 from the shared `.venv-surya2`
+   environment with explicit `--mode balanced`.
+3. Marker uses Surya 0.22.1 for layout/OCR while preserving its specialised
+   born-digital PDF parsing and table processing.
 4. Marker JSON is converted by `MarkerDocumentBuilder` into the shared model.
 5. Marker HTML tables become `TableModel` objects; figures become
    `FigureAsset` placeholders.
 
-The `marker_surya` engine forces Marker OCR for poor-text documents while
-retaining Marker text-only extraction for good born-digital PDFs.
+Good born-digital documents use this path without `--disable_ocr`. If a table
+omits numeric values present inside its source PDF box, only the affected pages
+are retried with forced OCR. Missing values are copied into empty balanced-mode
+cells only when the source-number deficit proves the mapping; existing values
+and row associations win. A table that still fails validation is retained in
+the original-layout PDF instead of masking source data. The `marker_surya`
+engine remains available for direct comparison.
 
 ## Legacy Surya + Qwen through mlx-vlm
 
 1. Poor scans bypass Marker.
 2. `PageRenderer` renders every selected page.
-3. the Surya v1 layout worker finds regions and reading order and writes crops,
+3. the Surya 2 layout worker finds regions and reading order and writes crops,
    overlays, and `layout.json`.
 4. Qwen receives the complete annotated page through `mlx-vlm`, returning
    `<region>`-wrapped Markdown.
@@ -51,18 +56,14 @@ retaining Marker text-only extraction for good born-digital PDFs.
 
 This remains available as `surya_qwen_mlx`.
 
-## Experimental direct Surya 2 + llama.cpp
+## Direct Surya 2 + llama.cpp for scans
 
-The selected design is a direct adapter, not a Marker 2 upgrade.
+The direct adapter consumes Surya's native block schema exactly once for scans
+and poor-text PDFs. Marker 2 shares the same package runtime but is not run on
+top of direct Surya output, so OCR work is not duplicated.
 
-Marker 2.0.0 is viable and uses Surya 2, but it requires a new Marker schema,
-Transformers 5, and Surya 0.22.1. Replacing Marker 1.10.2 would make the
-legacy comparison non-equivalent. Running direct Surya 2 followed by Marker
-would also repeat work. The direct adapter consumes Surya's native block
-schema exactly once and preserves TranslaTHOR's existing boundary.
-
-The runtime is isolated because legacy Marker and mlx-vlm use incompatible
-Transformers stacks:
+The extraction runtime is isolated because Surya 2/Marker 2 and mlx-vlm use
+different Transformers stacks:
 
 ```text
 FastAPI job queue (one active job)
@@ -70,12 +71,18 @@ FastAPI job queue (one active job)
      -> render selected PDF pages at one configured DPI
      -> persistent scripts/surya2_worker.py
         -> one shared SuryaInferenceManager(method="llamacpp")
-        -> one llama-server for successive pages and queued jobs
+        -> one llama-server with five concurrent page slots by default
         -> RecognitionPredictor (full page by default)
      -> Surya2DocumentAdapter
      -> DocumentModel / translation chunks / Markdown
 ```
 
+The worker submits all rendered pages as one ordered batch. The llama.cpp
+backend processes at most five page requests concurrently by default and
+returns results in source-page order. Each slot retains 16,384 context tokens;
+the worker therefore starts llama-server with 81,920 total context unless the
+environment requests a larger value. A stale smaller total-context override is
+raised automatically so batching cannot reduce the context available to any page.
 The worker is started lazily. Cancellation terminates its process group.
 Application shutdown calls `SuryaInferenceManager.stop()` and then terminates
 the process group if graceful shutdown fails. A subsequent job restarts a
@@ -166,7 +173,7 @@ that have no removable PDF text and no hidden-OCR word geometry:
 
 Hidden-OCR scans continue to use the stricter source-text-to-PDF-word
 alignment path. The raster strategy is selected only for blocks explicitly
-identified as `surya2_llamacpp`; Qwen and legacy Marker jobs do not silently
+identified as `surya2_llamacpp`; Qwen and Marker jobs do not silently
 change reconstruction behavior.
 
 ## Official references

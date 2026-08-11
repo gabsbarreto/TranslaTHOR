@@ -28,6 +28,25 @@ DEFAULT_SURYA2_PYTHON = os.getenv(
     str(BASE_DIR / ".venv-surya2" / "bin" / "python"),
 )
 DEFAULT_SURYA2_REQUEST_TIMEOUT = int(os.getenv("SURYA2_REQUEST_TIMEOUT", "3600"))
+DEFAULT_SURYA2_PARALLEL_PAGES = max(
+    1,
+    int(os.getenv("SURYA_INFERENCE_PARALLEL", "5")),
+)
+DEFAULT_SURYA2_CONTEXT_PER_SLOT = max(
+    1,
+    int(os.getenv("SURYA_INFERENCE_CTX_PER_SLOT", "16384")),
+)
+_CONFIGURED_MARKER_CONVERSION_MODE = os.getenv("MARKER_CONVERSION_MODE", "balanced").casefold()
+DEFAULT_MARKER_CONVERSION_MODE = (
+    _CONFIGURED_MARKER_CONVERSION_MODE
+    if _CONFIGURED_MARKER_CONVERSION_MODE in {"balanced", "fast"}
+    else "balanced"
+)
+ENABLE_MARKER_TABLE_OCR_RETRY = os.getenv("ENABLE_MARKER_TABLE_OCR_RETRY", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 DEFAULT_QWEN_OCR_MODEL = os.getenv("QWEN_OCR_MODEL", "mlx-community/Qwen3.5-4B-4bit")
 DEFAULT_QWEN_OCR_MAX_TOKENS = int(os.getenv("QWEN_OCR_MAX_TOKENS", "4096"))
 DEFAULT_QWEN_OCR_PROMPT = os.getenv(

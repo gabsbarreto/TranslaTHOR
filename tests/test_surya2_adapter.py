@@ -20,7 +20,10 @@ from app.services.pdf_extraction.surya2_adapter import (
     normalized_label,
 )
 from app.services.pdf_extraction.surya2_extractor import Surya2LlamaCppExtractor
-from app.services.pdf_extraction.surya2_runtime import Surya2Runtime
+from app.services.pdf_extraction.surya2_runtime import (
+    Surya2Runtime,
+    build_surya2_worker_environment,
+)
 from app.services.reconstructor import Reconstructor
 
 
@@ -49,6 +52,13 @@ def _raw_payload() -> dict:
         "engine": "surya2_llamacpp",
         "surya_version": "0.22.1",
         "strategy": "full_page",
+        "batching": {
+            "parallel_pages": 5,
+            "context_per_slot": 16384,
+            "total_context": 81920,
+            "requested_pages": 1,
+            "effective_parallel_pages": 1,
+        },
         "timing": {"total_worker_seconds": 1.0},
         "pages": [
             {
@@ -320,6 +330,7 @@ def test_surya2_extractor_integration_renders_fixture_and_writes_artifacts(
     assert result.metadata["surya2_version"] == "0.22.1"
     assert result.metadata["surya2_strategy"] == "full_page"
     assert result.metadata["surya2_dpi"] == 96
+    assert result.metadata["surya2_batching"]["parallel_pages"] == 5
     assert len(fake_runtime.calls) == 1
     assert fake_runtime.calls[0]["strategy"] == "full_page"
     assert (tmp_path / "job/surya2/raw_full_page.json").exists()
@@ -343,3 +354,48 @@ def test_runtime_event_pump_does_not_lose_buffered_lines() -> None:
 
     assert events.get_nowait()["event"] == "page_done"
     assert events.get_nowait()["event"] == "request_complete"
+
+
+def test_runtime_defaults_to_five_parallel_pages_with_full_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in (
+        "SURYA_INFERENCE_PARALLEL",
+        "SURYA_INFERENCE_CTX_PER_SLOT",
+        "SURYA_INFERENCE_CTX_SIZE",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    env = build_surya2_worker_environment()
+
+    assert env["SURYA_INFERENCE_PARALLEL"] == "5"
+    assert env["SURYA_INFERENCE_CTX_PER_SLOT"] == "16384"
+    assert env["SURYA_INFERENCE_CTX_SIZE"] == "81920"
+
+
+def test_runtime_preserves_explicit_surya_batch_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SURYA_INFERENCE_PARALLEL", "2")
+    monkeypatch.setenv("SURYA_INFERENCE_CTX_PER_SLOT", "12288")
+    monkeypatch.setenv("SURYA_INFERENCE_CTX_SIZE", "32768")
+
+    env = build_surya2_worker_environment()
+
+    assert env["SURYA_INFERENCE_PARALLEL"] == "2"
+    assert env["SURYA_INFERENCE_CTX_PER_SLOT"] == "12288"
+    assert env["SURYA_INFERENCE_CTX_SIZE"] == "32768"
+
+
+def test_runtime_raises_stale_total_context_to_protect_every_batch_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SURYA_INFERENCE_PARALLEL", "5")
+    monkeypatch.setenv("SURYA_INFERENCE_CTX_PER_SLOT", "16384")
+    monkeypatch.setenv("SURYA_INFERENCE_CTX_SIZE", "16384")
+
+    env = build_surya2_worker_environment()
+
+    assert env["SURYA_INFERENCE_PARALLEL"] == "5"
+    assert env["SURYA_INFERENCE_CTX_PER_SLOT"] == "16384"
+    assert env["SURYA_INFERENCE_CTX_SIZE"] == "81920"
